@@ -26,6 +26,9 @@
         "projectId": "3aa6ee2a-f253-45c8-8820-891191317658"
       }
     },
-    "owner": "ironmanmadhu"
+    "owner": "ironmanmadhu",
+    "plugins": [
+      "expo-status-bar"
+    ]
   }
 }
