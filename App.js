@@ -23,6 +23,9 @@ import { Ionicons } from '@expo/vector-icons';
 import OnboardingSlides from './components/OnboardingSlides';
 import LoginScreen from './components/LoginScreen';
 import LandingPage from './components/LandingPage';
+import LayoutEditor from './components/editor/LayoutEditor';
+import { generateStructuredLayoutFromState, syncLayoutToState } from './components/editor/layoutBridge';
+import { cloneLayout } from './components/editor/layoutModel';
 
 export default function App() {
   const [language, setLanguage] = useState('en'); 
@@ -30,6 +33,8 @@ export default function App() {
   const [activeTab, setActiveTab] = useState(Platform.OS === 'web' ? 'home' : 'input'); 
   const [hasCalculated, setHasCalculated] = useState(false);
   const [selectedRoomId, setSelectedRoomId] = useState("");
+  const [layoutData, setLayoutData] = useState(null);
+  const [originalGeneratedLayout, setOriginalGeneratedLayout] = useState(null);
   const [dimensions, setDimensions] = useState({
     width: Dimensions.get('window').width,
     height: Dimensions.get('window').height
@@ -168,6 +173,22 @@ export default function App() {
     setActiveTab(tabId);
   };
 
+  const handleOpenEditor = () => {
+    if (!layoutData) {
+      const generated = generateStructuredLayoutFromState(state);
+      setLayoutData(generated);
+      setOriginalGeneratedLayout(cloneLayout(generated));
+    }
+    setActiveTab('editor');
+  };
+
+  const handleSaveAndCloseEditor = (updatedLayout) => {
+    setLayoutData(updatedLayout);
+    const nextState = syncLayoutToState(updatedLayout, state);
+    setState(nextState);
+    setActiveTab('canvas');
+  };
+
   const isTe = language === 'te';
 
   // Navigation Items
@@ -175,6 +196,7 @@ export default function App() {
     { id: 'input', icon: 'create-outline', labelEn: 'Input Details', labelTe: 'ఇన్పుట్' },
     { id: 'core', icon: 'calculator-outline', labelEn: 'Vastu Core', labelTe: 'గణాంకాలు' },
     { id: 'canvas', icon: 'map-outline', labelEn: '2D Plan', labelTe: 'ప్లాన్' },
+    { id: 'editor', icon: 'color-wand-outline', labelEn: 'Edit Layout', labelTe: 'సవరణ' },
     { id: 'pdf', icon: 'document-text-outline', labelEn: 'PDF Report', labelTe: 'రిపోర్ట్' },
     { id: 'tables', icon: 'list-outline', labelEn: 'Charts', labelTe: 'పట్టికలు' },
   ];
@@ -201,6 +223,9 @@ export default function App() {
                   setActiveTab={setActiveTab}
                   onCalculate={() => {
                     setHasCalculated(true);
+                    const generated = generateStructuredLayoutFromState(state);
+                    setLayoutData(generated);
+                    setOriginalGeneratedLayout(cloneLayout(generated));
                     setActiveTab('canvas');
                   }} 
                   hideFooter={true}
@@ -218,6 +243,9 @@ export default function App() {
               setActiveTab={setActiveTab}
               onCalculate={() => {
                 setHasCalculated(true);
+                const generated = generateStructuredLayoutFromState(state);
+                setLayoutData(generated);
+                setOriginalGeneratedLayout(cloneLayout(generated));
                 setActiveTab('canvas');
               }} 
             />
@@ -234,10 +262,35 @@ export default function App() {
         );
       case 'core':
         return <CoreEngine language={language} state={state} theme={currentTheme} />;
+      case 'editor':
+        return (
+          <LayoutEditor
+            initialLayout={layoutData || generateStructuredLayoutFromState(state)}
+            originalGeneratedLayout={originalGeneratedLayout || generateStructuredLayoutFromState(state)}
+            onSaveAndClose={handleSaveAndCloseEditor}
+            onClose={() => setActiveTab('canvas')}
+            theme={currentTheme}
+          />
+        );
       case 'canvas':
-        return <Canvas2D language={language} state={state} theme={currentTheme} />;
+        return (
+          <Canvas2D
+            language={language}
+            state={state}
+            theme={currentTheme}
+            onOpenEditor={handleOpenEditor}
+            layoutData={layoutData}
+          />
+        );
       case 'pdf':
-        return <ReportsPDF language={language} state={state} theme={currentTheme} />;
+        return (
+          <ReportsPDF
+            language={language}
+            state={state}
+            theme={currentTheme}
+            onOpenEditor={handleOpenEditor}
+          />
+        );
       case 'tables':
         return <MasterTables language={language} theme={currentTheme} />;
       default:
@@ -250,6 +303,9 @@ export default function App() {
             setActiveTab={setActiveTab}
             onCalculate={() => {
               setHasCalculated(true);
+              const generated = generateStructuredLayoutFromState(state);
+              setLayoutData(generated);
+              setOriginalGeneratedLayout(cloneLayout(generated));
               setActiveTab('canvas');
             }} 
           />
@@ -378,6 +434,14 @@ export default function App() {
   // DESKTOP LAYOUT (SPLIT THREE PANEL PANELS)
   // ----------------------------------------------------
   const renderDesktopLayout = () => {
+    if (activeTab === 'editor') {
+      return (
+        <View style={{ flex: 1, width: '100%', height: '100%' }}>
+          {renderActiveComponent()}
+        </View>
+      );
+    }
+
     // Responsive horizontal padding removed from outer workspace to let footer span full width
     let webHorizontalPadding = 0;
 
@@ -475,6 +539,14 @@ export default function App() {
   // MOBILE LAYOUT (STANDARD TAB SYSTEM)
   // ----------------------------------------------------
   const renderMobileLayout = () => {
+    if (activeTab === 'editor') {
+      return (
+        <View style={{ flex: 1, width: '100%', height: '100%' }}>
+          {renderActiveComponent()}
+        </View>
+      );
+    }
+
     const isWebOrWide = Platform.OS === 'web' || dimensions.width >= 480;
     
     // Responsive horizontal padding removed from outer workspace to let footer span full width
@@ -588,21 +660,23 @@ export default function App() {
         </style>
       )}
       
-      {/* Top compact normal header */}
-      <VastuHeader 
-        language={language}
-        setLanguage={setLanguage}
-        activeTheme={activeTheme}
-        setActiveTheme={setActiveTheme}
-        compassAngle={state.compassAngle}
-        showMenuButton={Platform.OS === 'web' && !isDesktop}
-        onMenuPress={() => setIsMobileDrawerOpen(true)}
-        activeTab={activeTab}
-        setActiveTab={handleTabPress}
-        navItems={navItems}
-        hasCalculated={hasCalculated}
-        isDesktop={isDesktop}
-      />
+      {/* Top compact normal header (hidden in full CAD editor workspace) */}
+      {activeTab !== 'editor' && (
+        <VastuHeader 
+          language={language}
+          setLanguage={setLanguage}
+          activeTheme={activeTheme}
+          setActiveTheme={setActiveTheme}
+          compassAngle={state.compassAngle}
+          showMenuButton={Platform.OS === 'web' && !isDesktop}
+          onMenuPress={() => setIsMobileDrawerOpen(true)}
+          activeTab={activeTab}
+          setActiveTab={handleTabPress}
+          navItems={navItems}
+          hasCalculated={hasCalculated}
+          isDesktop={isDesktop}
+        />
+      )}
 
       {/* Conditional Layout Rendering */}
       {isDesktop ? renderDesktopLayout() : renderMobileLayout()}

@@ -7,7 +7,7 @@ import VastuFooter from './VastuFooter';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
-export default function ReportsPDF({ language, state, theme: propTheme }) {
+export default function ReportsPDF({ language, state, theme: propTheme, onOpenEditor }) {
   const isTe = language === 'te';
   const theme = propTheme || staticTheme;
   const styles = getStyles(theme);
@@ -149,6 +149,18 @@ export default function ReportsPDF({ language, state, theme: propTheme }) {
             {isTe ? "సింహద్వారం: " : "Entrance: "}{state.mainDoorDirection} | 
             {isTe ? " రోడ్డు: " : " Road: "}{state.roadDirection}
           </Text>
+          {onOpenEditor && (
+            <TouchableOpacity 
+              style={styles.pdfEditBtn} 
+              onPress={onOpenEditor}
+              activeOpacity={0.8}
+            >
+              <Ionicons name="create-outline" size={13} color="#FFFFFF" style={{ marginRight: 6 }} />
+              <Text style={styles.pdfEditBtnText}>
+                {isTe ? "లేఅవుట్ ఎడిట్ చేయండి" : "Edit Layout in CAD Studio"}
+              </Text>
+            </TouchableOpacity>
+          )}
         </View>
 
         <View style={[styles.sheetTable, { marginTop: 12 }]}>
@@ -550,6 +562,21 @@ const getStyles = (theme) => StyleSheet.create({
     color: theme.colors.textSecondary,
     marginTop: 6,
     fontWeight: '600',
+  },
+  pdfEditBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#2563EB',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 4,
+    marginTop: 8,
+  },
+  pdfEditBtnText: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#FFFFFF',
+    letterSpacing: 0.3,
   },
   reportMatrixTable: {
     borderWidth: 1,

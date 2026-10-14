@@ -3,7 +3,7 @@ import { View, Text, StyleSheet, TouchableOpacity, useWindowDimensions, ScrollVi
 import { lightTheme as staticTheme } from '../constants/theme';
 import { Ionicons } from '@expo/vector-icons';
 
-export default function Canvas2D({ language, state, theme: propTheme }) {
+export default function Canvas2D({ language, state, theme: propTheme, onOpenEditor, layoutData }) {
   const { width: SCREEN_WIDTH } = useWindowDimensions();
   const theme = propTheme || staticTheme;
   const styles = getStyles(theme);
@@ -1632,6 +1632,19 @@ export default function Canvas2D({ language, state, theme: propTheme }) {
             <TouchableOpacity style={styles.toolBtn} onPress={() => setScale(Math.min(1.6, scale + 0.1))}>
               <Ionicons name="add-outline" size={12} color="#475569" />
             </TouchableOpacity>
+
+            <View style={styles.toolbarDivider} />
+
+            <TouchableOpacity 
+              style={styles.editLayoutBtn} 
+              onPress={() => onOpenEditor && onOpenEditor()}
+              activeOpacity={0.8}
+            >
+              <Ionicons name="create-outline" size={13} color="#FFFFFF" style={{ marginRight: 5 }} />
+              <Text style={styles.editLayoutBtnText}>
+                {isTe ? "లేఅవుట్ ఎడిట్ చేయండి" : "Edit Layout"}
+              </Text>
+            </TouchableOpacity>
           </View>
         </ScrollView>
       </View>
@@ -1993,6 +2006,21 @@ const getStyles = (theme) => StyleSheet.create({
     height: 18,
     backgroundColor: '#CBD5E1',
     marginHorizontal: 4,
+  },
+  editLayoutBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#2563EB',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 4,
+    marginLeft: 4,
+  },
+  editLayoutBtnText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#FFFFFF',
+    letterSpacing: 0.3,
   },
   canvasContainer: {
     backgroundColor: '#F8FAFC', 
