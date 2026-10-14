@@ -13,7 +13,7 @@ import React, { useState } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, ScrollView } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { formatMeasurement, formatArea, parseToFeet } from './units';
-import { calculateWallLength, calculateWallAngle, splitWallAtPoint, generateUniqueId, ROOM_PALETTE } from './layoutModel';
+import { calculateWallLength, calculateWallAngle, splitWallAtPoint, generateUniqueId, ROOM_PALETTE, setPlotDimensionOffset } from './layoutModel';
 import { checkAyaVyayaYoni } from '../../constants/vastuData';
 
 export default function EditorRightPanel({
@@ -24,6 +24,7 @@ export default function EditorRightPanel({
   unit = 'ft-in',
   validationIssues = [],
   historyManager,
+  onRequestPlotResize,
 }) {
   const [tab, setTab] = useState('properties'); // 'properties' | 'validation'
 
@@ -158,15 +159,16 @@ export default function EditorRightPanel({
     const vastuResult = checkAyaVyayaYoni(room.width, room.length);
 
     const handleRoomField = (field, val) => {
+      const patch = field === 'name' ? { name: val, label: val } : { [field]: val };
       const nextRooms = layout.rooms.map(r => {
         if (r.id === room.id) {
-          return { ...r, [field]: val };
+          return { ...r, ...patch };
         }
         return r;
       });
       const nextLayout = { ...layout, rooms: nextRooms };
       updateLayoutAndRecord(nextLayout);
-      onSelectElement({ type: 'room', data: { ...room, [field]: val } });
+      onSelectElement({ type: 'room', data: { ...room, ...patch } });
     };
 
     const handleDimensionInput = (field, text) => {
@@ -639,14 +641,18 @@ export default function EditorRightPanel({
     const handlePlotDim = (field, text) => {
       const feet = parseToFeet(text, unit);
       if (feet && feet > 0) {
-        const nextLayout = {
-          ...layout,
-          plot: {
-            ...layout.plot,
-            [field]: feet,
-          },
-        };
-        updateLayoutAndRecord(nextLayout);
+        if (onRequestPlotResize) {
+          onRequestPlotResize(field, feet);
+        } else {
+          const nextLayout = {
+            ...layout,
+            plot: {
+              ...layout.plot,
+              [field]: feet,
+            },
+          };
+          updateLayoutAndRecord(nextLayout);
+        }
       }
     };
 
@@ -662,6 +668,7 @@ export default function EditorRightPanel({
           <View style={[styles.inputGroup, { flex: 1 }]}>
             <Text style={styles.inputLabel}>Plot Width ({unit})</Text>
             <TextInput
+              key={`plot-w-${plotW}`}
               style={styles.textInput}
               defaultValue={formatMeasurement(plotW, unit)}
               onBlur={(e) => handlePlotDim('width', e.nativeEvent.text)}
@@ -670,6 +677,7 @@ export default function EditorRightPanel({
           <View style={[styles.inputGroup, { flex: 1 }]}>
             <Text style={styles.inputLabel}>Plot Length ({unit})</Text>
             <TextInput
+              key={`plot-l-${plotL}`}
               style={styles.textInput}
               defaultValue={formatMeasurement(plotL, unit)}
               onBlur={(e) => handlePlotDim('length', e.nativeEvent.text)}
@@ -739,6 +747,78 @@ export default function EditorRightPanel({
         </View>
       </View>
     );
+  };
+
+  // ---------------------------------------------------------
+  // RENDER PLOT DIMENSION ANNOTATION INSPECTOR
+  // ---------------------------------------------------------
+  const renderDimensionInspector = (data) => {
+    const axis = data?.axis || 'width';
+    const meta = getPlotDimensionMetaSafe(axis);
+    const label = axis === 'width' ? 'Plot Width' : 'Plot Length';
+
+    const handleValue = (text) => {
+      const feet = parseToFeet(text, unit);
+      if (feet && feet > 0) {
+        if (onRequestPlotResize) onRequestPlotResize(axis, feet);
+        else {
+          const nextLayout = { ...layout, plot: { ...layout.plot, [axis]: feet } };
+          updateLayoutAndRecord(nextLayout);
+        }
+      }
+    };
+
+    const handleOffset = (text) => {
+      const off = parseToFeet(text, unit);
+      if (off && off > 0) {
+        const nextLayout = setPlotDimensionOffset({ ...layout }, axis, off);
+        updateLayoutAndRecord(nextLayout);
+      }
+    };
+
+    return (
+      <View style={styles.inspectorContent}>
+        <View style={styles.elemHeader}>
+          <Ionicons name="resize" size={18} color="#2563EB" />
+          <Text style={styles.elemTitle}>{label} Dimension</Text>
+        </View>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.inputLabel}>{label} ({unit})</Text>
+          <TextInput
+            key={`dim-val-${axis}-${meta.value}`}
+            style={styles.textInput}
+            defaultValue={formatMeasurement(meta.value, unit)}
+            onBlur={(e) => handleValue(e.nativeEvent.text)}
+          />
+        </View>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.inputLabel}>Annotation Offset ({unit})</Text>
+          <TextInput
+            key={`dim-off-${axis}-${meta.offset}`}
+            style={styles.textInput}
+            defaultValue={formatMeasurement(meta.offset, unit)}
+            onBlur={(e) => handleOffset(e.nativeEvent.text)}
+          />
+        </View>
+
+        <View style={[styles.statBox, { marginTop: 10 }]}>
+          <Text style={styles.statLabel}>
+            Linked to the real plot boundary. Editing the value resizes the plot; the offset only moves the dimension line.
+          </Text>
+        </View>
+      </View>
+    );
+  };
+
+  const getPlotDimensionMetaSafe = (axis) => {
+    const plot = layout?.plot || {};
+    const value = axis === 'width' ? (Number(plot.width) || 30) : (Number(plot.length) || 40);
+    const id = axis === 'width' ? 'dim-plot-width' : 'dim-plot-length';
+    const dim = (layout?.dimensions || []).find((d) => d.id === id);
+    const offset = dim && Number(dim.offset) ? Math.abs(Number(dim.offset)) : 2.5;
+    return { id, axis, value, offset };
   };
 
   // ---------------------------------------------------------
@@ -836,6 +916,8 @@ export default function EditorRightPanel({
             renderDoorInspector(selectedElement.data)
           ) : selectedElement.type === 'window' ? (
             renderWindowInspector(selectedElement.data)
+          ) : selectedElement.type === 'dimension' ? (
+            renderDimensionInspector(selectedElement.data)
           ) : (
             renderPlotInspector()
           )

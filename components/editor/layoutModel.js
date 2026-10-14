@@ -406,6 +406,315 @@ export function snapValue(val, snapStep = 0.5) {
   return Math.round(val / snapStep) * snapStep;
 }
 
+// ==========================================
+// WALL ORIENTATION & STRAIGHT-LINE DRAGGING
+// ==========================================
+
+/**
+ * Classify a wall's orientation. Near-axis walls are treated as perfectly
+ * horizontal / vertical so they never accidentally become tilted.
+ * @returns {'horizontal'|'vertical'|'diagonal'}
+ */
+export function getWallOrientation(wall, tolerance = 0.15) {
+  if (!wall) return 'diagonal';
+  const dx = Math.abs(wall.x2 - wall.x1);
+  const dy = Math.abs(wall.y2 - wall.y1);
+  if (dy <= tolerance && dx >= tolerance) return 'horizontal';
+  if (dx <= tolerance && dy >= tolerance) return 'vertical';
+  return 'diagonal';
+}
+
+/**
+ * Force a near-axis wall to be perfectly axis aligned (removes floating drift).
+ */
+export function normalizeWallOrientation(wall, tolerance = 0.15) {
+  if (!wall) return wall;
+  const orientation = getWallOrientation(wall, tolerance);
+  if (orientation === 'horizontal') return { ...wall, y2: wall.y1 };
+  if (orientation === 'vertical') return { ...wall, x2: wall.x1 };
+  return wall;
+}
+
+/**
+ * Translate an entire wall by (dx, dy). Both endpoints move by the exact same
+ * delta, which guarantees the length, thickness and orientation are preserved.
+ */
+export function translateWall(wall, dx, dy) {
+  if (!wall) return wall;
+  return {
+    ...wall,
+    x1: wall.x1 + dx,
+    y1: wall.y1 + dy,
+    x2: wall.x2 + dx,
+    y2: wall.y2 + dy,
+  };
+}
+
+/**
+ * Move one endpoint of a wall while preserving straight geometry.
+ * Axis-aligned walls keep their axis fixed unless diagonal mode is enabled.
+ * @param {object} wall
+ * @param {'p1'|'p2'} which
+ * @param {{x:number,y:number}} point - already snapped target position
+ * @param {{allowDiagonal?:boolean}} options
+ */
+export function moveWallEndpoint(wall, which, point, options = {}) {
+  if (!wall) return wall;
+  const { allowDiagonal = false } = options;
+  const orientation = getWallOrientation(wall);
+  let nx = point.x;
+  let ny = point.y;
+
+  if (!allowDiagonal) {
+    if (orientation === 'horizontal') {
+      ny = which === 'p1' ? wall.y1 : wall.y2;
+    } else if (orientation === 'vertical') {
+      nx = which === 'p1' ? wall.x1 : wall.x2;
+    }
+  }
+
+  if (which === 'p1') return { ...wall, x1: nx, y1: ny };
+  return { ...wall, x2: nx, y2: ny };
+}
+
+/**
+ * Move every endpoint that was coincident with `fromPoint` to `toPoint`.
+ * Used to keep adjoining walls / corners connected when a wall or endpoint
+ * is dragged. The excluded wall is left untouched.
+ */
+export function moveConnectedEndpoints(walls, fromPoint, toPoint, excludeWallId, tolerance = 0.25) {
+  if (!Array.isArray(walls) || !fromPoint || !toPoint) return walls;
+  return walls.map((w) => {
+    if (w.id === excludeWallId) return w;
+    let changed = false;
+    let nx1 = w.x1;
+    let ny1 = w.y1;
+    let nx2 = w.x2;
+    let ny2 = w.y2;
+
+    if (Math.hypot(w.x1 - fromPoint.x, w.y1 - fromPoint.y) <= tolerance) {
+      nx1 = toPoint.x;
+      ny1 = toPoint.y;
+      changed = true;
+    }
+    if (Math.hypot(w.x2 - fromPoint.x, w.y2 - fromPoint.y) <= tolerance) {
+      nx2 = toPoint.x;
+      ny2 = toPoint.y;
+      changed = true;
+    }
+    return changed ? { ...w, x1: nx1, y1: ny1, x2: nx2, y2: ny2 } : w;
+  });
+}
+
+/**
+ * Find the nearest wall endpoint to a target point (for endpoint / corner snapping).
+ * @returns {{x:number,y:number,distance:number}|null}
+ */
+export function findEndpointSnap(point, walls, tolerance = 0.75, excludeWallId = null, excludePoint = null) {
+  if (!Array.isArray(walls) || !point) return null;
+  let best = null;
+  const eps = 1e-6;
+  walls.forEach((w) => {
+    if (w.id === excludeWallId) return;
+    const candidates = [[w.x1, w.y1], [w.x2, w.y2]];
+    candidates.forEach(([ex, ey]) => {
+      if (excludePoint && Math.abs(ex - excludePoint.x) < eps && Math.abs(ey - excludePoint.y) < eps) return;
+      const d = Math.hypot(point.x - ex, point.y - ey);
+      if (d <= tolerance && (!best || d < best.distance)) {
+        best = { x: ex, y: ey, distance: d };
+      }
+    });
+  });
+  return best;
+}
+
+/**
+ * Find orthogonal alignment guides: if a free coordinate is close to another
+ * wall endpoint's coordinate, snap to it and report a guide line.
+ */
+export function findAlignmentGuides(point, walls, axis, tolerance = 0.5, excludeWallId = null) {
+  if (!Array.isArray(walls)) return { x: point.x, y: point.y, guides: [] };
+  const guides = [];
+  let nx = point.x;
+  let ny = point.y;
+
+  if (axis === 'x') {
+    let best = null;
+    walls.forEach((w) => {
+      if (w.id === excludeWallId) return;
+      [w.x1, w.x2].forEach((ex) => {
+        const d = Math.abs(point.x - ex);
+        if (d <= tolerance && (!best || d < best.d)) best = { v: ex, d };
+      });
+    });
+    if (best) {
+      nx = best.v;
+      guides.push({ orientation: 'v', pos: best.v });
+    }
+  } else if (axis === 'y') {
+    let best = null;
+    walls.forEach((w) => {
+      if (w.id === excludeWallId) return;
+      [w.y1, w.y2].forEach((ey) => {
+        const d = Math.abs(point.y - ey);
+        if (d <= tolerance && (!best || d < best.d)) best = { v: ey, d };
+      });
+    });
+    if (best) {
+      ny = best.v;
+      guides.push({ orientation: 'h', pos: best.v });
+    }
+  }
+
+  return { x: nx, y: ny, guides };
+}
+
+// ==========================================
+// PLOT DIMENSION LINES (Interactive / Editable)
+// ==========================================
+
+/**
+ * Read the outer plot dimension annotation metadata for a given axis.
+ * The measurement value is always derived from the real plot geometry so the
+ * label can never drift from the actual boundary.
+ */
+export function getPlotDimensionMeta(layout, axis) {
+  const plot = layout?.plot || {};
+  const value = axis === 'width' ? (Number(plot.width) || 30) : (Number(plot.length) || 40);
+  const id = axis === 'width' ? 'dim-plot-width' : 'dim-plot-length';
+  const dim = (layout?.dimensions || []).find((d) => d.id === id);
+  const fallback = 2.5;
+  const offset = dim && Number(dim.offset) ? Math.abs(Number(dim.offset)) : fallback;
+  return { id, axis, value, offset };
+}
+
+/**
+ * Re-derive the outer plot dimension line coordinates & labels from the real
+ * plot width/length. Mutates the provided layout (assumed already cloned) and
+ * returns it.
+ */
+export function syncPlotDimensions(layout) {
+  if (!layout || !layout.plot) return layout;
+  const W = Number(layout.plot.width) || 30;
+  const L = Number(layout.plot.length) || 40;
+  if (!Array.isArray(layout.dimensions)) layout.dimensions = [];
+
+  const wExisting = layout.dimensions.find((d) => d.id === 'dim-plot-width');
+  const lExisting = layout.dimensions.find((d) => d.id === 'dim-plot-length');
+  const wOff = wExisting && Number(wExisting.offset) ? Math.abs(Number(wExisting.offset)) : 2.5;
+  const lOff = lExisting && Number(lExisting.offset) ? Math.abs(Number(lExisting.offset)) : 2.5;
+
+  const upsert = (id, fields) => {
+    const idx = layout.dimensions.findIndex((d) => d.id === id);
+    if (idx >= 0) layout.dimensions[idx] = { ...layout.dimensions[idx], ...fields };
+    else layout.dimensions.push(createDimension({ id, ...fields }));
+  };
+
+  upsert('dim-plot-width', {
+    x1: 0, y1: -wOff, x2: W, y2: -wOff, offset: wOff,
+    label: `${W}' (Plot Width)`,
+  });
+  upsert('dim-plot-length', {
+    x1: -lOff, y1: 0, x2: -lOff, y2: L, offset: lOff,
+    label: `${L}' (Plot Length)`,
+  });
+
+  return layout;
+}
+
+/**
+ * Change the visual offset (position) of an outer plot dimension annotation.
+ * Does NOT modify the actual plot geometry.
+ */
+export function setPlotDimensionOffset(layout, axis, offset) {
+  if (!layout || !layout.plot) return layout;
+  const off = Math.max(0.5, Number(offset) || 0.5);
+  if (!Array.isArray(layout.dimensions)) layout.dimensions = [];
+  const id = axis === 'width' ? 'dim-plot-width' : 'dim-plot-length';
+  const idx = layout.dimensions.findIndex((d) => d.id === id);
+  if (idx >= 0) layout.dimensions[idx] = { ...layout.dimensions[idx], offset: off };
+  else layout.dimensions.push(createDimension({ id, offset: off }));
+  return syncPlotDimensions(layout);
+}
+
+/**
+ * Resize the real plot geometry along an axis and refresh dependent metadata
+ * (footprint + outer dimension annotations). Internal objects are intentionally
+ * NOT stretched - they stay exactly where they are and are re-validated later.
+ * @param {object} layout
+ * @param {'width'|'length'} axis
+ * @param {number} feet
+ */
+export function resizePlot(layout, axis, feet) {
+  if (!layout || !layout.plot) return layout;
+  const next = cloneLayout(layout);
+  const val = Math.max(2, Number(feet) || 0);
+  if (axis === 'width') next.plot.width = Number(val.toFixed(2));
+  else next.plot.length = Number(val.toFixed(2));
+
+  const sb = next.plot.setbacks || { east: 2, west: 2, north: 4, south: 4 };
+  next.plot.setbacks = sb;
+  next.footprint = {
+    ...(next.footprint || {}),
+    x: Number(sb.west || 0),
+    y: Number(sb.north || 0),
+    width: Math.max(1, Number((next.plot.width - (sb.west || 0) - (sb.east || 0)).toFixed(2))),
+    length: Math.max(1, Number((next.plot.length - (sb.north || 0) - (sb.south || 0)).toFixed(2))),
+  };
+
+  return syncPlotDimensions(next);
+}
+
+/**
+ * Identify elements that fall outside the (possibly resized) plot boundary.
+ * Used to warn before an unsafe shrink is applied - never deletes anything.
+ * @returns {Array<{type:string,id:string,name:string}>}
+ */
+export function findElementsOutsidePlot(layout, margin = 0.2) {
+  const W = Number(layout?.plot?.width) || 0;
+  const L = Number(layout?.plot?.length) || 0;
+  const out = [];
+
+  const checkRect = (e, type, name) => {
+    const x = Number(e.x) || 0;
+    const y = Number(e.y) || 0;
+    const w = Number(e.width) || 0;
+    const h = Number(e.length) || 0;
+    if (x < -margin || y < -margin || x + w > W + margin || y + h > L + margin) {
+      out.push({ type, id: e.id, name });
+    }
+  };
+
+  (layout?.rooms || []).forEach((r) => checkRect(r, 'room', r.name || 'Room'));
+  (layout?.staircases || []).forEach((s) => checkRect(s, 'staircase', s.label || 'Staircase'));
+  (layout?.parking || []).forEach((p) => checkRect(p, 'parking', p.label || 'Parking'));
+  (layout?.utilities || []).forEach((u) => checkRect(u, 'utility', u.name || 'Utility'));
+
+  (layout?.walls || []).forEach((w) => {
+    const pts = [[w.x1, w.y1], [w.x2, w.y2]];
+    for (const [x, y] of pts) {
+      if (x < -margin || y < -margin || x > W + margin || y > L + margin) {
+        out.push({ type: 'wall', id: w.id, name: 'Wall' });
+        break;
+      }
+    }
+  });
+
+  (layout?.doors || []).forEach((d) => {
+    if (d.x < -margin || d.y < -margin || d.x > W + margin || d.y > L + margin) {
+      out.push({ type: 'door', id: d.id, name: 'Door' });
+    }
+  });
+
+  (layout?.windows || []).forEach((win) => {
+    if (win.x < -margin || win.y < -margin || win.x > W + margin || win.y > L + margin) {
+      out.push({ type: 'window', id: win.id, name: 'Window' });
+    }
+  });
+
+  return out;
+}
+
 /**
  * Deep clone layout object for immutable updates and undo/redo
  */

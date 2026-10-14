@@ -16,7 +16,7 @@ import { HistoryManager } from './historyManager';
 import { validateLayout } from './layoutValidation';
 import { saveProject, exportProjectJSON, SAVE_STATUS } from './projectStorage';
 import { exportAsPNG, exportAsSVG, printLayoutPlan } from './exportUtils';
-import { cloneLayout } from './layoutModel';
+import { cloneLayout, resizePlot, findElementsOutsidePlot, getPlotDimensionMeta } from './layoutModel';
 import { UNIT_TYPES } from './units';
 
 export default function LayoutEditor({
@@ -36,6 +36,9 @@ export default function LayoutEditor({
   const [showDimensions, setShowDimensions] = useState(true);
   const [cursorWorldPos, setCursorWorldPos] = useState({ x: 0, y: 0 });
   const [saveStatus, setSaveStatus] = useState(SAVE_STATUS.SAVED);
+  const [allowDiagonal, setAllowDiagonal] = useState(false);
+  const [snapTolerance, setSnapTolerance] = useState(0.75);
+  const [pendingResize, setPendingResize] = useState(null); // { axis, feet, outside: [] }
 
   // Modals state
   const [exportModalVisible, setExportModalVisible] = useState(false);
@@ -74,6 +77,8 @@ export default function LayoutEditor({
         freshData = layout.parking?.find(p => p.id === data.id);
       } else if (type === 'plot') {
         freshData = layout.plot;
+      } else if (type === 'dimension') {
+        freshData = getPlotDimensionMeta(layout, data.axis);
       }
 
       if (freshData) {
@@ -132,6 +137,8 @@ export default function LayoutEditor({
         e.preventDefault();
         if (selectedElement) {
           const { type, data } = selectedElement;
+          // Plot dimension annotations are linked to the plot boundary and cannot be deleted
+          if (type === 'dimension') return;
           const nextLayout = { ...layout };
           if (type === 'room') {
             if (layout.rooms?.length <= 1) return;
@@ -223,6 +230,34 @@ export default function LayoutEditor({
     }
   };
 
+  // Apply a plot width/height change (updates real boundary + dimension annotations)
+  const applyPlotResize = (axis, feet) => {
+    const next = resizePlot(layout, axis, feet);
+    history.pushState(next);
+    setLayout(next);
+    setSelectedElement(null);
+  };
+
+  // Requested from the canvas / inspector. If shrinking the plot would push
+  // existing elements outside the boundary, confirm before applying.
+  const requestPlotResize = (axis, feet) => {
+    const next = resizePlot(layout, axis, feet);
+    const outside = findElementsOutsidePlot(next);
+    if (outside.length > 0) {
+      setPendingResize({ axis, feet, outside });
+      return;
+    }
+    history.pushState(next);
+    setLayout(next);
+    setSelectedElement(null);
+  };
+
+  const handleConfirmPlotResize = () => {
+    if (!pendingResize) return;
+    applyPlotResize(pendingResize.axis, pendingResize.feet);
+    setPendingResize(null);
+  };
+
   // Close & Apply Changes
   const handleCloseAndApply = () => {
     if (onSaveAndClose) {
@@ -250,6 +285,8 @@ export default function LayoutEditor({
         showDimensions={showDimensions}
         onToggleDimensions={() => setShowDimensions(!showDimensions)}
         onFitScreen={handleFitScreen}
+        allowDiagonal={allowDiagonal}
+        onToggleDiagonal={() => setAllowDiagonal(!allowDiagonal)}
         validationIssues={validationIssues}
         onOpenValidation={() => setValidationModalVisible(true)}
         onOpenExport={() => setExportModalVisible(true)}
@@ -283,6 +320,9 @@ export default function LayoutEditor({
           showDimensions={showDimensions}
           onCursorMove={setCursorWorldPos}
           historyManager={history}
+          allowDiagonal={allowDiagonal}
+          snapTolerance={snapTolerance}
+          onRequestPlotResize={requestPlotResize}
         />
 
         {/* Right Properties Panel (Inspector) */}
@@ -294,6 +334,7 @@ export default function LayoutEditor({
           unit={unit}
           validationIssues={validationIssues}
           historyManager={history}
+          onRequestPlotResize={requestPlotResize}
         />
       </View>
 
@@ -307,6 +348,8 @@ export default function LayoutEditor({
         layout={layout}
         validationIssues={validationIssues}
         onOpenValidation={() => setValidationModalVisible(true)}
+        snapTolerance={snapTolerance}
+        onChangeSnapTolerance={setSnapTolerance}
       />
 
       {/* EXPORT OPTIONS MODAL */}
@@ -471,6 +514,56 @@ export default function LayoutEditor({
                 onPress={handleConfirmReset}
               >
                 <Text style={styles.modalBtnDangerText}>Yes, Reset</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* PLOT DIMENSION RESIZE CONFIRMATION */}
+      <Modal visible={!!pendingResize} transparent animationType="fade" onRequestClose={() => setPendingResize(null)}>
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, { maxWidth: 440 }]}>
+            <View style={{ alignItems: 'center', paddingVertical: 8 }}>
+              <Ionicons name="resize-outline" size={40} color="#D97706" />
+              <Text style={[styles.modalTitleText, { marginTop: 10 }]}>
+                Resize Plot {pendingResize?.axis === 'width' ? 'Width' : 'Height'}?
+              </Text>
+              <Text style={[styles.modalDesc, { textAlign: 'center', marginTop: 8 }]}>
+                Changing the plot {pendingResize?.axis} to {pendingResize ? pendingResize.feet.toFixed(1) : ''} ft
+                will leave {pendingResize?.outside?.length || 0} element(s) outside the new boundary. Nothing is
+                deleted - internal layout is preserved and flagged for review.
+              </Text>
+            </View>
+
+            <View style={{ maxHeight: 160, borderWidth: 1, borderColor: '#F1F5F9', borderRadius: 6, padding: 8, marginTop: 4 }}>
+              {(pendingResize?.outside || []).slice(0, 6).map((el) => (
+                <View key={`${el.type}-${el.id}`} style={{ flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 3 }}>
+                  <Ionicons name="alert-circle-outline" size={13} color="#D97706" />
+                  <Text style={{ fontSize: 11, color: '#475569' }}>
+                    {el.name} ({el.type}) falls outside
+                  </Text>
+                </View>
+              ))}
+              {(pendingResize?.outside?.length || 0) > 6 && (
+                <Text style={{ fontSize: 11, color: '#94A3B8', marginTop: 4 }}>
+                  +{(pendingResize.outside.length - 6)} more...
+                </Text>
+              )}
+            </View>
+
+            <View style={{ flexDirection: 'row', gap: 10, marginTop: 16 }}>
+              <TouchableOpacity
+                style={[styles.modalBtnSecondary, { flex: 1 }]}
+                onPress={() => setPendingResize(null)}
+              >
+                <Text style={styles.modalBtnSecondaryText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.modalBtnDanger, { flex: 1 }]}
+                onPress={handleConfirmPlotResize}
+              >
+                <Text style={styles.modalBtnDangerText}>Apply Anyway</Text>
               </TouchableOpacity>
             </View>
           </View>

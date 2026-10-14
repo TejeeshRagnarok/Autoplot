@@ -16,6 +16,8 @@ export default function EditorStatusBar({
   layout,
   validationIssues = [],
   onOpenValidation,
+  snapTolerance = 0.75,
+  onChangeSnapTolerance,
 }) {
   const errorCount = validationIssues.filter(i => i.severity === 'error').length;
   const warningCount = validationIssues.filter(i => i.severity === 'warning').length;
@@ -67,6 +69,27 @@ export default function EditorStatusBar({
             Snap {snapEnabled ? 'ON' : 'OFF'}
           </Text>
         </TouchableOpacity>
+
+        <View style={styles.divider} />
+
+        {/* Snap Tolerance Stepper */}
+        {!!onChangeSnapTolerance && (
+          <View style={styles.snapTolGroup}>
+            <TouchableOpacity
+              style={styles.snapTolBtn}
+              onPress={() => onChangeSnapTolerance(Math.max(0.1, Number((snapTolerance - 0.25).toFixed(2))))}
+            >
+              <Ionicons name="remove" size={11} color="#64748B" />
+            </TouchableOpacity>
+            <Text style={styles.snapTolText}>{Number(snapTolerance).toFixed(2)}′</Text>
+            <TouchableOpacity
+              style={styles.snapTolBtn}
+              onPress={() => onChangeSnapTolerance(Math.min(3, Number((snapTolerance + 0.25).toFixed(2))))}
+            >
+              <Ionicons name="add" size={11} color="#64748B" />
+            </TouchableOpacity>
+          </View>
+        )}
 
         <View style={styles.divider} />
 
@@ -181,6 +204,32 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: '600',
     color: '#64748B',
+  },
+  snapTolGroup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: '#F1F5F9',
+    borderRadius: 4,
+    paddingHorizontal: 3,
+    paddingVertical: 1,
+  },
+  snapTolBtn: {
+    width: 16,
+    height: 16,
+    borderRadius: 3,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 0.5,
+    borderColor: '#CBD5E1',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  snapTolText: {
+    fontSize: 9,
+    fontWeight: '700',
+    color: '#475569',
+    minWidth: 30,
+    textAlign: 'center',
   },
   unitSelector: {
     flexDirection: 'row',

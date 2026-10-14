@@ -26,8 +26,18 @@ import {
   createParking,
   createUtility,
   generateUniqueId,
+  cloneLayout,
+  getWallOrientation,
+  translateWall,
+  moveWallEndpoint,
+  moveConnectedEndpoints,
+  findEndpointSnap,
+  findAlignmentGuides,
+  getPlotDimensionMeta,
+  syncPlotDimensions,
+  resizePlot,
 } from './layoutModel';
-import { formatMeasurement, formatArea } from './units';
+import { formatMeasurement, formatArea, parseToFeet } from './units';
 
 export default function EditorCanvas({
   layout,
@@ -42,8 +52,12 @@ export default function EditorCanvas({
   showDimensions = true,
   onCursorMove,
   historyManager,
+  allowDiagonal = false,
+  snapTolerance = 0.75,
+  onRequestPlotResize,
 }) {
   const containerRef = useRef(null);
+  const dimInputRef = useRef(null);
 
   // Viewport transformation: scale (px per foot), pan offset (px)
   const [viewport, setViewport] = useState({
@@ -57,8 +71,13 @@ export default function EditorCanvas({
   // Interaction State
   const [isPanning, setIsPanning] = useState(false);
   const [panStart, setPanStart] = useState({ x: 0, y: 0 });
-  const [draggingHandle, setDraggingHandle] = useState(null); // 'wall-p1' | 'wall-p2' | 'room-br' | 'element-body'
+  const [draggingHandle, setDraggingHandle] = useState(null); // 'wall-p1' | 'wall-p2' | 'room-br' | 'element-body' | 'dimension-line'
   const [dragStartInfo, setDragStartInfo] = useState(null);
+  const [alignmentGuides, setAlignmentGuides] = useState([]);
+
+  // Inline dimension label editing (Mode B)
+  const [editingDim, setEditingDim] = useState(null); // { axis, value, screenX, screenY }
+  const [dimInputValue, setDimInputValue] = useState('');
 
   // Drawing Tools State
   const [wallDrawStart, setWallDrawStart] = useState(null); // { x, y }
@@ -217,6 +236,67 @@ export default function EditorCanvas({
     return null;
   };
 
+  // ---- Outer plot dimension annotation helpers (width / height lines) ----
+  const getDimLabelWorld = (axis) => {
+    const W = layout?.plot?.width || 30;
+    const L = layout?.plot?.length || 40;
+    const meta = getPlotDimensionMeta(layout, axis);
+    if (axis === 'width') return { x: W / 2, y: -meta.offset };
+    return { x: -meta.offset, y: L / 2 };
+  };
+
+  const findDimensionAtWorldPoint = (wx, wy) => {
+    if (!layout?.plot) return null;
+    const W = layout.plot.width || 30;
+    const L = layout.plot.length || 40;
+    const w = getPlotDimensionMeta(layout, 'width');
+    const l = getPlotDimensionMeta(layout, 'length');
+
+    const clickScr = worldToScreen(wx, wy);
+    const isLabel = (axis) => {
+      const lw = getDimLabelWorld(axis);
+      const scr = worldToScreen(lw.x, lw.y);
+      return Math.abs(clickScr.x - scr.x) <= 38 && Math.abs(clickScr.y - scr.y) <= 13;
+    };
+
+    const lineTol = 1.1;
+    if (wy > -w.offset - lineTol && wy < -w.offset + lineTol && wx > -lineTol && wx < W + lineTol) {
+      return { axis: 'width', meta: w, onLabel: isLabel('width') };
+    }
+    if (wx > -l.offset - lineTol && wx < -l.offset + lineTol && wy > -lineTol && wy < L + lineTol) {
+      return { axis: 'length', meta: l, onLabel: isLabel('length') };
+    }
+    return null;
+  };
+
+  const openDimensionEditor = (axis) => {
+    const meta = getPlotDimensionMeta(layout, axis);
+    const lw = getDimLabelWorld(axis);
+    const scr = worldToScreen(lw.x, lw.y);
+    setEditingDim({ axis, screenX: scr.x, screenY: scr.y });
+    setDimInputValue(formatMeasurement(meta.value, unit));
+    onSelectElement({ type: 'dimension', data: meta });
+  };
+
+  const commitDimensionEdit = () => {
+    if (!editingDim) return;
+    const axis = editingDim.axis;
+    const feet = parseToFeet(dimInputValue, unit);
+    setEditingDim(null);
+    if (feet !== null && feet > 0) {
+      if (onRequestPlotResize) {
+        // Routed through LayoutEditor so unsafe shrinks can be confirmed first.
+        onRequestPlotResize(axis, feet);
+      } else {
+        const next = resizePlot(layout, axis, feet);
+        historyManager.pushState(next);
+        onUpdateLayout(next);
+      }
+    }
+  };
+
+  const cancelDimensionEdit = () => setEditingDim(null);
+
   // Pointer Down
   const handlePointerDown = (e) => {
     if (!containerRef.current) return;
@@ -358,7 +438,28 @@ export default function EditorCanvas({
       return;
     }
 
-    // 8. Tool: Select / Move
+    // 8. Dimension annotations take priority in the Select tool so a click on a
+    //    label never falls through and drags a wall.
+    if (activeTool === 'select') {
+      const dimHit = findDimensionAtWorldPoint(worldPos.x, worldPos.y);
+      if (dimHit) {
+        if (dimHit.onLabel) {
+          openDimensionEditor(dimHit.axis);
+          return;
+        }
+        onSelectElement({ type: 'dimension', data: dimHit.meta });
+        setDraggingHandle('dimension-line');
+        setDragStartInfo({
+          startWorld: worldPos,
+          axis: dimHit.axis,
+          initialOffset: dimHit.meta.offset,
+        });
+        historyManager.beginDrag();
+        return;
+      }
+    }
+
+    // 9. Tool: Select / Move
     // Check if clicked on a selected element's handles
     if (selectedElement) {
       if (selectedElement.type === 'wall') {
@@ -367,13 +468,21 @@ export default function EditorCanvas({
         const d2 = Math.hypot(worldPos.x - wall.x2, worldPos.y - wall.y2);
         if (d1 < 1.0) {
           setDraggingHandle('wall-p1');
-          setDragStartInfo({ startWorld: worldPos, initial: { ...wall } });
+          setDragStartInfo({
+            startWorld: worldPos,
+            initial: { ...wall },
+            wallSnapshot: cloneLayout(layout.walls || []),
+          });
           historyManager.beginDrag();
           return;
         }
         if (d2 < 1.0) {
           setDraggingHandle('wall-p2');
-          setDragStartInfo({ startWorld: worldPos, initial: { ...wall } });
+          setDragStartInfo({
+            startWorld: worldPos,
+            initial: { ...wall },
+            wallSnapshot: cloneLayout(layout.walls || []),
+          });
           historyManager.beginDrag();
           return;
         }
@@ -397,7 +506,12 @@ export default function EditorCanvas({
       onSelectElement(hit);
       // Start moving element
       setDraggingHandle('element-body');
-      setDragStartInfo({ startWorld: worldPos, hitType: hit.type, initial: { ...hit.data } });
+      setDragStartInfo({
+        startWorld: worldPos,
+        hitType: hit.type,
+        initial: { ...hit.data },
+        wallSnapshot: hit.type === 'wall' ? cloneLayout(layout.walls || []) : null,
+      });
       historyManager.beginDrag();
     } else {
       // Clicked on empty space -> deselect or pan
@@ -435,38 +549,73 @@ export default function EditorCanvas({
       const dx = worldPos.x - dragStartInfo.startWorld.x;
       const dy = worldPos.y - dragStartInfo.startWorld.y;
 
-      // 1. Wall Endpoint 1
-      if (draggingHandle === 'wall-p1' && selectedElement.type === 'wall') {
-        const wallId = selectedElement.data.id;
-        const nextWalls = layout.walls.map(w => {
-          if (w.id === wallId) {
-            return {
-              ...w,
-              x1: snap(dragStartInfo.initial.x1 + dx),
-              y1: snap(dragStartInfo.initial.y1 + dy),
-            };
-          }
-          return w;
-        });
-        const nextLayout = { ...layout, walls: nextWalls };
+      // 0. Dimension annotation move (Mode A: changes offset only, never plot size)
+      if (draggingHandle === 'dimension-line') {
+        const axis = dragStartInfo.axis;
+        const lineDelta = axis === 'width' ? -dy : -dx;
+        const newOffset = Math.max(0.5, dragStartInfo.initialOffset + lineDelta);
+        const dimId = axis === 'width' ? 'dim-plot-width' : 'dim-plot-length';
+        const nextLayout = {
+          ...layout,
+          dimensions: (layout.dimensions || []).map((d) =>
+            d.id === dimId ? { ...d, offset: newOffset } : d
+          ),
+        };
+        syncPlotDimensions(nextLayout);
         historyManager.updateDuringDrag(nextLayout);
         onUpdateLayout(nextLayout);
         return;
       }
 
-      // 2. Wall Endpoint 2
-      if (draggingHandle === 'wall-p2' && selectedElement.type === 'wall') {
-        const wallId = selectedElement.data.id;
-        const nextWalls = layout.walls.map(w => {
-          if (w.id === wallId) {
-            return {
-              ...w,
-              x2: snap(dragStartInfo.initial.x2 + dx),
-              y2: snap(dragStartInfo.initial.y2 + dy),
-            };
+      // 1 & 2. Wall Endpoint drag: resize while keeping the wall perfectly straight
+      if ((draggingHandle === 'wall-p1' || draggingHandle === 'wall-p2') && selectedElement.type === 'wall') {
+        const which = draggingHandle === 'wall-p1' ? 'p1' : 'p2';
+        const wallId = dragStartInfo.initial.id;
+        const snapshot = dragStartInfo.wallSnapshot || layout.walls || [];
+        const sel = snapshot.find(w => w.id === wallId) || dragStartInfo.initial;
+        const orig = which === 'p1' ? { x: sel.x1, y: sel.y1 } : { x: sel.x2, y: sel.y2 };
+        const orientation = getWallOrientation(sel);
+
+        let target = { x: snap(worldPos.x), y: snap(worldPos.y) };
+        let guides = [];
+
+        // Lock the free axis for axis-aligned walls (unless diagonal mode on)
+        const lockAxis = !allowDiagonal && (orientation === 'horizontal' || orientation === 'vertical');
+        if (lockAxis && orientation === 'horizontal') target.y = orig.y;
+        if (lockAxis && orientation === 'vertical') target.x = orig.x;
+
+        // Endpoint / corner snapping to other wall endpoints
+        const endpointHit = findEndpointSnap(
+          { x: worldPos.x, y: worldPos.y },
+          snapshot,
+          snapTolerance,
+          wallId,
+          orig
+        );
+        if (endpointHit) {
+          target = { x: endpointHit.x, y: endpointHit.y };
+        } else if (lockAxis) {
+          // Orthogonal alignment guides
+          const axis = orientation === 'horizontal' ? 'x' : 'y';
+          const aligned = findAlignmentGuides(target, snapshot, axis, snapTolerance * 0.7, wallId);
+          if (aligned.guides.length > 0) {
+            target[axis] = aligned[axis];
+            guides = aligned.guides;
           }
-          return w;
-        });
+        }
+
+        // Re-apply axis lock so snapping can never tilt an axis-aligned wall
+        if (lockAxis && orientation === 'horizontal') target.y = orig.y;
+        if (lockAxis && orientation === 'vertical') target.x = orig.x;
+
+        const newSel = moveWallEndpoint(sel, which, target, { allowDiagonal });
+        const newEndpoint = which === 'p1' ? { x: newSel.x1, y: newSel.y1 } : { x: newSel.x2, y: newSel.y2 };
+
+        let nextWalls = snapshot.map(w => (w.id === wallId ? newSel : w));
+        // Keep adjoining walls / corners connected
+        nextWalls = moveConnectedEndpoints(nextWalls, orig, newEndpoint, wallId, 0.3);
+
+        setAlignmentGuides(guides);
         const nextLayout = { ...layout, walls: nextWalls };
         historyManager.updateDuringDrag(nextLayout);
         onUpdateLayout(nextLayout);
@@ -503,15 +652,28 @@ export default function EditorCanvas({
           historyManager.updateDuringDrag(nextLayout);
           onUpdateLayout(nextLayout);
         } else if (elemType === 'wall') {
+          // Translate the whole wall by an identical delta for both endpoints.
+          // This guarantees length, thickness and orientation never change.
           const moveX = snap(dx);
           const moveY = snap(dy);
-          const nextWalls = layout.walls.map(w => (w.id === id ? {
-            ...w,
-            x1: dragStartInfo.initial.x1 + moveX,
-            y1: dragStartInfo.initial.y1 + moveY,
-            x2: dragStartInfo.initial.x2 + moveX,
-            y2: dragStartInfo.initial.y2 + moveY,
-          } : w));
+          const snapshot = dragStartInfo.wallSnapshot || layout.walls || [];
+          const orig = snapshot.find(w => w.id === id) || dragStartInfo.initial;
+          const newA = { x: orig.x1 + moveX, y: orig.y1 + moveY };
+          const newB = { x: orig.x2 + moveX, y: orig.y2 + moveY };
+          const tolerance = 0.25;
+
+          const nextWalls = snapshot.map(w => {
+            if (w.id === id) {
+              return { ...w, x1: newA.x, y1: newA.y, x2: newB.x, y2: newB.y };
+            }
+            // Follow adjoining walls whose endpoint was connected to the moved wall
+            let nx1 = w.x1, ny1 = w.y1, nx2 = w.x2, ny2 = w.y2, changed = false;
+            if (Math.hypot(w.x1 - orig.x1, w.y1 - orig.y1) <= tolerance) { nx1 = newA.x; ny1 = newA.y; changed = true; }
+            if (Math.hypot(w.x2 - orig.x1, w.y2 - orig.y1) <= tolerance) { nx2 = newA.x; ny2 = newA.y; changed = true; }
+            if (Math.hypot(w.x1 - orig.x2, w.y1 - orig.y2) <= tolerance) { nx1 = newB.x; ny1 = newB.y; changed = true; }
+            if (Math.hypot(w.x2 - orig.x2, w.y2 - orig.y2) <= tolerance) { nx2 = newB.x; ny2 = newB.y; changed = true; }
+            return changed ? { ...w, x1: nx1, y1: ny1, x2: nx2, y2: ny2 } : w;
+          });
           const nextLayout = { ...layout, walls: nextWalls };
           historyManager.updateDuringDrag(nextLayout);
           onUpdateLayout(nextLayout);
@@ -564,6 +726,7 @@ export default function EditorCanvas({
       historyManager.endDrag(layout);
       setDraggingHandle(null);
       setDragStartInfo(null);
+      setAlignmentGuides([]);
     }
   };
 
@@ -606,6 +769,106 @@ export default function EditorCanvas({
           {ticksY}
         </div>
       </>
+    );
+  };
+
+  // Outer Plot Dimension Lines (selectable + editable annotations)
+  const renderPlotDimensions = () => {
+    if (!layout || !showDimensions) return null;
+    const W = layout.plot?.width || 30;
+    const L = layout.plot?.length || 40;
+    const w = getPlotDimensionMeta(layout, 'width');
+    const l = getPlotDimensionMeta(layout, 'length');
+    const wSel = selectedElement?.type === 'dimension' && selectedElement.data?.axis === 'width';
+    const lSel = selectedElement?.type === 'dimension' && selectedElement.data?.axis === 'length';
+    const baseColor = '#B45309';
+    const selColor = '#2563EB';
+
+    const renderLabel = (scr, text, selected, axis) => {
+      const isEditing = editingDim && editingDim.axis === axis;
+      return (
+        <g>
+          <rect
+            x={scr.x - 34}
+            y={scr.y - 10}
+            width="68"
+            height="20"
+            rx="3"
+            fill={selected ? selColor : '#FFFFFF'}
+            stroke={selected ? selColor : baseColor}
+            strokeWidth="1.2"
+            opacity={isEditing ? 0.3 : 1}
+          />
+          <text
+            x={scr.x}
+            y={scr.y + 4}
+            textAnchor="middle"
+            fontSize="11"
+            fontWeight="700"
+            fill={selected ? '#FFFFFF' : baseColor}
+            fontFamily="Segoe UI, sans-serif"
+            opacity={isEditing ? 0.3 : 1}
+          >
+            {text}
+          </text>
+        </g>
+      );
+    };
+
+    const renderDimension = (axis, selected) => {
+      const color = selected ? selColor : baseColor;
+      const lsc = worldToScreen(getDimLabelWorld(axis).x, getDimLabelWorld(axis).y);
+
+      if (axis === 'width') {
+        const y = -w.offset;
+        const a = worldToScreen(0, y);
+        const b = worldToScreen(W, y);
+        const e1a = worldToScreen(0, 0.4);
+        const e1b = worldToScreen(0, y - 0.6);
+        const e2a = worldToScreen(W, 0.4);
+        const e2b = worldToScreen(W, y - 0.6);
+        return (
+          <g key="dim-width">
+            {selected && <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="rgba(37,99,235,0.22)" strokeWidth="12" />}
+            <line x1={e1a.x} y1={e1a.y} x2={e1b.x} y2={e1b.y} stroke={color} strokeWidth="1" strokeDasharray="3,2" />
+            <line x1={e2a.x} y1={e2a.y} x2={e2b.x} y2={e2b.y} stroke={color} strokeWidth="1" strokeDasharray="3,2" />
+            <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={color} strokeWidth={selected ? 2 : 1.4} strokeDasharray="5,4" />
+            <polygon points={`${a.x},${a.y} ${a.x + 11},${a.y - 4} ${a.x + 11},${a.y + 4}`} fill={color} />
+            <polygon points={`${b.x},${b.y} ${b.x - 11},${b.y - 4} ${b.x - 11},${b.y + 4}`} fill={color} />
+            {selected && <rect x={a.x - 4} y={a.y - 4} width="8" height="8" fill={selColor} stroke="#FFFFFF" strokeWidth="1.5" />}
+            {selected && <rect x={b.x - 4} y={b.y - 4} width="8" height="8" fill={selColor} stroke="#FFFFFF" strokeWidth="1.5" />}
+            {renderLabel(lsc, formatMeasurement(W, unit), selected, 'width')}
+          </g>
+        );
+      }
+
+      const x = -l.offset;
+      const a = worldToScreen(x, 0);
+      const b = worldToScreen(x, L);
+      const e1a = worldToScreen(0.4, 0);
+      const e1b = worldToScreen(x - 0.6, 0);
+      const e2a = worldToScreen(0.4, L);
+      const e2b = worldToScreen(x - 0.6, L);
+      return (
+        <g key="dim-length">
+          {selected && <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="rgba(37,99,235,0.22)" strokeWidth="12" />}
+          <line x1={e1a.x} y1={e1a.y} x2={e1b.x} y2={e1b.y} stroke={color} strokeWidth="1" strokeDasharray="3,2" />
+          <line x1={e2a.x} y1={e2a.y} x2={e2b.x} y2={e2b.y} stroke={color} strokeWidth="1" strokeDasharray="3,2" />
+          <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={color} strokeWidth={selected ? 2 : 1.4} strokeDasharray="5,4" />
+          <polygon points={`${a.x},${a.y} ${a.x - 4},${a.y + 11} ${a.x + 4},${a.y + 11}`} fill={color} />
+          <polygon points={`${b.x},${b.y} ${b.x - 4},${b.y - 11} ${b.x + 4},${b.y - 11}`} fill={color} />
+          {selected && <rect x={a.x - 4} y={a.y - 4} width="8" height="8" fill={selColor} stroke="#FFFFFF" strokeWidth="1.5" />}
+          {selected && <rect x={b.x - 4} y={b.y - 4} width="8" height="8" fill={selColor} stroke="#FFFFFF" strokeWidth="1.5" />}
+          {renderLabel(lsc, formatMeasurement(L, unit), selected, 'length')}
+        </g>
+      );
+    };
+
+    return (
+      <g>
+        {renderDimension('width', wSel)}
+        {renderDimension('length', lSel)}
+      </g>
     );
   };
 
@@ -701,6 +964,41 @@ export default function EditorCanvas({
           <text x={plotScr.x + plotWidthPx - 26} y={plotScr.y + plotHeightPx - 10}>SE</text>
           <text x={plotScr.x + 10} y={plotScr.y + plotHeightPx - 10}>SW</text>
         </g>
+
+        {/* Outer Plot Dimension Lines (interactive) */}
+        {renderPlotDimensions()}
+
+        {/* Live alignment guides while dragging wall endpoints */}
+        {alignmentGuides.map((g, i) => {
+          if (g.orientation === 'v') {
+            const p = worldToScreen(g.pos, 0);
+            return (
+              <line
+                key={`ag-${i}`}
+                x1={p.x}
+                y1={plotScr.y - 60}
+                x2={p.x}
+                y2={plotScr.y + plotHeightPx + 60}
+                stroke="#EC4899"
+                strokeWidth="1"
+                strokeDasharray="5,4"
+              />
+            );
+          }
+          const p = worldToScreen(0, g.pos);
+          return (
+            <line
+              key={`ag-${i}`}
+              x1={plotScr.x - 60}
+              y1={p.y}
+              x2={plotScr.x + plotWidthPx + 60}
+              y2={p.y}
+              stroke="#EC4899"
+              strokeWidth="1"
+              strokeDasharray="5,4"
+            />
+          );
+        })}
 
         {/* Rooms Layer */}
         {(layout?.rooms || []).map(room => {
@@ -1038,6 +1336,42 @@ export default function EditorCanvas({
           </g>
         )}
       </svg>
+
+      {/* Inline numeric editor for a selected plot dimension label (Mode B) */}
+      {editingDim && (
+        <input
+          ref={dimInputRef}
+          value={dimInputValue}
+          autoFocus
+          onChange={(e) => setDimInputValue(e.target.value)}
+          onPointerDown={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+          onKeyDown={(e) => {
+            e.stopPropagation();
+            if (e.key === 'Enter') commitDimensionEdit();
+            else if (e.key === 'Escape') cancelDimensionEdit();
+          }}
+          onBlur={commitDimensionEdit}
+          style={{
+            position: 'absolute',
+            left: editingDim.screenX - 48,
+            top: editingDim.screenY - 15,
+            width: 96,
+            height: 30,
+            textAlign: 'center',
+            fontSize: 12,
+            fontWeight: 700,
+            color: '#0F172A',
+            border: '2px solid #2563EB',
+            borderRadius: 5,
+            background: '#FFFFFF',
+            outline: 'none',
+            zIndex: 100,
+            boxShadow: '0 4px 12px rgba(15, 23, 42, 0.2)',
+          }}
+        />
+      )}
     </div>
   );
 }

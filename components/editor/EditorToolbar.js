@@ -22,6 +22,8 @@ export default function EditorToolbar({
   showDimensions,
   onToggleDimensions,
   onFitScreen,
+  allowDiagonal = false,
+  onToggleDiagonal,
   validationIssues = [],
   onOpenValidation,
   onOpenExport,
@@ -113,6 +115,14 @@ export default function EditorToolbar({
           title="Toggle Dimensions"
         >
           <Ionicons name="text-outline" size={16} color={showDimensions ? "#2563EB" : "#64748B"} />
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.toolBtn, allowDiagonal && styles.btnActive]}
+          onPress={onToggleDiagonal}
+          title={allowDiagonal ? 'Diagonal Walls: ON' : 'Diagonal Walls: OFF (H/V locked)'}
+        >
+          <Ionicons name="analytics-outline" size={16} color={allowDiagonal ? "#2563EB" : "#64748B"} />
         </TouchableOpacity>
 
         <TouchableOpacity
