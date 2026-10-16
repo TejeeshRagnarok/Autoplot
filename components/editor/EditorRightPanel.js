@@ -179,7 +179,7 @@ export default function EditorRightPanel({
     };
 
     return (
-      <View style={styles.inspectorContent}>
+      <View key={`inspector-room-${room?.id || 'room'}`} style={styles.inspectorContent}>
         {/* Header */}
         <View style={styles.elemHeader}>
           <Ionicons name="crop" size={18} color="#2563EB" />
@@ -190,8 +190,9 @@ export default function EditorRightPanel({
         <View style={styles.inputGroup}>
           <Text style={styles.inputLabel}>Room Name</Text>
           <TextInput
+            key={`room-name-${room?.id || 'room'}`}
             style={styles.textInput}
-            value={room.name}
+            value={room?.name ?? ''}
             onChangeText={(val) => handleRoomField('name', val)}
           />
         </View>
@@ -201,16 +202,18 @@ export default function EditorRightPanel({
           <View style={[styles.inputGroup, { flex: 1 }]}>
             <Text style={styles.inputLabel}>Width ({unit})</Text>
             <TextInput
+              key={`room-w-${room?.id}-${room?.width}-${unit}`}
               style={styles.textInput}
-              defaultValue={formatMeasurement(room.width, unit)}
+              defaultValue={formatMeasurement(room?.width ?? 10, unit)}
               onBlur={(e) => handleDimensionInput('width', e.nativeEvent.text)}
             />
           </View>
           <View style={[styles.inputGroup, { flex: 1 }]}>
             <Text style={styles.inputLabel}>Length ({unit})</Text>
             <TextInput
+              key={`room-l-${room?.id}-${room?.length}-${unit}`}
               style={styles.textInput}
-              defaultValue={formatMeasurement(room.length, unit)}
+              defaultValue={formatMeasurement(room?.length ?? 10, unit)}
               onBlur={(e) => handleDimensionInput('length', e.nativeEvent.text)}
             />
           </View>
@@ -227,16 +230,18 @@ export default function EditorRightPanel({
           <View style={[styles.inputGroup, { flex: 1 }]}>
             <Text style={styles.inputLabel}>Position X (ft)</Text>
             <TextInput
+              key={`room-x-${room?.id}-${room?.x}`}
               style={styles.textInput}
-              defaultValue={String(room.x)}
+              defaultValue={String(room?.x ?? 0)}
               onBlur={(e) => handleRoomField('x', parseFloat(e.nativeEvent.text) || 0)}
             />
           </View>
           <View style={[styles.inputGroup, { flex: 1 }]}>
             <Text style={styles.inputLabel}>Position Y (ft)</Text>
             <TextInput
+              key={`room-y-${room?.id}-${room?.y}`}
               style={styles.textInput}
-              defaultValue={String(room.y)}
+              defaultValue={String(room?.y ?? 0)}
               onBlur={(e) => handleRoomField('y', parseFloat(e.nativeEvent.text) || 0)}
             />
           </View>
@@ -330,7 +335,7 @@ export default function EditorRightPanel({
     };
 
     return (
-      <View style={styles.inspectorContent}>
+      <View key={`inspector-wall-${wall?.id || 'wall'}`} style={styles.inspectorContent}>
         <View style={styles.elemHeader}>
           <Ionicons name="pencil" size={18} color="#2563EB" />
           <Text style={styles.elemTitle}>Wall Properties</Text>
@@ -369,8 +374,9 @@ export default function EditorRightPanel({
         <View style={styles.inputGroup}>
           <Text style={styles.inputLabel}>Wall Thickness (ft)</Text>
           <TextInput
+            key={`wall-th-${wall?.id}-${wall?.thickness}`}
             style={styles.textInput}
-            defaultValue={String(wall.thickness)}
+            defaultValue={String(wall?.thickness ?? 0.375)}
             onBlur={(e) => handleWallField('thickness', parseFloat(e.nativeEvent.text) || 0.375)}
           />
         </View>
@@ -393,16 +399,18 @@ export default function EditorRightPanel({
           <View style={[styles.inputGroup, { flex: 1 }]}>
             <Text style={styles.inputLabel}>X1 (ft)</Text>
             <TextInput
+              key={`wall-x1-${wall?.id}-${wall?.x1}`}
               style={styles.textInput}
-              defaultValue={String(wall.x1)}
+              defaultValue={String(wall?.x1 ?? 0)}
               onBlur={(e) => handleWallField('x1', parseFloat(e.nativeEvent.text) || 0)}
             />
           </View>
           <View style={[styles.inputGroup, { flex: 1 }]}>
             <Text style={styles.inputLabel}>Y1 (ft)</Text>
             <TextInput
+              key={`wall-y1-${wall?.id}-${wall?.y1}`}
               style={styles.textInput}
-              defaultValue={String(wall.y1)}
+              defaultValue={String(wall?.y1 ?? 0)}
               onBlur={(e) => handleWallField('y1', parseFloat(e.nativeEvent.text) || 0)}
             />
           </View>
@@ -414,16 +422,18 @@ export default function EditorRightPanel({
           <View style={[styles.inputGroup, { flex: 1 }]}>
             <Text style={styles.inputLabel}>X2 (ft)</Text>
             <TextInput
+              key={`wall-x2-${wall?.id}-${wall?.x2}`}
               style={styles.textInput}
-              defaultValue={String(wall.x2)}
+              defaultValue={String(wall?.x2 ?? 0)}
               onBlur={(e) => handleWallField('x2', parseFloat(e.nativeEvent.text) || 0)}
             />
           </View>
           <View style={[styles.inputGroup, { flex: 1 }]}>
             <Text style={styles.inputLabel}>Y2 (ft)</Text>
             <TextInput
+              key={`wall-y2-${wall?.id}-${wall?.y2}`}
               style={styles.textInput}
-              defaultValue={String(wall.y2)}
+              defaultValue={String(wall?.y2 ?? 0)}
               onBlur={(e) => handleWallField('y2', parseFloat(e.nativeEvent.text) || 0)}
             />
           </View>
@@ -462,7 +472,7 @@ export default function EditorRightPanel({
     };
 
     return (
-      <View style={styles.inspectorContent}>
+      <View key={`inspector-door-${door?.id || 'door'}`} style={styles.inspectorContent}>
         <View style={styles.elemHeader}>
           <Ionicons name="enter" size={18} color="#B45309" />
           <Text style={styles.elemTitle}>Door Properties</Text>
@@ -471,8 +481,9 @@ export default function EditorRightPanel({
         <View style={styles.inputGroup}>
           <Text style={styles.inputLabel}>Door Width ({unit})</Text>
           <TextInput
+            key={`door-w-${door?.id}-${door?.width}-${unit}`}
             style={styles.textInput}
-            defaultValue={formatMeasurement(door.width, unit)}
+            defaultValue={formatMeasurement(door?.width ?? 3, unit)}
             onBlur={(e) => {
               const feet = parseToFeet(e.nativeEvent.text, unit);
               if (feet) handleDoorField('width', feet);
@@ -553,7 +564,7 @@ export default function EditorRightPanel({
     };
 
     return (
-      <View style={styles.inspectorContent}>
+      <View key={`inspector-win-${win?.id || 'win'}`} style={styles.inspectorContent}>
         <View style={styles.elemHeader}>
           <Ionicons name="browsers" size={18} color="#0284C7" />
           <Text style={styles.elemTitle}>Window Properties</Text>
@@ -562,8 +573,9 @@ export default function EditorRightPanel({
         <View style={styles.inputGroup}>
           <Text style={styles.inputLabel}>Window Width ({unit})</Text>
           <TextInput
+            key={`win-w-${win?.id}-${win?.width}-${unit}`}
             style={styles.textInput}
-            defaultValue={formatMeasurement(win.width, unit)}
+            defaultValue={formatMeasurement(win?.width ?? 4, unit)}
             onBlur={(e) => {
               const feet = parseToFeet(e.nativeEvent.text, unit);
               if (feet) handleWinField('width', feet);
@@ -657,7 +669,7 @@ export default function EditorRightPanel({
     };
 
     return (
-      <View style={styles.inspectorContent}>
+      <View key="inspector-plot" style={styles.inspectorContent}>
         <View style={styles.elemHeader}>
           <Ionicons name="map" size={18} color="#D97706" />
           <Text style={styles.elemTitle}>Plot & Building Parameters</Text>
@@ -668,7 +680,7 @@ export default function EditorRightPanel({
           <View style={[styles.inputGroup, { flex: 1 }]}>
             <Text style={styles.inputLabel}>Plot Width ({unit})</Text>
             <TextInput
-              key={`plot-w-${plotW}`}
+              key={`plot-w-${plotW}-${unit}`}
               style={styles.textInput}
               defaultValue={formatMeasurement(plotW, unit)}
               onBlur={(e) => handlePlotDim('width', e.nativeEvent.text)}
@@ -677,7 +689,7 @@ export default function EditorRightPanel({
           <View style={[styles.inputGroup, { flex: 1 }]}>
             <Text style={styles.inputLabel}>Plot Length ({unit})</Text>
             <TextInput
-              key={`plot-l-${plotL}`}
+              key={`plot-l-${plotL}-${unit}`}
               style={styles.textInput}
               defaultValue={formatMeasurement(plotL, unit)}
               onBlur={(e) => handlePlotDim('length', e.nativeEvent.text)}
@@ -777,7 +789,7 @@ export default function EditorRightPanel({
     };
 
     return (
-      <View style={styles.inspectorContent}>
+      <View key={`inspector-dim-${axis}`} style={styles.inspectorContent}>
         <View style={styles.elemHeader}>
           <Ionicons name="resize" size={18} color="#2563EB" />
           <Text style={styles.elemTitle}>{label} Dimension</Text>
@@ -786,7 +798,7 @@ export default function EditorRightPanel({
         <View style={styles.inputGroup}>
           <Text style={styles.inputLabel}>{label} ({unit})</Text>
           <TextInput
-            key={`dim-val-${axis}-${meta.value}`}
+            key={`dim-val-${axis}-${meta.value}-${unit}`}
             style={styles.textInput}
             defaultValue={formatMeasurement(meta.value, unit)}
             onBlur={(e) => handleValue(e.nativeEvent.text)}
@@ -796,7 +808,7 @@ export default function EditorRightPanel({
         <View style={styles.inputGroup}>
           <Text style={styles.inputLabel}>Annotation Offset ({unit})</Text>
           <TextInput
-            key={`dim-off-${axis}-${meta.offset}`}
+            key={`dim-off-${axis}-${meta.offset}-${unit}`}
             style={styles.textInput}
             defaultValue={formatMeasurement(meta.offset, unit)}
             onBlur={(e) => handleOffset(e.nativeEvent.text)}
@@ -826,7 +838,7 @@ export default function EditorRightPanel({
   // ---------------------------------------------------------
   const renderValidationTab = () => {
     return (
-      <View style={styles.inspectorContent}>
+      <View key="inspector-validation" style={styles.inspectorContent}>
         <View style={styles.elemHeader}>
           <Ionicons name="shield-checkmark" size={18} color="#059669" />
           <Text style={styles.elemTitle}>Layout Validation</Text>
