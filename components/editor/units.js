@@ -83,8 +83,8 @@ export function parseToFeet(inputStr, currentUnit = 'ft-in') {
     if (!isNaN(numPart)) return numPart / 0.3048;
   }
 
-  // 2. Explicit inches check (e.g. "144"" or "144 in" or "144in")
-  if (raw.endsWith('"') || raw.endsWith('in') || raw.endsWith('inches')) {
+  // 2. Explicit inches check (e.g. "144\"" or "144 in" or "144in") without feet
+  if ((raw.endsWith('"') || raw.endsWith('in') || raw.endsWith('inches')) && !raw.includes("'") && !raw.includes('ft')) {
     const numPart = parseFloat(raw.replace(/in(ches)?|"/g, '').trim());
     if (!isNaN(numPart)) return numPart / 12;
   }

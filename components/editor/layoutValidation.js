@@ -10,7 +10,9 @@
  * - Vastu advisory notifications
  */
 
-import { calculateWallLength } from './layoutModel';
+import { calculateWallLength } from './layoutModel.js';
+import { validateStaircaseFit } from './staircaseGeometry.js';
+import { validateOpenings } from './constraintEngine.js';
 
 export const SEVERITY = {
   ERROR: 'error',
@@ -216,6 +218,34 @@ export function validateLayout(layout) {
       });
     }
   });
+
+  // 7. Staircase drafting guidelines (geometric checks only)
+  (layout.staircases || []).forEach((st) => {
+    validateStaircaseFit(st, layout).warnings.forEach((w, i) => {
+      issues.push({
+        id: `issue-stair-${st.id}-${i}`,
+        elementId: st.id,
+        elementType: 'staircase',
+        severity: SEVERITY.WARNING,
+        title: 'Staircase Guideline',
+        message: w,
+      });
+    });
+  });
+
+  // 8. Openings wider than their host wall (checked on a copy - no side effects)
+  validateOpenings(JSON.parse(JSON.stringify({ walls: layout.walls || [], doors: layout.doors || [], windows: layout.windows || [] })))
+    .filter((c) => c.code === 'opening-too-wide')
+    .forEach((c) => {
+      issues.push({
+        id: `issue-opening-${c.id}`,
+        elementId: c.id,
+        elementType: (layout.doors || []).some((d) => d.id === c.id) ? 'door' : 'window',
+        severity: SEVERITY.ERROR,
+        title: 'Opening Wider Than Wall',
+        message: c.message,
+      });
+    });
 
   return issues;
 }

@@ -5,7 +5,7 @@
  * instead, a step is committed only when the drag ends or an explicit edit completes.
  */
 
-import { cloneLayout } from './layoutModel';
+import { cloneLayout } from './layoutModel.js';
 
 export class HistoryManager {
   constructor(initialLayout, maxHistory = 50) {
@@ -50,7 +50,9 @@ export class HistoryManager {
    */
   endDrag(finalLayout) {
     if (this.isDragging) {
-      if (this.dragSnapshot) {
+      // A click or a drag that ended where it started is not an undo step
+      const unchanged = this.dragSnapshot && JSON.stringify(this.dragSnapshot) === JSON.stringify(finalLayout);
+      if (this.dragSnapshot && !unchanged) {
         this.undoStack.push(this.dragSnapshot);
         if (this.undoStack.length > this.maxHistory) {
           this.undoStack.shift();
@@ -61,6 +63,19 @@ export class HistoryManager {
       this.isDragging = false;
       this.dragSnapshot = null;
     }
+  }
+
+  /**
+   * Abandon a drag: restore the layout from before the drag without adding a
+   * history step. Returns the restored layout.
+   */
+  cancelDrag() {
+    if (this.isDragging && this.dragSnapshot) {
+      this.current = this.dragSnapshot;
+    }
+    this.isDragging = false;
+    this.dragSnapshot = null;
+    return cloneLayout(this.current);
   }
 
   /**

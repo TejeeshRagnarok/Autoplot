@@ -16,7 +16,7 @@ import { HistoryManager } from './historyManager';
 import { validateLayout } from './layoutValidation';
 import { saveProject, exportProjectJSON, SAVE_STATUS } from './projectStorage';
 import { exportAsPNG, exportAsSVG, printLayoutPlan } from './exportUtils';
-import { cloneLayout, resizePlot, findElementsOutsidePlot, getPlotDimensionMeta } from './layoutModel';
+import { cloneLayout, applySiteChange, getPlotDimensionMeta } from './layoutModel';
 import { UNIT_TYPES } from './units';
 
 export default function LayoutEditor({
@@ -38,7 +38,7 @@ export default function LayoutEditor({
   const [saveStatus, setSaveStatus] = useState(SAVE_STATUS.SAVED);
   const [allowDiagonal, setAllowDiagonal] = useState(false);
   const [snapTolerance, setSnapTolerance] = useState(0.75);
-  const [pendingResize, setPendingResize] = useState(null); // { axis, feet, outside: [] }
+  const [pendingResize, setPendingResize] = useState(null); // { change, result } - a site change with conflicts awaiting a decision
 
   // Modals state
   const [exportModalVisible, setExportModalVisible] = useState(false);
@@ -230,31 +230,46 @@ export default function LayoutEditor({
     }
   };
 
-  // Apply a plot width/height change (updates real boundary + dimension annotations)
-  const applyPlotResize = (axis, feet) => {
-    const next = resizePlot(layout, axis, feet);
-    history.pushState(next);
-    setLayout(next);
-    setSelectedElement(null);
+  // Commit a site change (plot size and/or setbacks) as ONE undoable step.
+  const commitSiteResult = (result) => {
+    history.pushState(result.nextLayout);
+    setLayout(result.nextLayout);
   };
 
-  // Requested from the canvas / inspector. If shrinking the plot would push
-  // existing elements outside the boundary, confirm before applying.
-  const requestPlotResize = (axis, feet) => {
-    const next = resizePlot(layout, axis, feet);
-    const outside = findElementsOutsidePlot(next);
-    if (outside.length > 0) {
-      setPendingResize({ axis, feet, outside });
-      return;
+  // Every site change goes through the constraint engine. A change whose
+  // reflow has conflicts is held back: the last valid layout stays on screen
+  // until the user picks a resolution.
+  // `base` lets the canvas pass the layout it just restored after a rejected
+  // drag (this closure's `layout` would still be the last preview).
+  const requestSiteChange = (change, base = layout) => {
+    const result = applySiteChange(base, change);
+    if (result.success) {
+      commitSiteResult(result);
+      return true;
     }
-    history.pushState(next);
-    setLayout(next);
-    setSelectedElement(null);
+    setPendingResize({ change, result, base });
+    return false;
+  };
+
+  // Legacy signature used by the dimension label editor and inspectors.
+  const requestPlotResize = (axis, feet, options = {}) => requestSiteChange({ ...options, [axis]: feet });
+
+  const handleRelaxFixedResize = () => {
+    if (!pendingResize) return;
+    const change = { ...pendingResize.change, relaxFixed: true };
+    const base = pendingResize.base || layout;
+    const result = applySiteChange(base, change);
+    if (result.success) {
+      commitSiteResult(result);
+      setPendingResize(null);
+    } else {
+      setPendingResize({ change, result, base, relaxTried: true });
+    }
   };
 
   const handleConfirmPlotResize = () => {
     if (!pendingResize) return;
-    applyPlotResize(pendingResize.axis, pendingResize.feet);
+    commitSiteResult(pendingResize.result);
     setPendingResize(null);
   };
 
@@ -313,6 +328,7 @@ export default function LayoutEditor({
           selectedElement={selectedElement}
           onSelectElement={setSelectedElement}
           activeTool={activeTool}
+          onSelectTool={setActiveTool}
           unit={unit}
           showGrid={showGrid}
           snapEnabled={snapEnabled}
@@ -323,6 +339,7 @@ export default function LayoutEditor({
           allowDiagonal={allowDiagonal}
           snapTolerance={snapTolerance}
           onRequestPlotResize={requestPlotResize}
+          onRequestSiteChange={requestSiteChange}
         />
 
         {/* Right Properties Panel (Inspector) */}
@@ -335,6 +352,7 @@ export default function LayoutEditor({
           validationIssues={validationIssues}
           historyManager={history}
           onRequestPlotResize={requestPlotResize}
+          onRequestSiteChange={requestSiteChange}
         />
       </View>
 
@@ -523,47 +541,55 @@ export default function LayoutEditor({
       {/* PLOT DIMENSION RESIZE CONFIRMATION */}
       <Modal visible={!!pendingResize} transparent animationType="fade" onRequestClose={() => setPendingResize(null)}>
         <View style={styles.modalBackdrop}>
-          <View style={[styles.modalCard, { maxWidth: 440 }]}>
+          <View style={[styles.modalCard, { maxWidth: 480 }]}>
             <View style={{ alignItems: 'center', paddingVertical: 8 }}>
               <Ionicons name="resize-outline" size={40} color="#D97706" />
-              <Text style={[styles.modalTitleText, { marginTop: 10 }]}>
-                Resize Plot {pendingResize?.axis === 'width' ? 'Width' : 'Height'}?
-              </Text>
+              <Text style={[styles.modalTitleText, { marginTop: 10 }]}>Layout does not fit the new site</Text>
               <Text style={[styles.modalDesc, { textAlign: 'center', marginTop: 8 }]}>
-                Changing the plot {pendingResize?.axis} to {pendingResize ? pendingResize.feet.toFixed(1) : ''} ft
-                will leave {pendingResize?.outside?.length || 0} element(s) outside the new boundary. Nothing is
-                deleted - internal layout is preserved and flagged for review.
+                {pendingResize ? `Proposed plot: ${pendingResize.result.nextLayout.plot.width}' x ${pendingResize.result.nextLayout.plot.length}'. ` : ''}
+                The current layout is kept until you choose. Nothing will be deleted.
               </Text>
             </View>
 
-            <View style={{ maxHeight: 160, borderWidth: 1, borderColor: '#F1F5F9', borderRadius: 6, padding: 8, marginTop: 4 }}>
-              {(pendingResize?.outside || []).slice(0, 6).map((el) => (
-                <View key={`${el.type}-${el.id}`} style={{ flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 3 }}>
-                  <Ionicons name="alert-circle-outline" size={13} color="#D97706" />
-                  <Text style={{ fontSize: 11, color: '#475569' }}>
-                    {el.name} ({el.type}) falls outside
-                  </Text>
+            <View style={{ maxHeight: 180, borderWidth: 1, borderColor: '#F1F5F9', borderRadius: 6, padding: 8, marginTop: 4 }}>
+              {(pendingResize?.result?.conflicts || []).filter((c) => c.severity !== 'info').slice(0, 8).map((c, i) => (
+                <View key={`${c.code}-${c.id || i}`} style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 6, paddingVertical: 3 }}>
+                  <Ionicons name="alert-circle-outline" size={13} color="#D97706" style={{ marginTop: 1 }} />
+                  <Text style={{ fontSize: 11, color: '#475569', flex: 1 }}>{c.message}</Text>
                 </View>
               ))}
-              {(pendingResize?.outside?.length || 0) > 6 && (
+              {(pendingResize?.result?.conflicts?.length || 0) > 8 && (
                 <Text style={{ fontSize: 11, color: '#94A3B8', marginTop: 4 }}>
-                  +{(pendingResize.outside.length - 6)} more...
+                  +{(pendingResize.result.conflicts.length - 8)} more...
+                </Text>
+              )}
+              {pendingResize?.relaxTried && (
+                <Text style={{ fontSize: 11, color: '#B45309', marginTop: 6 }}>
+                  Even with fixed rooms shrunk to their minimums the layout does not fit.
                 </Text>
               )}
             </View>
 
-            <View style={{ flexDirection: 'row', gap: 10, marginTop: 16 }}>
+            <View style={{ flexDirection: 'row', gap: 8, marginTop: 16, flexWrap: 'wrap' }}>
               <TouchableOpacity
-                style={[styles.modalBtnSecondary, { flex: 1 }]}
+                style={[styles.modalBtnSecondary, { flex: 1, minWidth: 120 }]}
                 onPress={() => setPendingResize(null)}
               >
-                <Text style={styles.modalBtnSecondaryText}>Cancel</Text>
+                <Text style={styles.modalBtnSecondaryText}>Keep current layout</Text>
               </TouchableOpacity>
+              {!pendingResize?.relaxTried && !pendingResize?.change?.relaxFixed && (
+                <TouchableOpacity
+                  style={[styles.modalBtnSecondary, { flex: 1, minWidth: 120 }]}
+                  onPress={handleRelaxFixedResize}
+                >
+                  <Text style={styles.modalBtnSecondaryText}>Allow fixed rooms to shrink</Text>
+                </TouchableOpacity>
+              )}
               <TouchableOpacity
-                style={[styles.modalBtnDanger, { flex: 1 }]}
+                style={[styles.modalBtnDanger, { flex: 1, minWidth: 120 }]}
                 onPress={handleConfirmPlotResize}
               >
-                <Text style={styles.modalBtnDangerText}>Apply Anyway</Text>
+                <Text style={styles.modalBtnDangerText}>Apply and review</Text>
               </TouchableOpacity>
             </View>
           </View>

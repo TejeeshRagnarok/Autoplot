@@ -13,8 +13,28 @@ import React, { useState } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, ScrollView } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { formatMeasurement, formatArea, parseToFeet } from './units';
-import { calculateWallLength, calculateWallAngle, splitWallAtPoint, generateUniqueId, ROOM_PALETTE, setPlotDimensionOffset } from './layoutModel';
+import {
+  calculateWallLength,
+  calculateWallAngle,
+  splitWallAtPoint,
+  generateUniqueId,
+  ROOM_PALETTE,
+  setPlotDimensionOffset,
+  checkRoomPlotFit,
+  syncRoomWithWallsAndOpenings,
+  getPlotAndBuildableBounds,
+  cloneLayout,
+  normalizeStaircase,
+  rotateStaircase,
+  calculateStaircaseGeometry,
+  validateStaircaseFit,
+  STAIRCASE_TYPES,
+  inferRoomConstraintType,
+  getRoomTypeMinimum,
+  CONSTRAINT_TYPES,
+} from './layoutModel';
 import { checkAyaVyayaYoni } from '../../constants/vastuData';
+import { setRoomDimension, moveRoom } from './roomResize';
 
 export default function EditorRightPanel({
   layout,
@@ -25,8 +45,27 @@ export default function EditorRightPanel({
   validationIssues = [],
   historyManager,
   onRequestPlotResize,
+  onRequestSiteChange,
 }) {
   const [tab, setTab] = useState('properties'); // 'properties' | 'validation'
+  // Which side stays fixed when the plot size is typed in numerically
+  const [resizeAnchorX, setResizeAnchorX] = useState('right'); // 'right' keeps west edge | 'left' keeps east edge | 'symmetric'
+  const [resizeAnchorY, setResizeAnchorY] = useState('bottom'); // 'bottom' keeps north edge | 'top' keeps south edge | 'symmetric'
+
+  // Small segmented chooser used by several inspectors
+  const renderChoice = (options, value, onPick, keyPrefix) => (
+    <View style={styles.chipRow}>
+      {options.map((o) => (
+        <TouchableOpacity
+          key={`${keyPrefix}-${o.value}`}
+          style={[styles.chip, value === o.value && styles.chipActive]}
+          onPress={() => onPick(o.value)}
+        >
+          <Text style={[styles.chipText, value === o.value && styles.chipTextActive]}>{o.label}</Text>
+        </TouchableOpacity>
+      ))}
+    </View>
+  );
 
   // Generic updater
   const updateLayoutAndRecord = (nextLayout) => {
@@ -96,6 +135,16 @@ export default function EditorRightPanel({
       nextLayout.columns = [...(layout.columns || []), copy];
       updateLayoutAndRecord(nextLayout);
       onSelectElement({ type: 'column', data: copy });
+    } else if (type === 'staircase') {
+      const copy = {
+        ...cloneLayout(data),
+        id: generateUniqueId('stair'),
+        x: data.x + offset,
+        y: data.y + offset,
+      };
+      nextLayout.staircases = [...(layout.staircases || []), copy];
+      updateLayoutAndRecord(nextLayout);
+      onSelectElement({ type: 'staircase', data: copy });
     }
   };
 
@@ -145,6 +194,8 @@ export default function EditorRightPanel({
       nextLayout.doors = layout.doors.map(d => d.id === data.id ? { ...d, isLocked: nextLocked } : d);
     } else if (type === 'window') {
       nextLayout.windows = layout.windows.map(w => w.id === data.id ? { ...w, isLocked: nextLocked } : w);
+    } else if (type === 'staircase') {
+      nextLayout.staircases = layout.staircases.map(st => st.id === data.id ? { ...st, isLocked: nextLocked } : st);
     }
 
     updateLayoutAndRecord(nextLayout);
@@ -157,25 +208,57 @@ export default function EditorRightPanel({
   const renderRoomInspector = (room) => {
     const area = room.width * room.length;
     const vastuResult = checkAyaVyayaYoni(room.width, room.length);
+    const fitStatus = checkRoomPlotFit(room, layout);
 
     const handleRoomField = (field, val) => {
       const patch = field === 'name' ? { name: val, label: val } : { [field]: val };
-      const nextRooms = layout.rooms.map(r => {
-        if (r.id === room.id) {
-          return { ...r, ...patch };
+      const updatedRoom = { ...room, ...patch };
+      let nextLayout = {
+        ...layout,
+        rooms: layout.rooms.map((r) => (r.id === room.id ? updatedRoom : r)),
+      };
+      // Geometry edits go through the room solver: neighbours and shared walls
+      // follow, and the outer site boundary never moves.
+      if (field === 'width' || field === 'length') {
+        const res = setRoomDimension(layout, room.id, field, val);
+        if (res.room) {
+          updateLayoutAndRecord(res.layout);
+          onSelectElement({ type: 'room', data: res.room });
+          if (res.conflicts.length && typeof alert === 'function') alert(`Stopped at the nearest valid size: ${res.conflicts[0]}`);
         }
-        return r;
-      });
-      const nextLayout = { ...layout, rooms: nextRooms };
+        return;
+      }
+      if (field === 'x' || field === 'y') {
+        const res = moveRoom(layout, room.id, field === 'x' ? val - room.x : 0, field === 'y' ? val - room.y : 0);
+        updateLayoutAndRecord(res.layout);
+        onSelectElement({ type: 'room', data: res.room });
+        return;
+      }
       updateLayoutAndRecord(nextLayout);
-      onSelectElement({ type: 'room', data: { ...room, ...patch } });
+      onSelectElement({ type: 'room', data: updatedRoom });
     };
 
     const handleDimensionInput = (field, text) => {
       const feet = parseToFeet(text, unit);
-      if (feet !== null && feet > 0) {
-        handleRoomField(field, feet);
+      if (feet !== null && feet >= 2.5) {
+        handleRoomField(field, Number(feet.toFixed(2)));
       }
+    };
+
+    const handlePositionInput = (field, text) => {
+      const feet = parseToFeet(text, unit);
+      if (feet !== null) {
+        handleRoomField(field, Number(feet.toFixed(2)));
+      }
+    };
+
+    const handleAutoFitToBuildable = () => {
+      const { buildable } = fitStatus;
+      const newX = Math.max(buildable.minX, Math.min(room.x, buildable.maxX - room.width));
+      const newY = Math.max(buildable.minY, Math.min(room.y, buildable.maxY - room.length));
+      const res = moveRoom(layout, room.id, Number((newX - room.x).toFixed(4)), Number((newY - room.y).toFixed(4)));
+      updateLayoutAndRecord(res.layout);
+      onSelectElement({ type: 'room', data: res.room });
     };
 
     return (
@@ -185,6 +268,23 @@ export default function EditorRightPanel({
           <Ionicons name="crop" size={18} color="#2563EB" />
           <Text style={styles.elemTitle}>Room Properties</Text>
         </View>
+
+        {/* Plot & Buildable Bounds Warning */}
+        {fitStatus.warnings.length > 0 && (
+          <View style={styles.fitWarningCard}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 4 }}>
+              <Ionicons name="warning" size={16} color="#DC2626" />
+              <Text style={styles.fitWarningTitle}>Boundary Constraint Alert</Text>
+            </View>
+            <Text style={styles.fitWarningText}>{fitStatus.warnings[0]}</Text>
+            {fitStatus.isOutsideBuildable && !fitStatus.exceedsBuildableDimensions && (
+              <TouchableOpacity style={styles.fitActionBtn} onPress={handleAutoFitToBuildable}>
+                <Ionicons name="scan-outline" size={13} color="#2563EB" />
+                <Text style={styles.fitActionBtnText}>Align Inside Buildable Area</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        )}
 
         {/* Room Name */}
         <View style={styles.inputGroup}>
@@ -228,23 +328,93 @@ export default function EditorRightPanel({
         {/* Position X and Y */}
         <View style={styles.rowTwo}>
           <View style={[styles.inputGroup, { flex: 1 }]}>
-            <Text style={styles.inputLabel}>Position X (ft)</Text>
+            <Text style={styles.inputLabel}>Position X ({unit})</Text>
             <TextInput
-              key={`room-x-${room?.id}-${room?.x}`}
+              key={`room-x-${room?.id}-${room?.x}-${unit}`}
               style={styles.textInput}
-              defaultValue={String(room?.x ?? 0)}
-              onBlur={(e) => handleRoomField('x', parseFloat(e.nativeEvent.text) || 0)}
+              defaultValue={formatMeasurement(room?.x ?? 0, unit)}
+              onBlur={(e) => handlePositionInput('x', e.nativeEvent.text)}
             />
           </View>
           <View style={[styles.inputGroup, { flex: 1 }]}>
-            <Text style={styles.inputLabel}>Position Y (ft)</Text>
+            <Text style={styles.inputLabel}>Position Y ({unit})</Text>
             <TextInput
-              key={`room-y-${room?.id}-${room?.y}`}
+              key={`room-y-${room?.id}-${room?.y}-${unit}`}
               style={styles.textInput}
-              defaultValue={String(room?.y ?? 0)}
-              onBlur={(e) => handleRoomField('y', parseFloat(e.nativeEvent.text) || 0)}
+              defaultValue={formatMeasurement(room?.y ?? 0, unit)}
+              onBlur={(e) => handlePositionInput('y', e.nativeEvent.text)}
             />
           </View>
+        </View>
+
+        {/* Site-resize constraints */}
+        <Text style={styles.subHeading}>Resize Behaviour</Text>
+        {renderChoice(
+          [
+            { value: 'auto', label: `Auto (${inferRoomConstraintType({ ...room, isLocked: false })})` },
+            { value: CONSTRAINT_TYPES.FLEXIBLE, label: 'Flexible' },
+            { value: CONSTRAINT_TYPES.FIXED, label: 'Fixed' },
+          ],
+          room.constraintType || 'auto',
+          (v) => handleRoomField('constraintType', v === 'auto' ? undefined : v),
+          `rc-${room.id}`
+        )}
+        <Text style={styles.hintText}>
+          {room.isLocked
+            ? 'Locked: never resized by site changes.'
+            : 'Flexible rooms grow or shrink within their limits when the plot changes; fixed rooms keep their size.'}
+        </Text>
+        <View style={styles.rowTwo}>
+          <View style={[styles.inputGroup, { flex: 1 }]}>
+            <Text style={styles.inputLabel}>Min W</Text>
+            <TextInput
+              key={`room-minw-${room.id}-${room.minWidth}-${unit}`}
+              style={styles.textInput}
+              placeholder={formatMeasurement(Math.min(room.width, getRoomTypeMinimum(room)), unit)}
+              defaultValue={room.minWidth !== undefined ? formatMeasurement(room.minWidth, unit) : ''}
+              onBlur={(e) => { const t = e.nativeEvent.text.trim(); const f = parseToFeet(t, unit); handleRoomField('minWidth', t === '' ? undefined : (f !== null && f > 0 ? f : room.minWidth)); }}
+            />
+          </View>
+          <View style={[styles.inputGroup, { flex: 1 }]}>
+            <Text style={styles.inputLabel}>Max W</Text>
+            <TextInput
+              key={`room-maxw-${room.id}-${room.maxWidth}-${unit}`}
+              style={styles.textInput}
+              placeholder="none"
+              defaultValue={room.maxWidth !== undefined ? formatMeasurement(room.maxWidth, unit) : ''}
+              onBlur={(e) => { const t = e.nativeEvent.text.trim(); const f = parseToFeet(t, unit); handleRoomField('maxWidth', t === '' ? undefined : (f !== null && f > 0 ? f : room.maxWidth)); }}
+            />
+          </View>
+        </View>
+        <View style={styles.rowTwo}>
+          <View style={[styles.inputGroup, { flex: 1 }]}>
+            <Text style={styles.inputLabel}>Min L</Text>
+            <TextInput
+              key={`room-minl-${room.id}-${room.minLength}-${unit}`}
+              style={styles.textInput}
+              placeholder={formatMeasurement(Math.min(room.length, getRoomTypeMinimum(room)), unit)}
+              defaultValue={room.minLength !== undefined ? formatMeasurement(room.minLength, unit) : ''}
+              onBlur={(e) => { const t = e.nativeEvent.text.trim(); const f = parseToFeet(t, unit); handleRoomField('minLength', t === '' ? undefined : (f !== null && f > 0 ? f : room.minLength)); }}
+            />
+          </View>
+          <View style={[styles.inputGroup, { flex: 1 }]}>
+            <Text style={styles.inputLabel}>Max L</Text>
+            <TextInput
+              key={`room-maxl-${room.id}-${room.maxLength}-${unit}`}
+              style={styles.textInput}
+              placeholder="none"
+              defaultValue={room.maxLength !== undefined ? formatMeasurement(room.maxLength, unit) : ''}
+              onBlur={(e) => { const t = e.nativeEvent.text.trim(); const f = parseToFeet(t, unit); handleRoomField('maxLength', t === '' ? undefined : (f !== null && f > 0 ? f : room.maxLength)); }}
+            />
+          </View>
+        </View>
+        <View style={styles.chipRow}>
+          <TouchableOpacity style={[styles.chip, room.lockWidth && styles.chipActive]} onPress={() => handleRoomField('lockWidth', !room.lockWidth)}>
+            <Text style={[styles.chipText, room.lockWidth && styles.chipTextActive]}>Lock width</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.chip, room.lockLength && styles.chipActive]} onPress={() => handleRoomField('lockLength', !room.lockLength)}>
+            <Text style={[styles.chipText, room.lockLength && styles.chipTextActive]}>Lock length</Text>
+          </TouchableOpacity>
         </View>
 
         {/* Room Fill Color Picker */}
@@ -638,6 +808,214 @@ export default function EditorRightPanel({
   // ---------------------------------------------------------
   // RENDER PLOT / DEFAULT PROJECT INSPECTOR
   // ---------------------------------------------------------
+  // ---------------------------------------------------------
+  // RENDER STAIRCASE INSPECTOR
+  // ---------------------------------------------------------
+  const renderStaircaseInspector = (stair) => {
+    const geo = calculateStaircaseGeometry(stair);
+    const m = geo.metrics;
+    const check = validateStaircaseFit(stair, layout);
+
+    // Every edit regenerates the step geometry; `changed` decides which
+    // dependent value is recomputed (see staircaseGeometry.js).
+    const applyStair = (patch, changed = null) => {
+      if (stair.isLocked) return;
+      const next = normalizeStaircase({ ...stair, ...patch }, changed);
+      updateLayoutAndRecord({
+        ...layout,
+        staircases: layout.staircases.map((st) => (st.id === stair.id ? next : st)),
+      });
+      onSelectElement({ type: 'staircase', data: next });
+    };
+
+    const lengthInput = (field, label, minFeet = 0) => (
+      <View style={[styles.inputGroup, { flex: 1 }]}>
+        <Text style={styles.inputLabel}>{label}</Text>
+        <TextInput
+          key={`st-${field}-${stair.id}-${stair[field]}-${unit}`}
+          style={styles.textInput}
+          editable={!stair.isLocked}
+          defaultValue={formatMeasurement(stair[field] ?? 0, unit)}
+          onBlur={(e) => {
+            const f = parseToFeet(e.nativeEvent.text, unit);
+            if (f !== null && f >= minFeet && Math.abs(f - (stair[field] || 0)) > 1e-4) applyStair({ [field]: f }, field);
+          }}
+        />
+      </View>
+    );
+
+    return (
+      <View key={`inspector-stair-${stair.id}`} style={styles.inspectorContent}>
+        <View style={styles.elemHeader}>
+          <Ionicons name="trending-up" size={18} color="#2563EB" />
+          <Text style={styles.elemTitle}>Staircase Properties</Text>
+        </View>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.inputLabel}>Label</Text>
+          <TextInput
+            key={`st-label-${stair.id}`}
+            style={styles.textInput}
+            defaultValue={stair.label || ''}
+            onBlur={(e) => applyStair({ label: e.nativeEvent.text })}
+          />
+        </View>
+
+        <Text style={styles.inputLabel}>Type</Text>
+        {renderChoice(
+          [
+            { value: STAIRCASE_TYPES.STRAIGHT, label: 'Straight' },
+            { value: STAIRCASE_TYPES.DOG_LEGGED, label: 'Dog-legged' },
+            { value: STAIRCASE_TYPES.U_SHAPED, label: 'U-shaped' },
+            { value: STAIRCASE_TYPES.L_SHAPED, label: 'L-shaped' },
+          ],
+          stair.stairType,
+          (v) => applyStair({ stairType: v, wellGap: undefined, landingDepth: undefined }, 'stairType'),
+          `st-type-${stair.id}`
+        )}
+
+        <View style={styles.rowTwo}>
+          {lengthInput('x', `X (${unit})`, -1000)}
+          {lengthInput('y', `Y (${unit})`, -1000)}
+        </View>
+        <View style={styles.rowTwo}>
+          {lengthInput('width', 'Overall width', 2)}
+          {lengthInput('length', 'Overall length', 2)}
+        </View>
+        <Text style={styles.hintText}>Changing the length keeps the step count and recalculates the tread depth.</Text>
+
+        <View style={styles.rowTwo}>
+          {lengthInput('floorHeight', 'Floor-to-floor', 6)}
+          <View style={[styles.inputGroup, { flex: 1 }]}>
+            <Text style={styles.inputLabel}>Risers</Text>
+            <TextInput
+              key={`st-risers-${stair.id}-${stair.risers}`}
+              style={styles.textInput}
+              editable={!stair.isLocked}
+              keyboardType="numeric"
+              defaultValue={String(stair.risers)}
+              onBlur={(e) => {
+                const n = parseInt(e.nativeEvent.text, 10);
+                if (Number.isFinite(n) && n !== stair.risers) applyStair({ risers: n }, 'risers');
+              }}
+            />
+          </View>
+        </View>
+        <View style={styles.rowTwo}>
+          {lengthInput('treadDepth', 'Tread depth', 0.25)}
+          {stair.stairType === STAIRCASE_TYPES.L_SHAPED
+            ? lengthInput('flightWidth', 'Flight width', 2)
+            : stair.stairType === STAIRCASE_TYPES.STRAIGHT
+              ? <View style={{ flex: 1 }} />
+              : lengthInput('landingDepth', 'Landing depth', 2)}
+        </View>
+        {(stair.stairType === STAIRCASE_TYPES.DOG_LEGGED || stair.stairType === STAIRCASE_TYPES.U_SHAPED) && (
+          <View style={styles.rowTwo}>
+            {lengthInput('wellGap', 'Well / mid-wall gap', 0)}
+            <View style={{ flex: 1 }} />
+          </View>
+        )}
+
+        <Text style={styles.inputLabel}>Direction</Text>
+        {renderChoice(
+          [{ value: 'up', label: 'UP' }, { value: 'down', label: 'DN' }],
+          stair.direction || 'up',
+          (v) => applyStair({ direction: v }),
+          `st-dir-${stair.id}`
+        )}
+
+        <View style={styles.actionsBar}>
+          <TouchableOpacity
+            style={styles.actionBtn}
+            onPress={() => {
+              if (stair.isLocked) return;
+              const next = rotateStaircase(stair, 90);
+              updateLayoutAndRecord({ ...layout, staircases: layout.staircases.map((st) => (st.id === stair.id ? next : st)) });
+              onSelectElement({ type: 'staircase', data: next });
+            }}
+          >
+            <Ionicons name="refresh" size={14} color="#334155" />
+            <Text style={styles.actionBtnText}>Rotate 90° ({geo.rotation}°)</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Calculated geometry */}
+        <View style={styles.statBox}>
+          <View style={styles.rowBetween}>
+            <Text style={styles.statLabel}>Risers / treads:</Text>
+            <Text style={styles.statValue}>{m.totalRisers}R / {m.totalTreads}T</Text>
+          </View>
+          <View style={[styles.rowBetween, { marginTop: 4 }]}>
+            <Text style={styles.statLabel}>Treads per flight:</Text>
+            <Text style={styles.statValue}>{m.treadsPerFlight.join(' + ')}{m.landings ? ` (${m.landings} landing)` : ''}</Text>
+          </View>
+          <View style={[styles.rowBetween, { marginTop: 4 }]}>
+            <Text style={styles.statLabel}>Riser height:</Text>
+            <Text style={styles.statValue}>{m.riserHeightInches.toFixed(2)}"</Text>
+          </View>
+          <View style={[styles.rowBetween, { marginTop: 4 }]}>
+            <Text style={styles.statLabel}>Tread depth:</Text>
+            <Text style={styles.statValue}>{m.treadDepthInches.toFixed(2)}"</Text>
+          </View>
+          <View style={[styles.rowBetween, { marginTop: 4 }]}>
+            <Text style={styles.statLabel}>Run per flight:</Text>
+            <Text style={styles.statValue}>{m.runs.map((r) => formatMeasurement(r, unit)).join(' + ')}</Text>
+          </View>
+        </View>
+        <Text style={styles.hintText}>
+          Convention: each flight has one fewer tread than risers; landings are not counted as treads.
+        </Text>
+
+        {check.warnings.length > 0 && (
+          <View style={styles.fitWarningCard}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 4 }}>
+              <Ionicons name="warning" size={16} color="#D97706" />
+              <Text style={styles.fitWarningTitle}>Drafting guideline notes</Text>
+            </View>
+            {check.warnings.map((w, i) => <Text key={`sw-${i}`} style={styles.fitWarningText}>{w}</Text>)}
+            <Text style={[styles.hintText, { marginTop: 4 }]}>Geometric checks only - not a structural or building-code review.</Text>
+          </View>
+        )}
+
+        {/* Site-resize constraints */}
+        <Text style={styles.subHeading}>Resize Behaviour</Text>
+        {renderChoice(
+          [{ value: 'fixed', label: 'Fixed size' }, { value: 'flexible', label: 'Flexible' }],
+          stair.constraintType === 'flexible' ? 'flexible' : 'fixed',
+          (v) => applyStair({ constraintType: v }),
+          `st-c-${stair.id}`
+        )}
+        <Text style={styles.inputLabel}>Anchor (staircases outside the building)</Text>
+        {renderChoice(
+          [
+            { value: 'none', label: 'Nearest edge' },
+            { value: 'top-left', label: 'NW' }, { value: 'top-right', label: 'NE' },
+            { value: 'bottom-left', label: 'SW' }, { value: 'bottom-right', label: 'SE' },
+            { value: 'center', label: 'Centre' },
+          ],
+          stair.anchor || 'none',
+          (v) => applyStair({ anchor: v }),
+          `st-a-${stair.id}`
+        )}
+
+        <View style={styles.actionsBar}>
+          <TouchableOpacity style={styles.actionBtn} onPress={handleDuplicate}>
+            <Ionicons name="copy-outline" size={14} color="#334155" />
+            <Text style={styles.actionBtnText}>Duplicate</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.actionBtn} onPress={handleToggleLock}>
+            <Ionicons name={stair.isLocked ? 'lock-closed' : 'lock-open-outline'} size={14} color="#334155" />
+            <Text style={styles.actionBtnText}>{stair.isLocked ? 'Unlock' : 'Lock'}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.actionBtn, styles.deleteBtn]} onPress={handleDelete}>
+            <Ionicons name="trash-outline" size={14} color="#DC2626" />
+            <Text style={[styles.actionBtnText, { color: '#DC2626' }]}>Delete</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    );
+  };
+
   const renderPlotInspector = () => {
     const plotW = layout.plot?.width || 30;
     const plotL = layout.plot?.length || 40;
@@ -649,12 +1027,20 @@ export default function EditorRightPanel({
     });
 
     const groundCoverage = totalPlotArea > 0 ? (totalCarpet / totalPlotArea) * 100 : 0;
+    const { buildable } = getPlotAndBuildableBounds(layout);
+
+    const handleSetback = (key, text) => {
+      const feet = parseToFeet(text, unit);
+      if (feet === null || feet < 0 || !onRequestSiteChange) return;
+      if (Math.abs(feet - (Number(layout.plot?.setbacks?.[key]) || 0)) < 1e-4) return;
+      onRequestSiteChange({ setbacks: { [key]: Number(feet.toFixed(4)) } });
+    };
 
     const handlePlotDim = (field, text) => {
       const feet = parseToFeet(text, unit);
       if (feet && feet > 0) {
         if (onRequestPlotResize) {
-          onRequestPlotResize(field, feet);
+          onRequestPlotResize(field, feet, { edge: field === 'width' ? resizeAnchorX : resizeAnchorY });
         } else {
           const nextLayout = {
             ...layout,
@@ -697,25 +1083,80 @@ export default function EditorRightPanel({
           </View>
         </View>
 
-        {/* Setbacks Summary */}
-        <Text style={styles.subHeading}>Setback Clearances</Text>
+        <Text style={styles.inputLabel}>When width changes, move</Text>
+        {renderChoice(
+          [{ value: 'right', label: 'East edge' }, { value: 'left', label: 'West edge' }, { value: 'symmetric', label: 'Both' }],
+          resizeAnchorX, setResizeAnchorX, 'rax'
+        )}
+        <Text style={styles.inputLabel}>When length changes, move</Text>
+        {renderChoice(
+          [{ value: 'bottom', label: 'South edge' }, { value: 'top', label: 'North edge' }, { value: 'symmetric', label: 'Both' }],
+          resizeAnchorY, setResizeAnchorY, 'ray'
+        )}
+        <Text style={styles.hintText}>On the canvas, drag the orange edge handles; hold Shift to resize symmetrically.</Text>
+
+        {/* Setbacks (editable - the building reflows to the new buildable area) */}
+        <Text style={styles.subHeading}>Setbacks</Text>
+        <View style={styles.rowTwo}>
+          {['north', 'south'].map((k) => (
+            <View key={`sb-${k}`} style={[styles.inputGroup, { flex: 1 }]}>
+              <Text style={styles.inputLabel}>{k === 'north' ? 'North (front/top)' : 'South (bottom)'}</Text>
+              <TextInput
+                key={`sb-${k}-${layout.plot?.setbacks?.[k]}-${unit}`}
+                style={styles.textInput}
+                defaultValue={formatMeasurement(layout.plot?.setbacks?.[k] ?? 0, unit)}
+                onBlur={(e) => handleSetback(k, e.nativeEvent.text)}
+              />
+            </View>
+          ))}
+        </View>
+        <View style={styles.rowTwo}>
+          {['west', 'east'].map((k) => (
+            <View key={`sb-${k}`} style={[styles.inputGroup, { flex: 1 }]}>
+              <Text style={styles.inputLabel}>{k === 'west' ? 'West (left)' : 'East (right)'}</Text>
+              <TextInput
+                key={`sb-${k}-${layout.plot?.setbacks?.[k]}-${unit}`}
+                style={styles.textInput}
+                defaultValue={formatMeasurement(layout.plot?.setbacks?.[k] ?? 0, unit)}
+                onBlur={(e) => handleSetback(k, e.nativeEvent.text)}
+              />
+            </View>
+          ))}
+        </View>
         <View style={styles.statBox}>
           <View style={styles.rowBetween}>
-            <Text style={styles.statLabel}>East Setback:</Text>
-            <Text style={styles.statValue}>{formatMeasurement(layout.plot?.setbacks?.east || 2, unit)}</Text>
+            <Text style={styles.statLabel}>Buildable area:</Text>
+            <Text style={styles.statValue}>
+              {formatMeasurement(buildable.width, unit)} × {formatMeasurement(buildable.length, unit)}
+            </Text>
           </View>
           <View style={[styles.rowBetween, { marginTop: 4 }]}>
-            <Text style={styles.statLabel}>West Setback:</Text>
-            <Text style={styles.statValue}>{formatMeasurement(layout.plot?.setbacks?.west || 2, unit)}</Text>
+            <Text style={styles.statLabel}>Buildable floor area:</Text>
+            <Text style={styles.statValue}>{formatArea(buildable.width * buildable.length, unit)}</Text>
           </View>
-          <View style={[styles.rowBetween, { marginTop: 4 }]}>
-            <Text style={styles.statLabel}>North Setback:</Text>
-            <Text style={styles.statValue}>{formatMeasurement(layout.plot?.setbacks?.north || 4, unit)}</Text>
-          </View>
-          <View style={[styles.rowBetween, { marginTop: 4 }]}>
-            <Text style={styles.statLabel}>South Setback:</Text>
-            <Text style={styles.statValue}>{formatMeasurement(layout.plot?.setbacks?.south || 4, unit)}</Text>
-          </View>
+        </View>
+
+        {/* Orientation */}
+        <Text style={styles.subHeading}>Orientation</Text>
+        <Text style={styles.inputLabel}>Road-facing side</Text>
+        {renderChoice(
+          ['North', 'South', 'East', 'West'].map((d) => ({ value: d, label: d })),
+          (layout.plot?.roadDirection || 'North Road').replace(' Road', ''),
+          (d) => updateLayoutAndRecord({ ...layout, plot: { ...layout.plot, roadDirection: `${d} Road`, facing: d } }),
+          'road'
+        )}
+        <View style={styles.inputGroup}>
+          <Text style={styles.inputLabel}>North direction (degrees clockwise from up)</Text>
+          <TextInput
+            key={`compass-${layout.plot?.compassAngle}`}
+            style={styles.textInput}
+            defaultValue={String(layout.plot?.compassAngle ?? 0)}
+            keyboardType="numeric"
+            onBlur={(e) => {
+              const v = parseFloat(e.nativeEvent.text);
+              if (Number.isFinite(v)) updateLayoutAndRecord({ ...layout, plot: { ...layout.plot, compassAngle: ((v % 360) + 360) % 360 } });
+            }}
+          />
         </View>
 
         {/* Project Area Summary */}
@@ -930,6 +1371,8 @@ export default function EditorRightPanel({
             renderWindowInspector(selectedElement.data)
           ) : selectedElement.type === 'dimension' ? (
             renderDimensionInspector(selectedElement.data)
+          ) : selectedElement.type === 'staircase' ? (
+            renderStaircaseInspector(selectedElement.data)
           ) : (
             renderPlotInspector()
           )
@@ -942,6 +1385,38 @@ export default function EditorRightPanel({
 }
 
 const styles = StyleSheet.create({
+  chipRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginBottom: 10,
+  },
+  chip: {
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#CBD5E1',
+    backgroundColor: '#FFFFFF',
+  },
+  chipActive: {
+    borderColor: '#2563EB',
+    backgroundColor: '#EFF6FF',
+  },
+  chipText: {
+    fontSize: 11,
+    color: '#475569',
+    fontWeight: '600',
+  },
+  chipTextActive: {
+    color: '#1D4ED8',
+  },
+  hintText: {
+    fontSize: 10,
+    color: '#64748B',
+    marginBottom: 10,
+    lineHeight: 14,
+  },
   panel: {
     width: 280,
     backgroundColor: '#FFFFFF',
@@ -1238,5 +1713,42 @@ const styles = StyleSheet.create({
     fontSize: 10,
     color: '#64748B',
     lineHeight: 14,
+  },
+  fitWarningCard: {
+    backgroundColor: '#FEF2F2',
+    borderWidth: 1,
+    borderColor: '#FECACA',
+    borderRadius: 6,
+    padding: 10,
+    marginBottom: 12,
+  },
+  fitWarningTitle: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#DC2626',
+    marginLeft: 6,
+  },
+  fitWarningText: {
+    fontSize: 10.5,
+    color: '#991B1B',
+    lineHeight: 15,
+  },
+  fitActionBtn: {
+    marginTop: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    backgroundColor: '#EFF6FF',
+    borderWidth: 1,
+    borderColor: '#BFDBFE',
+    borderRadius: 4,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+  },
+  fitActionBtnText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#2563EB',
   },
 });

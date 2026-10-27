@@ -173,22 +173,21 @@ export function createWindow(params = {}) {
   };
 }
 
+import {
+  reflowLayoutOnPlotResize,
+  syncPlotDimensionAnnotations,
+} from './constraintEngine.js';
+
+import {
+  createStaircase as createStaircaseCore,
+  getStaircaseBounds,
+} from './staircaseGeometry.js';
+
 /**
- * Create a staircase object
+ * Create a staircase object with full architectural parameters
  */
 export function createStaircase(params = {}) {
-  return {
-    id: params.id || generateUniqueId('stair'),
-    x: Number(params.x || 0),
-    y: Number(params.y || 0),
-    width: Number(params.width || 6.0),
-    length: Number(params.length || 9.0),
-    direction: params.direction || 'up', // 'up' | 'down'
-    stairType: params.stairType || 'dog-legged', // 'dog-legged' | 'straight' | 'spiral'
-    steps: Number(params.steps || 14),
-    label: params.label || 'STAIRS',
-    isLocked: !!params.isLocked,
-  };
+  return createStaircaseCore(params);
 }
 
 /**
@@ -595,31 +594,7 @@ export function getPlotDimensionMeta(layout, axis) {
  */
 export function syncPlotDimensions(layout) {
   if (!layout || !layout.plot) return layout;
-  const W = Number(layout.plot.width) || 30;
-  const L = Number(layout.plot.length) || 40;
-  if (!Array.isArray(layout.dimensions)) layout.dimensions = [];
-
-  const wExisting = layout.dimensions.find((d) => d.id === 'dim-plot-width');
-  const lExisting = layout.dimensions.find((d) => d.id === 'dim-plot-length');
-  const wOff = wExisting && Number(wExisting.offset) ? Math.abs(Number(wExisting.offset)) : 2.5;
-  const lOff = lExisting && Number(lExisting.offset) ? Math.abs(Number(lExisting.offset)) : 2.5;
-
-  const upsert = (id, fields) => {
-    const idx = layout.dimensions.findIndex((d) => d.id === id);
-    if (idx >= 0) layout.dimensions[idx] = { ...layout.dimensions[idx], ...fields };
-    else layout.dimensions.push(createDimension({ id, ...fields }));
-  };
-
-  upsert('dim-plot-width', {
-    x1: 0, y1: -wOff, x2: W, y2: -wOff, offset: wOff,
-    label: `${W}' (Plot Width)`,
-  });
-  upsert('dim-plot-length', {
-    x1: -lOff, y1: 0, x2: -lOff, y2: L, offset: lOff,
-    label: `${L}' (Plot Length)`,
-  });
-
-  return layout;
+  return syncPlotDimensionAnnotations(layout);
 }
 
 /**
@@ -638,31 +613,36 @@ export function setPlotDimensionOffset(layout, axis, offset) {
 }
 
 /**
- * Resize the real plot geometry along an axis and refresh dependent metadata
- * (footprint + outer dimension annotations). Internal objects are intentionally
- * NOT stretched - they stay exactly where they are and are re-validated later.
+ * Resize the real plot geometry and reflow every dependent element through the
+ * constraint engine. Returns the full engine result:
+ * { nextLayout, conflicts, warnings, success, shift }.
  * @param {object} layout
- * @param {'width'|'length'} axis
- * @param {number} feet
+ * @param {{width?:number, length?:number, setbacks?:object, edge?:string, isSymmetric?:boolean, relaxFixed?:boolean}} change
  */
-export function resizePlot(layout, axis, feet) {
+export function applySiteChange(layout, change = {}) {
+  return reflowLayoutOnPlotResize(layout, {
+    newWidth: change.width,
+    newLength: change.length,
+    setbacks: change.setbacks,
+    edge: change.edge,
+    edgeX: change.edgeX,
+    edgeY: change.edgeY,
+    isSymmetric: change.isSymmetric,
+    relaxFixed: change.relaxFixed,
+  });
+}
+
+/**
+ * Resize the plot along one axis. Kept for callers that only need the layout.
+ * @param {'width'|'length'} axis
+ */
+export function resizePlot(layout, axis, feet, options = {}) {
   if (!layout || !layout.plot) return layout;
-  const next = cloneLayout(layout);
-  const val = Math.max(2, Number(feet) || 0);
-  if (axis === 'width') next.plot.width = Number(val.toFixed(2));
-  else next.plot.length = Number(val.toFixed(2));
-
-  const sb = next.plot.setbacks || { east: 2, west: 2, north: 4, south: 4 };
-  next.plot.setbacks = sb;
-  next.footprint = {
-    ...(next.footprint || {}),
-    x: Number(sb.west || 0),
-    y: Number(sb.north || 0),
-    width: Math.max(1, Number((next.plot.width - (sb.west || 0) - (sb.east || 0)).toFixed(2))),
-    length: Math.max(1, Number((next.plot.length - (sb.north || 0) - (sb.south || 0)).toFixed(2))),
-  };
-
-  return syncPlotDimensions(next);
+  return applySiteChange(layout, {
+    ...options,
+    [axis]: Number(feet),
+    edge: options.edge || (axis === 'width' ? 'right' : 'bottom'),
+  }).nextLayout;
 }
 
 /**
@@ -686,7 +666,7 @@ export function findElementsOutsidePlot(layout, margin = 0.2) {
   };
 
   (layout?.rooms || []).forEach((r) => checkRect(r, 'room', r.name || 'Room'));
-  (layout?.staircases || []).forEach((s) => checkRect(s, 'staircase', s.label || 'Staircase'));
+  (layout?.staircases || []).forEach((s) => checkRect({ id: s.id, ...getStaircaseBounds(s) }, 'staircase', s.label || 'Staircase'));
   (layout?.parking || []).forEach((p) => checkRect(p, 'parking', p.label || 'Parking'));
   (layout?.utilities || []).forEach((u) => checkRect(u, 'utility', u.name || 'Utility'));
 
@@ -722,3 +702,37 @@ export function cloneLayout(layout) {
   if (!layout) return null;
   return JSON.parse(JSON.stringify(layout));
 }
+
+export {
+  MIN_ROOM_DIMENSION,
+  getPlotAndBuildableBounds,
+  checkRoomPlotFit,
+  collectAlignmentTargets,
+  findRoomSnapping,
+  areSegmentsOverlapping,
+  createRoomBoundaryWalls,
+  syncRoomWithWallsAndOpenings,
+} from './roomGeometry.js';
+
+export {
+  reflowLayoutOnPlotResize,
+  inferObjectConstraints,
+  inferRoomConstraintType,
+  getRoomTypeMinimum,
+  validateOpenings,
+  validateSiteFit,
+  CONSTRAINT_TYPES,
+  ANCHOR_TYPES,
+} from './constraintEngine.js';
+
+export {
+  calculateStaircaseGeometry,
+  validateStaircaseFit,
+  normalizeStaircase,
+  getStaircaseBounds,
+  resizeStaircaseWorld,
+  rotateStaircase,
+  stairDimensionForAxis,
+  STAIRCASE_TYPES,
+  STAIRCASE_DEFAULTS,
+} from './staircaseGeometry.js';

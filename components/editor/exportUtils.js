@@ -7,6 +7,7 @@
  */
 
 import { formatMeasurement, formatArea } from './units';
+import { calculateStaircaseGeometry } from './staircaseGeometry.js';
 
 /**
  * Generate full SVG string for the entire layout
@@ -45,6 +46,16 @@ export function generateLayoutSVG(layout, unit = 'ft-in') {
     <rect x="${originX}" y="${originY}" width="${plotW * scale}" height="${plotL * scale}" 
       fill="#FFFFFF" stroke="#D97706" stroke-width="3" stroke-dasharray="6,4"/>
   `;
+
+  // 2b. Setback line (buildable area)
+  const sb = layout.plot?.setbacks || {};
+  const bx0 = Number(sb.west) || 0;
+  const by0 = Number(sb.north) || 0;
+  const bw = plotW - bx0 - (Number(sb.east) || 0);
+  const bl = plotL - by0 - (Number(sb.south) || 0);
+  if (bw > 0 && bl > 0) {
+    elementsSvg += `<rect x="${originX + bx0 * scale}" y="${originY + by0 * scale}" width="${bw * scale}" height="${bl * scale}" fill="none" stroke="#94A3B8" stroke-width="1" stroke-dasharray="3,3"/>`;
+  }
 
   // 3. Rooms
   (layout.rooms || []).forEach(room => {
@@ -98,21 +109,24 @@ export function generateLayoutSVG(layout, unit = 'ft-in') {
   });
 
   (layout.staircases || []).forEach(s => {
-    const sx = originX + s.x * scale;
-    const sy = originY + s.y * scale;
-    const sw = s.width * scale;
-    const sh = s.length * scale;
+    // Steps are regenerated from the staircase parameters, exactly as on the canvas.
+    const geo = calculateStaircaseGeometry(s);
+    const X = (x) => originX + x * scale;
+    const Y = (y) => originY + y * scale;
+    const pts = (poly) => poly.map((p) => `${X(p.x)},${Y(p.y)}`).join(' ');
+    const ln = (l, stroke, w) => `<line x1="${X(l.x1)}" y1="${Y(l.y1)}" x2="${X(l.x2)}" y2="${Y(l.y2)}" stroke="${stroke}" stroke-width="${w}"/>`;
+    elementsSvg += `<g><polygon points="${pts(geo.outline)}" fill="#F8FAFC" stroke="#475569" stroke-width="1.5"/>`;
+    geo.landings.forEach((l) => { elementsSvg += `<polygon points="${pts(l.polygon)}" fill="#EEF2F7" stroke="#64748B" stroke-width="1"/>`; });
+    geo.flights.forEach((f) => {
+      elementsSvg += `<polygon points="${pts(f.polygon)}" fill="none" stroke="#64748B" stroke-width="1"/>`;
+      f.treads.forEach((t) => { elementsSvg += ln(t, '#94A3B8', 1); });
+    });
+    geo.dividers.forEach((d) => { elementsSvg += ln(d, '#334155', 1.5); });
+    elementsSvg += `<polyline points="${pts(geo.arrow.points)}" fill="none" stroke="#0F172A" stroke-width="1.2"/>`;
+    elementsSvg += `<polyline points="${pts(geo.arrow.arrowHead)}" fill="none" stroke="#0F172A" stroke-width="1.2"/>`;
     elementsSvg += `
-      <g>
-        <rect x="${sx}" y="${sy}" width="${sw}" height="${sh}" fill="#F8FAFC" stroke="#475569" stroke-width="1.5"/>
-    `;
-    const steps = s.steps || 12;
-    for (let i = 1; i < steps; i++) {
-      elementsSvg += `<line x1="${sx}" y1="${sy + (sh / steps) * i}" x2="${sx + sw}" y2="${sy + (sh / steps) * i}" stroke="#94A3B8" stroke-width="1"/>`;
-    }
-    elementsSvg += `
-        <text x="${sx + sw / 2}" y="${sy + sh / 2}" font-family="Arial, sans-serif" font-size="9" font-weight="bold" fill="#0F172A" text-anchor="middle">
-          ${s.label || 'STAIRS'}
+        <text x="${X(geo.labelPos.x)}" y="${Y(geo.labelPos.y) + 3}" font-family="Arial, sans-serif" font-size="9" font-weight="bold" fill="#0F172A" text-anchor="middle">
+          ${s.label || 'STAIRS'} ${geo.labelText} (${geo.metrics.totalRisers}R / ${geo.metrics.totalTreads}T)
         </text>
       </g>
     `;

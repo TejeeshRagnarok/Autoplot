@@ -18,7 +18,7 @@ import {
   generateUniqueId,
   WALL_THICKNESS,
   ROOM_PALETTE,
-} from './layoutModel';
+} from './layoutModel.js';
 
 /**
  * Generates structured LayoutData from AutoPlot state using the Vastu zoning algorithm.
@@ -550,15 +550,17 @@ export function generateStructuredLayoutFromState(state) {
 
   // Staircase in setback or SW
   if (state.stairsLocation) {
-    const c = getUtilCoord(state.stairsLocation, 6.0);
-    layout.staircases.push(createStaircase({
-      id: 'stair-external',
-      x: Number(c.x.toFixed(2)),
-      y: Number(c.y.toFixed(2)),
-      width: 6.0,
-      length: 9.0,
-      label: 'STAIRCASE',
-    }));
+    // Size first, then place from the real footprint so the stair never
+    // overhangs the plot (the run depends on risers and tread depth).
+    const stair = createStaircase({ id: 'stair-external', width: 6.0, label: 'STAIRCASE' });
+    const loc = state.stairsLocation;
+    const pad = 1.0;
+    const east = loc.includes('east');
+    const south = loc.includes('South');
+    stair.x = Number((east ? siteW - stair.width - pad : pad).toFixed(2));
+    stair.y = Number((south ? siteL - stair.length - pad : pad).toFixed(2));
+    stair.anchor = `${south ? 'bottom' : 'top'}-${east ? 'right' : 'left'}`;
+    layout.staircases.push(stair);
   }
 
   // Exterior Dimension lines for plot & setbacks

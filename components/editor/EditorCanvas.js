@@ -36,8 +36,28 @@ import {
   getPlotDimensionMeta,
   syncPlotDimensions,
   resizePlot,
+  MIN_ROOM_DIMENSION,
+  getPlotAndBuildableBounds,
+  checkRoomPlotFit,
+  collectAlignmentTargets,
+  findRoomSnapping,
+  createRoomBoundaryWalls,
+  syncRoomWithWallsAndOpenings,
+  applySiteChange,
+  calculateStaircaseGeometry,
+  getStaircaseBounds,
+  resizeStaircaseWorld,
 } from './layoutModel';
 import { formatMeasurement, formatArea, parseToFeet } from './units';
+import {
+  resizeRoom,
+  moveRoom,
+  setRoomDimension,
+  moveWallBoundary,
+  edgeTargetsForHandle,
+  screenToWorldPoint,
+  worldToScreenPoint,
+} from './roomResize';
 
 export default function EditorCanvas({
   layout,
@@ -45,6 +65,7 @@ export default function EditorCanvas({
   selectedElement,
   onSelectElement,
   activeTool = 'select',
+  onSelectTool,
   unit = 'ft-in',
   showGrid = true,
   snapEnabled = true,
@@ -55,9 +76,11 @@ export default function EditorCanvas({
   allowDiagonal = false,
   snapTolerance = 0.75,
   onRequestPlotResize,
+  onRequestSiteChange,
 }) {
   const containerRef = useRef(null);
   const dimInputRef = useRef(null);
+  const roomDimInputRef = useRef(null);
 
   // Viewport transformation: scale (px per foot), pan offset (px)
   const [viewport, setViewport] = useState({
@@ -71,13 +94,27 @@ export default function EditorCanvas({
   // Interaction State
   const [isPanning, setIsPanning] = useState(false);
   const [panStart, setPanStart] = useState({ x: 0, y: 0 });
-  const [draggingHandle, setDraggingHandle] = useState(null); // 'wall-p1' | 'wall-p2' | 'room-br' | 'element-body' | 'dimension-line'
+  const [draggingHandle, setDraggingHandle] = useState(null); // 'wall-p1' | 'wall-p2' | 'room-nw'...'room-se' | 'room-body' | 'dimension-line'
   const [dragStartInfo, setDragStartInfo] = useState(null);
   const [alignmentGuides, setAlignmentGuides] = useState([]);
+  const [snapBadges, setSnapBadges] = useState([]);
+  const [roomWarnings, setRoomWarnings] = useState([]);
+  const [activeMeasurements, setActiveMeasurements] = useState(null);
+  const [resizeConflict, setResizeConflict] = useState(null); // reason a room / wall drag stopped short
+  const [sitePreview, setSitePreview] = useState(null); // { width, length, conflicts, change, success } while dragging a plot edge
+
+  // Pending room placement confirmation (room drawn outside buildable area)
+  const [pendingRoomPlacement, setPendingRoomPlacement] = useState(null); // { room, warnings, buildable, exceeds }
+  const [placementNotice, setPlacementNotice] = useState(null);
+  const placementNoticeTimer = useRef(null);
 
   // Inline dimension label editing (Mode B)
   const [editingDim, setEditingDim] = useState(null); // { axis, value, screenX, screenY }
   const [dimInputValue, setDimInputValue] = useState('');
+
+  // Inline Room Dimension label editing
+  const [editingRoomDim, setEditingRoomDim] = useState(null); // { roomId, field, screenX, screenY }
+  const [roomDimInputValue, setRoomDimInputValue] = useState('');
 
   // Drawing Tools State
   const [wallDrawStart, setWallDrawStart] = useState(null); // { x, y }
@@ -85,26 +122,96 @@ export default function EditorCanvas({
   const [measureStart, setMeasureStart] = useState(null);
 
   // Convert World Coordinates (ft) to Screen Pixels
-  const worldToScreen = useCallback((wx, wy) => {
-    return {
-      x: wx * viewport.scale + viewport.panX,
-      y: wy * viewport.scale + viewport.panY,
-    };
-  }, [viewport]);
+  const worldToScreen = useCallback((wx, wy) => worldToScreenPoint(viewport, wx, wy), [viewport]);
 
-  // Convert Screen Pixels to World Coordinates (ft)
-  const screenToWorld = useCallback((sx, sy) => {
-    return {
-      x: (sx - viewport.panX) / viewport.scale,
-      y: (sy - viewport.panY) / viewport.scale,
-    };
-  }, [viewport]);
+  // Convert Screen Pixels to World Coordinates (ft) - the only conversion drags use
+  const screenToWorld = useCallback((sx, sy) => screenToWorldPoint(viewport, sx, sy), [viewport]);
 
   // Snap to grid if enabled
   const snap = useCallback((val) => {
     if (!snapEnabled) return val;
     return snapValue(val, snapStep);
   }, [snapEnabled, snapStep]);
+
+  // Room smart-snap tolerance in screen pixels, driven by the configurable
+  // snap tolerance control so it stays consistent at every zoom level.
+  const roomSnapPixelTolerance = Math.max(6, Math.min(40, (snapTolerance / 0.75) * 12));
+
+  const showPlacementNotice = (text) => {
+    setPlacementNotice(text);
+    if (placementNoticeTimer.current) clearTimeout(placementNoticeTimer.current);
+    placementNoticeTimer.current = setTimeout(() => setPlacementNotice(null), 4500);
+  };
+
+  // Commit a room into the layout (history + boundary walls + selection)
+  const commitRoomPlacement = (room) => {
+    const newRoom = createRoom({
+      name: `Room ${layout.rooms?.length ? layout.rooms.length + 1 : 1}`,
+      x: room.x,
+      y: room.y,
+      width: room.width,
+      length: room.length,
+    });
+    const nextWalls = createRoomBoundaryWalls(layout, newRoom);
+    const nextLayout = {
+      ...layout,
+      rooms: [...(layout.rooms || []), newRoom],
+      walls: nextWalls,
+    };
+    historyManager.pushState(nextLayout);
+    onUpdateLayout(nextLayout);
+    onSelectElement({ type: 'room', data: newRoom });
+    if (onSelectTool) onSelectTool('select');
+  };
+
+  // Finish a draw: if the room violates plot/buildable constraints, ask the
+  // user how to resolve it instead of silently placing or shrinking it.
+  const finalizeRoomPlacement = (room) => {
+    const fit = checkRoomPlotFit(room, layout);
+    if (fit.warnings.length > 0) {
+      setPendingRoomPlacement({
+        room,
+        warnings: fit.warnings,
+        buildable: fit.buildable,
+        exceeds: !!fit.exceedsBuildableDimensions,
+      });
+      return;
+    }
+    commitRoomPlacement(room);
+  };
+
+  const handlePlaceAsIs = () => {
+    if (!pendingRoomPlacement) return;
+    commitRoomPlacement(pendingRoomPlacement.room);
+    setPendingRoomPlacement(null);
+  };
+
+  const handleFitInsidePlot = () => {
+    if (!pendingRoomPlacement) return;
+    const { room, buildable, exceeds } = pendingRoomPlacement;
+    if (exceeds) return; // dimensions don't fit — only "Resize to Fit" is allowed
+    const newX = Math.max(buildable.minX, Math.min(room.x, buildable.maxX - room.width));
+    const newY = Math.max(buildable.minY, Math.min(room.y, buildable.maxY - room.length));
+    commitRoomPlacement({ ...room, x: Number(newX.toFixed(2)), y: Number(newY.toFixed(2)) });
+    setPendingRoomPlacement(null);
+  };
+
+  const handleResizeToFitPlot = () => {
+    if (!pendingRoomPlacement) return;
+    const { room, buildable } = pendingRoomPlacement;
+    const w = Math.min(room.width, buildable.width);
+    const l = Math.min(room.length, buildable.length);
+    const x = Math.max(buildable.minX, Math.min(room.x, buildable.maxX - w));
+    const y = Math.max(buildable.minY, Math.min(room.y, buildable.maxY - l));
+    commitRoomPlacement({
+      ...room,
+      width: Number(w.toFixed(2)),
+      length: Number(l.toFixed(2)),
+      x: Number(x.toFixed(2)),
+      y: Number(y.toFixed(2)),
+    });
+    setPendingRoomPlacement(null);
+  };
 
   // Auto-fit drawing to screen on initial mount
   const fitToScreen = useCallback(() => {
@@ -193,7 +300,8 @@ export default function EditorCanvas({
 
     // 4. Check staircases
     for (const s of layout.staircases || []) {
-      if (wx >= s.x && wx <= s.x + s.width && wy >= s.y && wy <= s.y + s.length) {
+      const b = getStaircaseBounds(s);
+      if (wx >= b.x && wx <= b.x + b.width && wy >= b.y && wy <= b.y + b.length) {
         return { type: 'staircase', data: s };
       }
     }
@@ -297,7 +405,178 @@ export default function EditorCanvas({
 
   const cancelDimensionEdit = () => setEditingDim(null);
 
+  // Inline Room Dimension Editing
+  const openRoomDimensionEditor = (roomId, field, sx, sy, curVal) => {
+    setEditingRoomDim({ roomId, field, screenX: sx, screenY: sy });
+    setRoomDimInputValue(formatMeasurement(curVal, unit));
+    setTimeout(() => {
+      if (roomDimInputRef.current) {
+        roomDimInputRef.current.focus();
+        roomDimInputRef.current.select();
+      }
+    }, 50);
+  };
+
+  const commitRoomDimensionEdit = () => {
+    if (!editingRoomDim) return;
+    const { roomId, field } = editingRoomDim;
+    const feet = parseToFeet(roomDimInputValue, unit);
+    setEditingRoomDim(null);
+    if (feet !== null && feet >= MIN_ROOM_DIMENSION) {
+      const res = setRoomDimension(layout, roomId, field, Number(feet.toFixed(4)));
+      if (res.room) {
+        historyManager.pushState(res.layout);
+        onUpdateLayout(res.layout);
+        onSelectElement({ type: 'room', data: res.room });
+        if (res.conflicts.length) showPlacementNotice(`Stopped at the nearest valid size: ${res.conflicts[0]}`);
+      }
+    }
+  };
+
+  const cancelRoomDimensionEdit = () => setEditingRoomDim(null);
+
+  // Escape key cancels placement, drawing, or dimension editing
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof window === 'undefined') return;
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        if (pendingRoomPlacement) {
+          setPendingRoomPlacement(null);
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        if (roomDrawStart) {
+          setRoomDrawStart(null);
+          setAlignmentGuides([]);
+          setSnapBadges([]);
+          setRoomWarnings([]);
+          setActiveMeasurements(null);
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        if (wallDrawStart) {
+          setWallDrawStart(null);
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        if (measureStart) {
+          setMeasureStart(null);
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        if (editingRoomDim) {
+          setEditingRoomDim(null);
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        if (editingDim) {
+          setEditingDim(null);
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [pendingRoomPlacement, roomDrawStart, wallDrawStart, measureStart, editingRoomDim, editingDim]);
+
   // Pointer Down
+  // Resize handle under the pointer for a selected room: corners first, then
+  // the edge midpoint squares, then anywhere along an edge line.
+  const findRoomHandle = (room, sx, sy) => {
+    if (!room) return null;
+    const p0 = worldToScreen(room.x, room.y);
+    const w = room.width * viewport.scale;
+    const h = room.length * viewport.scale;
+    const corners = [
+      { id: 'room-nw', x: p0.x, y: p0.y }, { id: 'room-ne', x: p0.x + w, y: p0.y },
+      { id: 'room-se', x: p0.x + w, y: p0.y + h }, { id: 'room-sw', x: p0.x, y: p0.y + h },
+    ];
+    const mids = [
+      { id: 'room-n', x: p0.x + w / 2, y: p0.y }, { id: 'room-e', x: p0.x + w, y: p0.y + h / 2 },
+      { id: 'room-s', x: p0.x + w / 2, y: p0.y + h }, { id: 'room-w', x: p0.x, y: p0.y + h / 2 },
+    ];
+    const c = corners.find((k) => Math.hypot(sx - k.x, sy - k.y) <= 10);
+    if (c) return c.id;
+    const m = mids.find((k) => Math.hypot(sx - k.x, sy - k.y) <= 10);
+    if (m) return m.id;
+    const tol = 5;
+    const inX = sx > p0.x + tol && sx < p0.x + w - tol;
+    const inY = sy > p0.y + tol && sy < p0.y + h - tol;
+    if (inX && Math.abs(sy - p0.y) <= tol) return 'room-n';
+    if (inX && Math.abs(sy - (p0.y + h)) <= tol) return 'room-s';
+    if (inY && Math.abs(sx - p0.x) <= tol) return 'room-w';
+    if (inY && Math.abs(sx - (p0.x + w)) <= tol) return 'room-e';
+    return null;
+  };
+
+  // Site boundary handles: edge midpoints and corners are always grabbable;
+  // the whole edge line is grabbable while the plot is selected.
+  const PLOT_EDGE_HANDLE_PX = 9;
+  const getPlotHandlePositions = () => {
+    const W = layout?.plot?.width || 30;
+    const L = layout?.plot?.length || 40;
+    const p = (x, y) => worldToScreen(x, y);
+    return [
+      { edge: 'top', ...p(W / 2, 0) },
+      { edge: 'bottom', ...p(W / 2, L) },
+      { edge: 'left', ...p(0, L / 2) },
+      { edge: 'right', ...p(W, L / 2) },
+      { edge: 'corner-nw', ...p(0, 0) },
+      { edge: 'corner-ne', ...p(W, 0) },
+      { edge: 'corner-sw', ...p(0, L) },
+      { edge: 'corner-se', ...p(W, L) },
+    ];
+  };
+
+  const findPlotEdgeHandle = (sx, sy) => {
+    if (!layout?.plot) return null;
+    const hit = getPlotHandlePositions().find((h) => Math.hypot(sx - h.x, sy - h.y) <= PLOT_EDGE_HANDLE_PX);
+    if (hit) return hit.edge;
+    if (selectedElement?.type !== 'plot') return null;
+    const W = layout.plot.width || 30;
+    const L = layout.plot.length || 40;
+    const a = worldToScreen(0, 0);
+    const b = worldToScreen(W, L);
+    const tol = 5;
+    const inX = sx > a.x - tol && sx < b.x + tol;
+    const inY = sy > a.y - tol && sy < b.y + tol;
+    if (inX && Math.abs(sy - a.y) <= tol) return 'top';
+    if (inX && Math.abs(sy - b.y) <= tol) return 'bottom';
+    if (inY && Math.abs(sx - a.x) <= tol) return 'left';
+    if (inY && Math.abs(sx - b.x) <= tol) return 'right';
+    return null;
+  };
+
+  // Proposed site change for a boundary drag. The opposite edge stays fixed;
+  // Shift (or Alt) resizes symmetrically about the centre.
+  const computeSiteDragChange = (info, worldPos, symmetric) => {
+    const plot = info.snapshot.plot;
+    const sb = plot.setbacks || {};
+    const dx = worldPos.x - info.startWorld.x;
+    const dy = worldPos.y - info.startWorld.y;
+    const e = info.edge;
+    const k = symmetric ? 2 : 1;
+    let width = plot.width;
+    let length = plot.length;
+    if (e === 'right' || e === 'corner-ne' || e === 'corner-se') width = plot.width + k * dx;
+    if (e === 'left' || e === 'corner-nw' || e === 'corner-sw') width = plot.width - k * dx;
+    if (e === 'bottom' || e === 'corner-sw' || e === 'corner-se') length = plot.length + k * dy;
+    if (e === 'top' || e === 'corner-nw' || e === 'corner-ne') length = plot.length - k * dy;
+    // Snap to the grid step and keep at least 1 ft of buildable area
+    const minW = (Number(sb.west) || 0) + (Number(sb.east) || 0) + 1;
+    const minL = (Number(sb.north) || 0) + (Number(sb.south) || 0) + 1;
+    width = Math.max(minW, 5, snapEnabled ? snapValue(width, snapStep) : Number(width.toFixed(2)));
+    length = Math.max(minL, 5, snapEnabled ? snapValue(length, snapStep) : Number(length.toFixed(2)));
+    return { width, length, edge: symmetric ? 'symmetric' : e };
+  };
+
   const handlePointerDown = (e) => {
     if (!containerRef.current) return;
     const rect = containerRef.current.getBoundingClientRect();
@@ -305,6 +584,12 @@ export default function EditorCanvas({
     const sy = e.clientY - rect.top;
     const worldPos = screenToWorld(sx, sy);
     const snappedPos = { x: snap(worldPos.x), y: snap(worldPos.y) };
+
+    // Capture the pointer so drags and draws keep receiving events even if
+    // the cursor/finger leaves the canvas mid-operation.
+    if (e.currentTarget && typeof e.currentTarget.setPointerCapture === 'function' && e.pointerId !== undefined) {
+      try { e.currentTarget.setPointerCapture(e.pointerId); } catch (err) { /* not capturable */ }
+    }
 
     // Middle click or spacebar or Pan Tool -> start panning
     if (e.button === 1 || e.spaceKey || activeTool === 'pan') {
@@ -318,7 +603,6 @@ export default function EditorCanvas({
       if (!wallDrawStart) {
         setWallDrawStart(snappedPos);
       } else {
-        // Complete wall
         const newWall = createWall({
           x1: wallDrawStart.x,
           y1: wallDrawStart.y,
@@ -338,24 +622,31 @@ export default function EditorCanvas({
       return;
     }
 
-    // 2. Tool: Add Room
+    // 2. Tool: Add Room (Click & Drag to Create)
     if (activeTool === 'room') {
-      const roomW = 12;
-      const roomH = 10;
-      const newRoom = createRoom({
-        name: 'New Room',
-        x: snappedPos.x,
-        y: snappedPos.y,
-        width: roomW,
-        length: roomH,
+      const snapRes = findRoomSnapping(
+        { x: worldPos.x, y: worldPos.y, width: 0, length: 0 },
+        layout,
+        {
+          handle: 'draw',
+          viewportScale: viewport.scale,
+          screenTolerancePixels: roomSnapPixelTolerance,
+          snapEnabled,
+          snapStep,
+        }
+      );
+      const startPt = { x: snapRes.snappedRoom.x, y: snapRes.snappedRoom.y };
+      setRoomDrawStart(startPt);
+      setAlignmentGuides(snapRes.guides);
+      setSnapBadges(snapRes.snapBadges);
+      setRoomWarnings(snapRes.warnings);
+      setActiveMeasurements({
+        width: 0,
+        length: 0,
+        x: startPt.x,
+        y: startPt.y,
+        area: 0,
       });
-      const nextLayout = {
-        ...layout,
-        rooms: [...(layout.rooms || []), newRoom],
-      };
-      historyManager.pushState(nextLayout);
-      onUpdateLayout(nextLayout);
-      onSelectElement({ type: 'room', data: newRoom });
       return;
     }
 
@@ -416,7 +707,6 @@ export default function EditorCanvas({
         x: snappedPos.x,
         y: snappedPos.y,
         width: 6.0,
-        length: 9.0,
       });
       const nextLayout = {
         ...layout,
@@ -436,6 +726,51 @@ export default function EditorCanvas({
         setMeasureStart(null);
       }
       return;
+    }
+
+    // 8a. Site boundary edge / corner handles (select tool). A selected room's
+    //     own handles take priority so a room resize never resizes the site.
+    const selectedRoomHandle = selectedElement?.type === 'room'
+      ? findRoomHandle((layout.rooms || []).find((r) => r.id === selectedElement.data.id), sx, sy)
+      : null;
+    if (activeTool === 'select' && !selectedRoomHandle) {
+      const edgeHit = findPlotEdgeHandle(sx, sy);
+      if (edgeHit) {
+        onSelectElement({ type: 'plot', data: layout.plot });
+        setDraggingHandle('plot-edge');
+        setDragStartInfo({
+          startWorld: worldPos,
+          edge: edgeHit,
+          snapshot: cloneLayout(layout),
+          startViewport: { ...viewport },
+        });
+        historyManager.beginDrag();
+        return;
+      }
+    }
+
+    // 8b. Staircase width / length handles
+    if (activeTool === 'select' && selectedElement?.type === 'staircase') {
+      const stair = (layout.staircases || []).find((st) => st.id === selectedElement.data.id);
+      if (stair && !stair.isLocked) {
+        const b = getStaircaseBounds(stair);
+        const p0 = worldToScreen(b.x, b.y);
+        const bw = b.width * viewport.scale;
+        const bh = b.length * viewport.scale;
+        const handles = [
+          { id: 'stair-e', x: p0.x + bw, y: p0.y + bh / 2 },
+          { id: 'stair-w', x: p0.x, y: p0.y + bh / 2 },
+          { id: 'stair-s', x: p0.x + bw / 2, y: p0.y + bh },
+          { id: 'stair-n', x: p0.x + bw / 2, y: p0.y },
+        ];
+        const h = handles.find((hh) => Math.hypot(sx - hh.x, sy - hh.y) <= 10);
+        if (h) {
+          setDraggingHandle(h.id);
+          setDragStartInfo({ startWorld: worldPos, initial: { ...stair }, bounds: b });
+          historyManager.beginDrag();
+          return;
+        }
+      }
     }
 
     // 8. Dimension annotations take priority in the Select tool so a click on a
@@ -459,7 +794,7 @@ export default function EditorCanvas({
       }
     }
 
-    // 9. Tool: Select / Move
+    // 9. Tool: Select / Move / 8-Point Resizing
     // Check if clicked on a selected element's handles
     if (selectedElement) {
       if (selectedElement.type === 'wall') {
@@ -487,14 +822,29 @@ export default function EditorCanvas({
           return;
         }
       } else if (selectedElement.type === 'room') {
-        const room = selectedElement.data;
-        // Bottom-right corner resize handle
-        const brX = room.x + room.width;
-        const brY = room.y + room.length;
-        if (Math.hypot(worldPos.x - brX, worldPos.y - brY) < 1.2) {
-          setDraggingHandle('room-br');
-          setDragStartInfo({ startWorld: worldPos, initial: { ...room } });
+        const room = (layout.rooms || []).find((r) => r.id === selectedElement.data.id) || selectedElement.data;
+        const rPos = worldToScreen(room.x, room.y);
+        const rW = room.width * viewport.scale;
+        const rH = room.length * viewport.scale;
+
+        // Resize: capture the pointer-down world position, the room and the
+        // whole layout. Every move is solved from this snapshot.
+        if (selectedRoomHandle && !room.isLocked) {
+          setDraggingHandle(selectedRoomHandle);
+          setDragStartInfo({
+            startWorld: worldPos,
+            initial: { ...room },
+            layoutSnapshot: cloneLayout(layout),
+          });
+          setResizeConflict(null);
           historyManager.beginDrag();
+          return;
+        }
+
+        // Inline click-to-edit room dimension label
+        const labelCenter = { x: rPos.x + rW / 2, y: rPos.y + rH / 2 + 7 };
+        if (Math.hypot(sx - labelCenter.x, sy - labelCenter.y) <= 24) {
+          openRoomDimensionEditor(room.id, 'width', labelCenter.x, labelCenter.y, room.width);
           return;
         }
       }
@@ -504,14 +854,26 @@ export default function EditorCanvas({
     const hit = findElementAtWorldPoint(worldPos.x, worldPos.y);
     if (hit) {
       onSelectElement(hit);
-      // Start moving element
+      if (hit.type === 'room') {
+        setDraggingHandle('room-body');
+        setDragStartInfo({
+          startWorld: worldPos,
+          hitType: 'room',
+          initial: { ...hit.data },
+          layoutSnapshot: cloneLayout(layout),
+        });
+        historyManager.beginDrag();
+        return;
+      }
       setDraggingHandle('element-body');
       setDragStartInfo({
         startWorld: worldPos,
         hitType: hit.type,
         initial: { ...hit.data },
         wallSnapshot: hit.type === 'wall' ? cloneLayout(layout.walls || []) : null,
+        layoutSnapshot: hit.type === 'wall' ? cloneLayout(layout) : null,
       });
+      setResizeConflict(null);
       historyManager.beginDrag();
     } else {
       // Clicked on empty space -> deselect or pan
@@ -536,7 +898,7 @@ export default function EditorCanvas({
 
     // Panning
     if (isPanning) {
-      setViewport(prev => ({
+      setViewport((prev) => ({
         ...prev,
         panX: e.clientX - panStart.x,
         panY: e.clientY - panStart.y,
@@ -544,10 +906,96 @@ export default function EditorCanvas({
       return;
     }
 
+    // 1. Live preview when drawing a new room with mouse
+    if (activeTool === 'room' && roomDrawStart) {
+      const rawBox = {
+        x: Math.min(roomDrawStart.x, worldPos.x),
+        y: Math.min(roomDrawStart.y, worldPos.y),
+        width: Math.abs(worldPos.x - roomDrawStart.x),
+        length: Math.abs(worldPos.y - roomDrawStart.y),
+        freeX: worldPos.x,
+        freeY: worldPos.y,
+      };
+      const snapRes = findRoomSnapping(rawBox, layout, {
+        handle: 'draw',
+        anchor: roomDrawStart,
+        viewportScale: viewport.scale,
+        screenTolerancePixels: roomSnapPixelTolerance,
+        snapEnabled,
+        snapStep,
+      });
+      setAlignmentGuides(snapRes.guides);
+      setSnapBadges(snapRes.snapBadges);
+      setRoomWarnings(snapRes.warnings);
+      setActiveMeasurements({
+        width: snapRes.snappedRoom.width,
+        length: snapRes.snappedRoom.length,
+        x: snapRes.snappedRoom.x,
+        y: snapRes.snappedRoom.y,
+        area: snapRes.snappedRoom.width * snapRes.snappedRoom.length,
+      });
+      return;
+    }
+
     // Dragging / Resizing Handles
     if (draggingHandle && dragStartInfo && selectedElement) {
       const dx = worldPos.x - dragStartInfo.startWorld.x;
       const dy = worldPos.y - dragStartInfo.startWorld.y;
+
+      // Site boundary drag: always recomputed from the drag-start snapshot so
+      // the preview is deterministic and never accumulates drift.
+      if (draggingHandle === 'plot-edge') {
+        // Measure the drag in the drag-start viewport: the live viewport is
+        // shifted below (to pin the fixed edge), which would otherwise feed back.
+        const sv = dragStartInfo.startViewport;
+        const dragWorld = { x: (sx - sv.panX) / sv.scale, y: (sy - sv.panY) / sv.scale };
+        const change = computeSiteDragChange(dragStartInfo, dragWorld, e.shiftKey || e.altKey);
+        const res = applySiteChange(dragStartInfo.snapshot, change);
+        // Keep the fixed edge still on screen when the west / north edge moves.
+        setViewport((prev) => ({
+          ...prev,
+          panX: sv.panX - res.shift.x * prev.scale,
+          panY: sv.panY - res.shift.y * prev.scale,
+        }));
+        setSitePreview({
+          width: res.nextLayout.plot.width,
+          length: res.nextLayout.plot.length,
+          conflicts: res.conflicts.filter((c) => c.severity !== 'info'),
+          change,
+          success: res.success,
+        });
+        historyManager.updateDuringDrag(res.nextLayout);
+        onUpdateLayout(res.nextLayout);
+        return;
+      }
+
+      // Staircase resize: regenerates the steps (step count is preserved)
+      if (draggingHandle && draggingHandle.startsWith('stair-')) {
+        const { initial, bounds } = dragStartInfo;
+        const side = draggingHandle.slice(6);
+        const minSize = 2;
+        let next;
+        if (side === 'e' || side === 'w') {
+          const raw = side === 'e' ? bounds.width + dx : bounds.width - dx;
+          next = resizeStaircaseWorld(initial, 'x', Math.max(minSize, snap(raw)));
+          const nb = getStaircaseBounds(next);
+          next = { ...next, x: side === 'w' ? bounds.x + bounds.width - nb.width : bounds.x, y: bounds.y };
+        } else {
+          const raw = side === 's' ? bounds.length + dy : bounds.length - dy;
+          next = resizeStaircaseWorld(initial, 'y', Math.max(minSize, snap(raw)));
+          const nb = getStaircaseBounds(next);
+          next = { ...next, y: side === 'n' ? bounds.y + bounds.length - nb.length : bounds.y, x: bounds.x };
+        }
+        const nextLayout = {
+          ...layout,
+          staircases: layout.staircases.map((st) => (st.id === initial.id ? next : st)),
+        };
+        const nb = getStaircaseBounds(next);
+        setActiveMeasurements({ width: nb.width, length: nb.length, x: nb.x, y: nb.y, area: nb.width * nb.length });
+        historyManager.updateDuringDrag(nextLayout);
+        onUpdateLayout(nextLayout);
+        return;
+      }
 
       // 0. Dimension annotation move (Mode A: changes offset only, never plot size)
       if (draggingHandle === 'dimension-line') {
@@ -572,7 +1020,7 @@ export default function EditorCanvas({
         const which = draggingHandle === 'wall-p1' ? 'p1' : 'p2';
         const wallId = dragStartInfo.initial.id;
         const snapshot = dragStartInfo.wallSnapshot || layout.walls || [];
-        const sel = snapshot.find(w => w.id === wallId) || dragStartInfo.initial;
+        const sel = snapshot.find((w) => w.id === wallId) || dragStartInfo.initial;
         const orig = which === 'p1' ? { x: sel.x1, y: sel.y1 } : { x: sel.x2, y: sel.y2 };
         const orientation = getWallOrientation(sel);
 
@@ -595,7 +1043,6 @@ export default function EditorCanvas({
         if (endpointHit) {
           target = { x: endpointHit.x, y: endpointHit.y };
         } else if (lockAxis) {
-          // Orthogonal alignment guides
           const axis = orientation === 'horizontal' ? 'x' : 'y';
           const aligned = findAlignmentGuides(target, snapshot, axis, snapTolerance * 0.7, wallId);
           if (aligned.guides.length > 0) {
@@ -604,15 +1051,13 @@ export default function EditorCanvas({
           }
         }
 
-        // Re-apply axis lock so snapping can never tilt an axis-aligned wall
         if (lockAxis && orientation === 'horizontal') target.y = orig.y;
         if (lockAxis && orientation === 'vertical') target.x = orig.x;
 
         const newSel = moveWallEndpoint(sel, which, target, { allowDiagonal });
         const newEndpoint = which === 'p1' ? { x: newSel.x1, y: newSel.y1 } : { x: newSel.x2, y: newSel.y2 };
 
-        let nextWalls = snapshot.map(w => (w.id === wallId ? newSel : w));
-        // Keep adjoining walls / corners connected
+        let nextWalls = snapshot.map((w) => (w.id === wallId ? newSel : w));
         nextWalls = moveConnectedEndpoints(nextWalls, orig, newEndpoint, wallId, 0.3);
 
         setAlignmentGuides(guides);
@@ -622,51 +1067,121 @@ export default function EditorCanvas({
         return;
       }
 
-      // 3. Room Bottom-Right Resize
-      if (draggingHandle === 'room-br' && selectedElement.type === 'room') {
-        const roomId = selectedElement.data.id;
-        const newW = Math.max(3.0, snap(dragStartInfo.initial.width + dx));
-        const newL = Math.max(3.0, snap(dragStartInfo.initial.length + dy));
-        const nextRooms = layout.rooms.map(r => {
-          if (r.id === roomId) {
-            return { ...r, width: newW, length: newL };
-          }
-          return r;
+      // 3. Room Body Drag (Move whole room with smart alignment snapping & wall sync)
+      if (draggingHandle === 'room-body' && selectedElement.type === 'room') {
+        const snapshot = dragStartInfo.layoutSnapshot;
+        const init = dragStartInfo.initial;
+        const proposed = { ...init, x: init.x + dx, y: init.y + dy };
+        const snapRes = findRoomSnapping(proposed, snapshot, {
+          excludeRoomId: init.id,
+          handle: 'body',
+          viewportScale: viewport.scale,
+          screenTolerancePixels: roomSnapPixelTolerance,
+          snapEnabled,
+          snapStep,
         });
-        const nextLayout = { ...layout, rooms: nextRooms };
+        const target = snapRes.snappedRoom;
+        const { layout: nextLayout, room: updatedRoom } = moveRoom(snapshot, init.id, target.x - init.x, target.y - init.y);
         historyManager.updateDuringDrag(nextLayout);
         onUpdateLayout(nextLayout);
+        setAlignmentGuides(snapRes.guides);
+        setSnapBadges(snapRes.snapBadges);
+        setRoomWarnings(snapRes.warnings);
+        setActiveMeasurements({
+          width: updatedRoom.width,
+          length: updatedRoom.length,
+          x: updatedRoom.x,
+          y: updatedRoom.y,
+          area: updatedRoom.width * updatedRoom.length,
+        });
         return;
       }
 
-      // 4. Element Body Move
+      // 4. Room resizing (edges and corners). dx / dy are world-feet deltas from
+      //    the pointer-down position; geometry comes from the pointer-down
+      //    snapshot, so nothing accumulates between move events.
+      if (draggingHandle.startsWith('room-') && selectedElement.type === 'room') {
+        const handleCode = draggingHandle.replace('room-', '');
+        const init = dragStartInfo.initial;
+        const snapshot = dragStartInfo.layoutSnapshot;
+        const raw = edgeTargetsForHandle(init, handleCode, dx, dy);
+
+        // Snap the moving edge(s) to grid / alignment targets of the snapshot
+        const proposed = {
+          x: raw.left ?? init.x,
+          y: raw.top ?? init.y,
+          width: (raw.right ?? init.x + init.width) - (raw.left ?? init.x),
+          length: (raw.bottom ?? init.y + init.length) - (raw.top ?? init.y),
+        };
+        const snapRes = findRoomSnapping(proposed, snapshot, {
+          excludeRoomId: init.id,
+          handle: handleCode,
+          anchor: {
+            x: handleCode.includes('w') ? init.x + init.width : init.x,
+            y: handleCode.includes('n') ? init.y + init.length : init.y,
+          },
+          viewportScale: viewport.scale,
+          screenTolerancePixels: roomSnapPixelTolerance,
+          snapEnabled,
+          snapStep,
+        });
+        const sr = snapRes.snappedRoom;
+        const targets = {};
+        if (raw.left !== undefined) targets.left = sr.x;
+        if (raw.right !== undefined) targets.right = sr.x + sr.width;
+        if (raw.top !== undefined) targets.top = sr.y;
+        if (raw.bottom !== undefined) targets.bottom = sr.y + sr.length;
+
+        const res = resizeRoom(snapshot, init.id, targets);
+        const updatedRoom = res.room;
+        historyManager.updateDuringDrag(res.layout);
+        onUpdateLayout(res.layout);
+        setAlignmentGuides(snapRes.guides);
+        setSnapBadges(snapRes.snapBadges);
+        setRoomWarnings(snapRes.warnings);
+        setResizeConflict(res.conflicts[0] || null);
+        setActiveMeasurements({
+          width: updatedRoom.width,
+          length: updatedRoom.length,
+          x: updatedRoom.x,
+          y: updatedRoom.y,
+          area: updatedRoom.width * updatedRoom.length,
+        });
+        return;
+      }
+
+      // 5. General Element Body Move (wall, door, window, staircase, etc.)
       if (draggingHandle === 'element-body') {
         const elemType = dragStartInfo.hitType;
         const id = dragStartInfo.initial.id;
 
-        if (elemType === 'room') {
-          const newX = snap(dragStartInfo.initial.x + dx);
-          const newY = snap(dragStartInfo.initial.y + dy);
-          const nextRooms = layout.rooms.map(r => (r.id === id ? { ...r, x: newX, y: newY } : r));
-          const nextLayout = { ...layout, rooms: nextRooms };
-          historyManager.updateDuringDrag(nextLayout);
-          onUpdateLayout(nextLayout);
-        } else if (elemType === 'wall') {
-          // Translate the whole wall by an identical delta for both endpoints.
-          // This guarantees length, thickness and orientation never change.
+        if (elemType === 'wall' && dragStartInfo.layoutSnapshot) {
+          const w0 = dragStartInfo.initial;
+          const vertical = Math.abs(w0.x1 - w0.x2) < 0.02;
+          const horizontal = Math.abs(w0.y1 - w0.y2) < 0.02;
+          if (vertical || horizontal) {
+            const res = moveWallBoundary(dragStartInfo.layoutSnapshot, id, vertical ? snap(dx) : snap(dy));
+            if (res) {
+              historyManager.updateDuringDrag(res.layout);
+              onUpdateLayout(res.layout);
+              setResizeConflict(res.clamped ? res.reason : null);
+              return;
+            }
+          }
+        }
+        if (elemType === 'wall') {
           const moveX = snap(dx);
           const moveY = snap(dy);
           const snapshot = dragStartInfo.wallSnapshot || layout.walls || [];
-          const orig = snapshot.find(w => w.id === id) || dragStartInfo.initial;
+          const orig = snapshot.find((w) => w.id === id) || dragStartInfo.initial;
           const newA = { x: orig.x1 + moveX, y: orig.y1 + moveY };
           const newB = { x: orig.x2 + moveX, y: orig.y2 + moveY };
           const tolerance = 0.25;
 
-          const nextWalls = snapshot.map(w => {
+          const nextWalls = snapshot.map((w) => {
             if (w.id === id) {
               return { ...w, x1: newA.x, y1: newA.y, x2: newB.x, y2: newB.y };
             }
-            // Follow adjoining walls whose endpoint was connected to the moved wall
             let nx1 = w.x1, ny1 = w.y1, nx2 = w.x2, ny2 = w.y2, changed = false;
             if (Math.hypot(w.x1 - orig.x1, w.y1 - orig.y1) <= tolerance) { nx1 = newA.x; ny1 = newA.y; changed = true; }
             if (Math.hypot(w.x2 - orig.x1, w.y2 - orig.y1) <= tolerance) { nx2 = newA.x; ny2 = newA.y; changed = true; }
@@ -680,35 +1195,35 @@ export default function EditorCanvas({
         } else if (elemType === 'door') {
           const newX = snap(dragStartInfo.initial.x + dx);
           const newY = snap(dragStartInfo.initial.y + dy);
-          const nextDoors = layout.doors.map(d => (d.id === id ? { ...d, x: newX, y: newY } : d));
+          const nextDoors = layout.doors.map((d) => (d.id === id ? { ...d, x: newX, y: newY } : d));
           const nextLayout = { ...layout, doors: nextDoors };
           historyManager.updateDuringDrag(nextLayout);
           onUpdateLayout(nextLayout);
         } else if (elemType === 'window') {
           const newX = snap(dragStartInfo.initial.x + dx);
           const newY = snap(dragStartInfo.initial.y + dy);
-          const nextWins = layout.windows.map(w => (w.id === id ? { ...w, x: newX, y: newY } : w));
+          const nextWins = layout.windows.map((w) => (w.id === id ? { ...w, x: newX, y: newY } : w));
           const nextLayout = { ...layout, windows: nextWins };
           historyManager.updateDuringDrag(nextLayout);
           onUpdateLayout(nextLayout);
         } else if (elemType === 'staircase') {
           const newX = snap(dragStartInfo.initial.x + dx);
           const newY = snap(dragStartInfo.initial.y + dy);
-          const nextStairs = layout.staircases.map(s => (s.id === id ? { ...s, x: newX, y: newY } : s));
+          const nextStairs = layout.staircases.map((s) => (s.id === id ? { ...s, x: newX, y: newY } : s));
           const nextLayout = { ...layout, staircases: nextStairs };
           historyManager.updateDuringDrag(nextLayout);
           onUpdateLayout(nextLayout);
         } else if (elemType === 'utility') {
           const newX = snap(dragStartInfo.initial.x + dx);
           const newY = snap(dragStartInfo.initial.y + dy);
-          const nextUtils = layout.utilities.map(u => (u.id === id ? { ...u, x: newX, y: newY } : u));
+          const nextUtils = layout.utilities.map((u) => (u.id === id ? { ...u, x: newX, y: newY } : u));
           const nextLayout = { ...layout, utilities: nextUtils };
           historyManager.updateDuringDrag(nextLayout);
           onUpdateLayout(nextLayout);
         } else if (elemType === 'parking') {
           const newX = snap(dragStartInfo.initial.x + dx);
           const newY = snap(dragStartInfo.initial.y + dy);
-          const nextParks = layout.parking.map(p => (p.id === id ? { ...p, x: newX, y: newY } : p));
+          const nextParks = layout.parking.map((p) => (p.id === id ? { ...p, x: newX, y: newY } : p));
           const nextLayout = { ...layout, parking: nextParks };
           historyManager.updateDuringDrag(nextLayout);
           onUpdateLayout(nextLayout);
@@ -718,15 +1233,90 @@ export default function EditorCanvas({
   };
 
   // Pointer Up
-  const handlePointerUp = () => {
+  const handlePointerUp = (e) => {
     if (isPanning) {
       setIsPanning(false);
     }
+
+    if (e && e.currentTarget && typeof e.currentTarget.releasePointerCapture === 'function' && e.pointerId !== undefined) {
+      try { e.currentTarget.releasePointerCapture(e.pointerId); } catch (err) {}
+    }
+
+    if (activeTool === 'room' && roomDrawStart) {
+      const rawBox = {
+        x: Math.min(roomDrawStart.x, mouseWorldPos.x),
+        y: Math.min(roomDrawStart.y, mouseWorldPos.y),
+        width: Math.abs(mouseWorldPos.x - roomDrawStart.x),
+        length: Math.abs(mouseWorldPos.y - roomDrawStart.y),
+        freeX: mouseWorldPos.x,
+        freeY: mouseWorldPos.y,
+      };
+      const snapRes = findRoomSnapping(rawBox, layout, {
+        handle: 'draw',
+        anchor: roomDrawStart,
+        viewportScale: viewport.scale,
+        screenTolerancePixels: roomSnapPixelTolerance,
+        snapEnabled,
+        snapStep,
+      });
+      const r = snapRes.snappedRoom;
+      let finalW = r.width;
+      let finalL = r.length;
+      let finalX = r.x;
+      let finalY = r.y;
+
+      const dragDist = Math.hypot(mouseWorldPos.x - roomDrawStart.x, mouseWorldPos.y - roomDrawStart.y);
+      if (dragDist < 0.6) {
+        finalW = 12;
+        finalL = 10;
+        finalX = roomDrawStart.x;
+        finalY = roomDrawStart.y;
+      }
+
+      if (finalW >= MIN_ROOM_DIMENSION && finalL >= MIN_ROOM_DIMENSION) {
+        finalizeRoomPlacement({ x: finalX, y: finalY, width: finalW, length: finalL });
+      } else {
+        showPlacementNotice(`Room too small - minimum ${formatMeasurement(MIN_ROOM_DIMENSION, unit)} × ${formatMeasurement(MIN_ROOM_DIMENSION, unit)} required`);
+      }
+
+      setRoomDrawStart(null);
+      setAlignmentGuides([]);
+      setSnapBadges([]);
+      setRoomWarnings([]);
+      setActiveMeasurements(null);
+      return;
+    }
+
+    if (draggingHandle === 'plot-edge' && dragStartInfo) {
+      const preview = sitePreview;
+      const startViewport = dragStartInfo.startViewport;
+      setSitePreview(null);
+      setDraggingHandle(null);
+      setDragStartInfo(null);
+      if (preview && !preview.success) {
+        // Reject the live preview: restore the last valid layout (no history
+        // step) and hand the change to the editor's conflict dialog.
+        const restored = historyManager.cancelDrag();
+        onUpdateLayout(restored);
+        setViewport((prev) => ({ ...prev, panX: startViewport.panX, panY: startViewport.panY }));
+        if (onRequestSiteChange) onRequestSiteChange(preview.change, restored);
+        return;
+      }
+      // One undoable transaction for the whole resize + reflow
+      historyManager.endDrag(layout);
+      return;
+    }
+
     if (draggingHandle) {
+      if (resizeConflict) showPlacementNotice(`Stopped at the nearest valid size: ${resizeConflict}`);
+      setResizeConflict(null);
       historyManager.endDrag(layout);
       setDraggingHandle(null);
       setDragStartInfo(null);
       setAlignmentGuides([]);
+      setSnapBadges([]);
+      setRoomWarnings([]);
+      setActiveMeasurements(null);
     }
   };
 
@@ -888,7 +1478,9 @@ export default function EditorCanvas({
         backgroundColor: '#F8FAFC',
         position: 'relative',
         overflow: 'hidden',
+        touchAction: 'none',
         userSelect: 'none',
+        WebkitUserSelect: 'none',
         cursor: activeTool === 'pan' || isPanning ? 'grabbing' : (activeTool === 'wall' || activeTool === 'room' ? 'crosshair' : 'default'),
       }}
       onWheel={handleWheel}
@@ -896,6 +1488,7 @@ export default function EditorCanvas({
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
       onPointerLeave={handlePointerUp}
+      onPointerCancel={handlePointerUp}
     >
       {/* Top & Left Architectural Precision Rulers */}
       {renderRulers()}
@@ -957,6 +1550,30 @@ export default function EditorCanvas({
           strokeDasharray="6,4"
         />
 
+        {/* Setback line / buildable area (derived from the plot and setbacks) */}
+        {(() => {
+          const sb = layout?.plot?.setbacks || {};
+          const bx0 = Number(sb.west) || 0;
+          const by0 = Number(sb.north) || 0;
+          const bw = plotW - bx0 - (Number(sb.east) || 0);
+          const bl = plotL - by0 - (Number(sb.south) || 0);
+          if (bw <= 0 || bl <= 0) return null;
+          const p0 = worldToScreen(bx0, by0);
+          return (
+            <rect
+              key="buildable-area"
+              x={p0.x}
+              y={p0.y}
+              width={bw * viewport.scale}
+              height={bl * viewport.scale}
+              fill="none"
+              stroke="#94A3B8"
+              strokeWidth="1"
+              strokeDasharray="3,3"
+            />
+          );
+        })()}
+
         {/* Vastu Quadrant Badges */}
         <g fontSize="10" fontWeight="bold" fill="#B45309">
           <text x={plotScr.x + plotWidthPx - 26} y={plotScr.y + 18}>NE</text>
@@ -967,6 +1584,41 @@ export default function EditorCanvas({
 
         {/* Outer Plot Dimension Lines (interactive) */}
         {renderPlotDimensions()}
+
+        {/* Site boundary resize handles (drag an edge; Shift = symmetric) */}
+        {activeTool === 'select' && getPlotHandlePositions().map((h) => {
+          const isCorner = h.edge.startsWith('corner');
+          const cursor = isCorner
+            ? (h.edge === 'corner-nw' || h.edge === 'corner-se' ? 'nwse-resize' : 'nesw-resize')
+            : (h.edge === 'left' || h.edge === 'right' ? 'ew-resize' : 'ns-resize');
+          const active = draggingHandle === 'plot-edge' && dragStartInfo?.edge === h.edge;
+          return (
+            <rect
+              key={`plot-h-${h.edge}`}
+              x={h.x - 5}
+              y={h.y - 5}
+              width="10"
+              height="10"
+              rx={isCorner ? 0 : 2}
+              fill={active ? '#D97706' : '#FFFFFF'}
+              stroke="#D97706"
+              strokeWidth="1.5"
+              style={{ cursor, pointerEvents: 'all' }}
+            />
+          );
+        })}
+        {sitePreview && (() => {
+          const text = `${formatMeasurement(sitePreview.width, unit)} × ${formatMeasurement(sitePreview.length, unit)}` +
+            (sitePreview.success ? '' : `  ·  ${sitePreview.conflicts.length} conflict${sitePreview.conflicts.length === 1 ? '' : 's'}`);
+          const c = worldToScreen(plotW / 2, plotL / 2);
+          return (
+            <g key="site-preview" transform={`translate(${c.x}, ${c.y})`}>
+              <rect x={-(text.length * 3.4 + 14)} y="-12" width={text.length * 6.8 + 28} height="22" rx="11"
+                fill={sitePreview.success ? '#0F172A' : '#991B1B'} opacity="0.92" />
+              <text x="0" y="3" textAnchor="middle" fill="#FFFFFF" fontSize="11" fontWeight="700" fontFamily="Segoe UI, sans-serif">{text}</text>
+            </g>
+          );
+        })()}
 
         {/* Live alignment guides while dragging wall endpoints */}
         {alignmentGuides.map((g, i) => {
@@ -1035,14 +1687,20 @@ export default function EditorCanvas({
               </text>
 
               {showDimensions && (
-                <>
+                <g
+                  style={{ cursor: 'pointer', pointerEvents: 'all' }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    openRoomDimensionEditor(room.id, 'width', rPos.x + rW / 2, rPos.y + rH / 2 + 7, room.width);
+                  }}
+                >
                   <text
                     x={rPos.x + rW / 2}
                     y={rPos.y + rH / 2 + 7}
                     textAnchor="middle"
                     fontSize={Math.max(8.5, Math.min(12, 9.5 * (viewport.scale / 18)))}
-                    fontWeight="500"
-                    fill="#64748B"
+                    fontWeight="600"
+                    fill="#334155"
                     fontFamily="Segoe UI, sans-serif"
                   >
                     {formatMeasurement(room.width, unit)} × {formatMeasurement(room.length, unit)}
@@ -1058,21 +1716,125 @@ export default function EditorCanvas({
                   >
                     {formatArea(area, unit)}
                   </text>
-                </>
+                </g>
               )}
 
-              {/* Selection Corner Resize Handle */}
+              {/* 8-Point Selection & Resize Handles */}
               {isSel && (
-                <rect
-                  x={rPos.x + rW - 6}
-                  y={rPos.y + rH - 6}
-                  width="12"
-                  height="12"
-                  fill="#2563EB"
-                  stroke="#FFFFFF"
-                  strokeWidth="2"
-                  cursor="nwse-resize"
-                />
+                <g key={`room-handles-${room.id}`}>
+                  {/* Subtle selection outer glow */}
+                  <rect
+                    x={rPos.x - 2}
+                    y={rPos.y - 2}
+                    width={rW + 4}
+                    height={rH + 4}
+                    fill="none"
+                    stroke="#2563EB"
+                    strokeWidth="1.5"
+                    strokeDasharray="4,3"
+                    opacity="0.8"
+                  />
+
+                  {/* Corner Handles */}
+                  {/* NW */}
+                  <rect
+                    x={rPos.x - 6}
+                    y={rPos.y - 6}
+                    width="12"
+                    height="12"
+                    rx="2"
+                    fill="#2563EB"
+                    stroke="#FFFFFF"
+                    strokeWidth="2"
+                    style={{ cursor: 'nwse-resize', pointerEvents: 'all' }}
+                  />
+                  {/* NE */}
+                  <rect
+                    x={rPos.x + rW - 6}
+                    y={rPos.y - 6}
+                    width="12"
+                    height="12"
+                    rx="2"
+                    fill="#2563EB"
+                    stroke="#FFFFFF"
+                    strokeWidth="2"
+                    style={{ cursor: 'nesw-resize', pointerEvents: 'all' }}
+                  />
+                  {/* SE */}
+                  <rect
+                    x={rPos.x + rW - 6}
+                    y={rPos.y + rH - 6}
+                    width="12"
+                    height="12"
+                    rx="2"
+                    fill="#2563EB"
+                    stroke="#FFFFFF"
+                    strokeWidth="2"
+                    style={{ cursor: 'nwse-resize', pointerEvents: 'all' }}
+                  />
+                  {/* SW */}
+                  <rect
+                    x={rPos.x - 6}
+                    y={rPos.y + rH - 6}
+                    width="12"
+                    height="12"
+                    rx="2"
+                    fill="#2563EB"
+                    stroke="#FFFFFF"
+                    strokeWidth="2"
+                    style={{ cursor: 'nesw-resize', pointerEvents: 'all' }}
+                  />
+
+                  {/* Edge Handles */}
+                  {/* N (Top) */}
+                  <rect
+                    x={rPos.x + rW / 2 - 8}
+                    y={rPos.y - 5}
+                    width="16"
+                    height="10"
+                    rx="3"
+                    fill="#FFFFFF"
+                    stroke="#2563EB"
+                    strokeWidth="2"
+                    style={{ cursor: 'ns-resize', pointerEvents: 'all' }}
+                  />
+                  {/* S (Bottom) */}
+                  <rect
+                    x={rPos.x + rW / 2 - 8}
+                    y={rPos.y + rH - 5}
+                    width="16"
+                    height="10"
+                    rx="3"
+                    fill="#FFFFFF"
+                    stroke="#2563EB"
+                    strokeWidth="2"
+                    style={{ cursor: 'ns-resize', pointerEvents: 'all' }}
+                  />
+                  {/* W (Left) */}
+                  <rect
+                    x={rPos.x - 5}
+                    y={rPos.y + rH / 2 - 8}
+                    width="10"
+                    height="16"
+                    rx="3"
+                    fill="#FFFFFF"
+                    stroke="#2563EB"
+                    strokeWidth="2"
+                    style={{ cursor: 'ew-resize', pointerEvents: 'all' }}
+                  />
+                  {/* E (Right) */}
+                  <rect
+                    x={rPos.x + rW - 5}
+                    y={rPos.y + rH / 2 - 8}
+                    width="10"
+                    height="16"
+                    rx="3"
+                    fill="#FFFFFF"
+                    stroke="#2563EB"
+                    strokeWidth="2"
+                    style={{ cursor: 'ew-resize', pointerEvents: 'all' }}
+                  />
+                </g>
               )}
             </g>
           );
@@ -1128,36 +1890,45 @@ export default function EditorCanvas({
         })}
 
         {(layout?.staircases || []).map(s => {
-          const sPos = worldToScreen(s.x, s.y);
-          const sW = s.width * viewport.scale;
-          const sH = s.length * viewport.scale;
+          const geo = calculateStaircaseGeometry(s);
           const isSel = selectedElement?.type === 'staircase' && selectedElement.data.id === s.id;
-          const steps = s.steps || 12;
+          const pts = (poly) => poly.map((pt) => { const q = worldToScreen(pt.x, pt.y); return `${q.x},${q.y}`; }).join(' ');
+          const ln = (l, key, stroke, w) => {
+            const a = worldToScreen(l.x1, l.y1);
+            const b = worldToScreen(l.x2, l.y2);
+            return <line key={key} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={stroke} strokeWidth={w} />;
+          };
+          const label = worldToScreen(geo.labelPos.x, geo.labelPos.y);
+          const b = geo.bounds;
+          const p0 = worldToScreen(b.x, b.y);
+          const bw = b.width * viewport.scale;
+          const bh = b.length * viewport.scale;
           return (
             <g key={s.id}>
-              <rect
-                x={sPos.x}
-                y={sPos.y}
-                width={sW}
-                height={sH}
-                fill="#F8FAFC"
-                stroke={isSel ? '#2563EB' : '#475569'}
-                strokeWidth={isSel ? 2 : 1.5}
-              />
-              {Array.from({ length: steps - 1 }).map((_, idx) => (
-                <line
-                  key={`st-${idx}`}
-                  x1={sPos.x}
-                  y1={sPos.y + (sH / steps) * (idx + 1)}
-                  x2={sPos.x + sW}
-                  y2={sPos.y + (sH / steps) * (idx + 1)}
-                  stroke="#94A3B8"
-                  strokeWidth="1"
-                />
+              <polygon points={pts(geo.outline)} fill={s.color || '#F8FAFC'} stroke={isSel ? '#2563EB' : '#475569'} strokeWidth={isSel ? 2 : 1.5} />
+              {geo.landings.map((l, i) => (
+                <polygon key={`ld-${i}`} points={pts(l.polygon)} fill="#EEF2F7" stroke="#64748B" strokeWidth="1" />
               ))}
-              <text x={sPos.x + sW / 2} y={sPos.y + sH / 2 + 3} textAnchor="middle" fontSize="9" fontWeight="bold" fill="#0F172A">
-                {s.label || 'STAIRS'}
+              {geo.flights.map((f) => (
+                <g key={`fl-${f.index}`}>
+                  <polygon points={pts(f.polygon)} fill="none" stroke="#64748B" strokeWidth="1" />
+                  {f.treads.map((t, i) => ln(t, `tr-${f.index}-${i}`, '#94A3B8', 1))}
+                </g>
+              ))}
+              {geo.dividers.map((d, i) => ln(d, `dv-${i}`, '#334155', 1.5))}
+              <polyline points={pts(geo.arrow.points)} fill="none" stroke="#0F172A" strokeWidth="1.2" />
+              <polyline points={pts(geo.arrow.arrowHead)} fill="none" stroke="#0F172A" strokeWidth="1.2" />
+              <text x={label.x} y={label.y + 3} textAnchor="middle" fontSize="9" fontWeight="bold" fill="#0F172A">
+                {`${geo.labelText} · ${geo.metrics.totalRisers}R`}
               </text>
+              {isSel && !s.isLocked && [
+                { id: 'e', x: p0.x + bw, y: p0.y + bh / 2, c: 'ew-resize' },
+                { id: 'w', x: p0.x, y: p0.y + bh / 2, c: 'ew-resize' },
+                { id: 's', x: p0.x + bw / 2, y: p0.y + bh, c: 'ns-resize' },
+                { id: 'n', x: p0.x + bw / 2, y: p0.y, c: 'ns-resize' },
+              ].map((h) => (
+                <rect key={`sh-${h.id}`} x={h.x - 5} y={h.y - 5} width="10" height="10" fill="#FFFFFF" stroke="#2563EB" strokeWidth="1.5" style={{ cursor: h.c, pointerEvents: 'all' }} />
+              ))}
             </g>
           );
         })}
@@ -1298,6 +2069,204 @@ export default function EditorCanvas({
           );
         })}
 
+        {/* Real-time Alignment Guides */}
+        {alignmentGuides.map((g, idx) => {
+          if (g.orientation === 'v') {
+            const sx = worldToScreen(g.pos, 0).x;
+            return (
+              <g key={`guide-v-${idx}-${g.pos}`}>
+                <line
+                  x1={sx}
+                  y1={0}
+                  x2={sx}
+                  y2={3000}
+                  stroke="#2563EB"
+                  strokeWidth="1.2"
+                  strokeDasharray="4,3"
+                  opacity="0.85"
+                />
+                {g.label && (
+                  <g transform={`translate(${sx + 4}, 28)`}>
+                    <rect x="0" y="-11" width={g.label.length * 6.5 + 8} height="15" rx="3" fill="#0F172A" opacity="0.88" />
+                    <text x="4" y="0" fill="#93C5FD" fontSize="9" fontWeight="600" fontFamily="Segoe UI, sans-serif">
+                      {g.label}
+                    </text>
+                  </g>
+                )}
+              </g>
+            );
+          } else {
+            const sy = worldToScreen(0, g.pos).y;
+            return (
+              <g key={`guide-h-${idx}-${g.pos}`}>
+                <line
+                  x1={0}
+                  y1={sy}
+                  x2={3000}
+                  y2={sy}
+                  stroke="#2563EB"
+                  strokeWidth="1.2"
+                  strokeDasharray="4,3"
+                  opacity="0.85"
+                />
+                {g.label && (
+                  <g transform={`translate(28, ${sy - 4})`}>
+                    <rect x="0" y="-11" width={g.label.length * 6.5 + 8} height="15" rx="3" fill="#0F172A" opacity="0.88" />
+                    <text x="4" y="0" fill="#93C5FD" fontSize="9" fontWeight="600" fontFamily="Segoe UI, sans-serif">
+                      {g.label}
+                    </text>
+                  </g>
+                )}
+              </g>
+            );
+          }
+        })}
+
+        {/* Visible Snap Indicators */}
+        {snapBadges.map((badge, idx) => {
+          const scr = worldToScreen(badge.pos.x, badge.pos.y);
+          return (
+            <g key={`snap-badge-${idx}`} transform={`translate(${scr.x + 8}, ${scr.y - 14})`}>
+              <rect
+                x="0"
+                y="-13"
+                width={badge.text.length * 6.5 + 12}
+                height="18"
+                rx="9"
+                fill="#0F172A"
+                stroke="#3B82F6"
+                strokeWidth="1.2"
+                opacity="0.95"
+              />
+              <text
+                x="6"
+                y="0"
+                fill="#FFFFFF"
+                fontSize="9.5"
+                fontWeight="700"
+                fontFamily="Segoe UI, sans-serif"
+              >
+                {badge.text}
+              </text>
+            </g>
+          );
+        })}
+
+        {/* Room Drawing Live Preview (Add Room Tool) */}
+        {activeTool === 'room' && roomDrawStart && (() => {
+          const rawBox = {
+            x: Math.min(roomDrawStart.x, mouseWorldPos.x),
+            y: Math.min(roomDrawStart.y, mouseWorldPos.y),
+            width: Math.abs(mouseWorldPos.x - roomDrawStart.x),
+            length: Math.abs(mouseWorldPos.y - roomDrawStart.y),
+            freeX: mouseWorldPos.x,
+            freeY: mouseWorldPos.y,
+          };
+          const snapRes = findRoomSnapping(rawBox, layout, {
+            handle: 'draw',
+            anchor: roomDrawStart,
+            viewportScale: viewport.scale,
+            screenTolerancePixels: roomSnapPixelTolerance,
+            snapEnabled,
+            snapStep,
+          });
+          const r = snapRes.snappedRoom;
+          const scr = worldToScreen(r.x, r.y);
+          const scrW = r.width * viewport.scale;
+          const scrH = r.length * viewport.scale;
+          const area = r.width * r.length;
+          const hasWarning = snapRes.warnings.length > 0;
+          const color = hasWarning ? '#EF4444' : '#2563EB';
+
+          return (
+            <g key="room-draw-live-preview">
+              <rect
+                x={scr.x}
+                y={scr.y}
+                width={scrW}
+                height={scrH}
+                fill={hasWarning ? 'rgba(239, 68, 68, 0.12)' : 'rgba(37, 99, 235, 0.14)'}
+                stroke={color}
+                strokeWidth="2.5"
+                strokeDasharray="6,4"
+              />
+              {/* Corner handles */}
+              <circle cx={scr.x} cy={scr.y} r="3.5" fill={color} />
+              <circle cx={scr.x + scrW} cy={scr.y} r="3.5" fill={color} />
+              <circle cx={scr.x + scrW} cy={scr.y + scrH} r="3.5" fill={color} />
+              <circle cx={scr.x} cy={scr.y + scrH} r="3.5" fill={color} />
+
+              {/* Center dimension overlay badge */}
+              {scrW > 40 && scrH > 30 && (
+                <g transform={`translate(${scr.x + scrW / 2}, ${scr.y + scrH / 2})`}>
+                  <rect
+                    x="-70"
+                    y="-20"
+                    width="140"
+                    height="40"
+                    rx="6"
+                    fill="#0F172A"
+                    stroke={color}
+                    strokeWidth="1.2"
+                    opacity="0.92"
+                  />
+                  <text x="0" y="-4" textAnchor="middle" fill="#FFFFFF" fontSize="11" fontWeight="700" fontFamily="Segoe UI, sans-serif">
+                    {formatMeasurement(r.width, unit)} × {formatMeasurement(r.length, unit)}
+                  </text>
+                  <text x="0" y="11" textAnchor="middle" fill={hasWarning ? '#FCA5A5' : '#38BDF8'} fontSize="10" fontWeight="600" fontFamily="Segoe UI, sans-serif">
+                    {formatArea(area, unit)}
+                  </text>
+                </g>
+              )}
+
+              {/* Warning badge if exceeds bounds */}
+              {hasWarning && (
+                <g transform={`translate(${scr.x + scrW / 2}, ${scr.y - 12})`}>
+                  <rect
+                    x={-Math.min(160, snapRes.warnings[0].length * 3.4 + 14)}
+                    y="-11"
+                    width={Math.min(320, snapRes.warnings[0].length * 6.8 + 28)}
+                    height="18"
+                    rx="4"
+                    fill="#7F1D1D"
+                    stroke="#EF4444"
+                    strokeWidth="1"
+                  />
+                  <text x="0" y="2" textAnchor="middle" fill="#FEE2E2" fontSize="9" fontWeight="700" fontFamily="Segoe UI, sans-serif">
+                    ⚠️ {snapRes.warnings[0]}
+                  </text>
+                </g>
+              )}
+            </g>
+          );
+        })()}
+
+        {/* Floating Measurements Pill while dragging/resizing a room */}
+        {activeMeasurements && (draggingHandle && (draggingHandle.startsWith('room-') || draggingHandle.startsWith('stair-'))) && (() => {
+          const scr = worldToScreen(activeMeasurements.x, activeMeasurements.y);
+          const scrW = activeMeasurements.width * viewport.scale;
+          const text = `${formatMeasurement(activeMeasurements.width, unit)} × ${formatMeasurement(activeMeasurements.length, unit)}  |  ${formatArea(activeMeasurements.area, unit)}` +
+            (resizeConflict ? '  ·  limit reached' : '');
+          return (
+            <g key="active-measurements-pill" transform={`translate(${scr.x + scrW / 2}, ${scr.y - 18})`}>
+              <rect
+                x={-Math.min(160, text.length * 3.4 + 14)}
+                y="-11"
+                width={Math.min(320, text.length * 6.8 + 28)}
+                height="20"
+                rx="10"
+                fill="#0F172A"
+                stroke="#3B82F6"
+                strokeWidth="1.2"
+                opacity="0.95"
+              />
+              <text x="0" y="3" textAnchor="middle" fill="#FFFFFF" fontSize="10" fontWeight="700" fontFamily="Segoe UI, sans-serif">
+                {text}
+              </text>
+            </g>
+          );
+        })()}
+
         {/* Wall Drawing Live Preview */}
         {activeTool === 'wall' && wallDrawStart && (
           <line
@@ -1357,6 +2326,42 @@ export default function EditorCanvas({
             position: 'absolute',
             left: editingDim.screenX - 48,
             top: editingDim.screenY - 15,
+            width: 96,
+            height: 30,
+            textAlign: 'center',
+            fontSize: 12,
+            fontWeight: 700,
+            color: '#0F172A',
+            border: '2px solid #2563EB',
+            borderRadius: 5,
+            background: '#FFFFFF',
+            outline: 'none',
+            zIndex: 100,
+            boxShadow: '0 4px 12px rgba(15, 23, 42, 0.2)',
+          }}
+        />
+      )}
+
+      {/* Inline numeric editor for a room dimension label */}
+      {editingRoomDim && (
+        <input
+          ref={roomDimInputRef}
+          value={roomDimInputValue}
+          autoFocus
+          onChange={(e) => setRoomDimInputValue(e.target.value)}
+          onPointerDown={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+          onKeyDown={(e) => {
+            e.stopPropagation();
+            if (e.key === 'Enter') commitRoomDimensionEdit();
+            else if (e.key === 'Escape') cancelRoomDimensionEdit();
+          }}
+          onBlur={commitRoomDimensionEdit}
+          style={{
+            position: 'absolute',
+            left: editingRoomDim.screenX - 48,
+            top: editingRoomDim.screenY - 15,
             width: 96,
             height: 30,
             textAlign: 'center',

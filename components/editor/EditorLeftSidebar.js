@@ -13,6 +13,7 @@ import {
   createColumn,
   createParking,
   createUtility,
+  createRoomBoundaryWalls,
 } from './layoutModel';
 
 export const TOOLS = [
@@ -61,9 +62,11 @@ export default function EditorLeftSidebar({
       x: Math.max(2, (plotW - tmpl.width) / 2),
       y: Math.max(2, (plotL - tmpl.length) / 2),
     });
+    const nextWalls = createRoomBoundaryWalls(layout, newRoom);
     const nextLayout = {
       ...layout,
       rooms: [...(layout.rooms || []), newRoom],
+      walls: nextWalls,
     };
     historyManager.pushState(nextLayout);
     onUpdateLayout(nextLayout);
