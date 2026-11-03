@@ -1,6 +1,6 @@
 /**
  * AutoPlot Complete 2D Architectural Layout Editor
- * Integrates Toolbar, Left Sidebar, 2D Canvas, Right Inspector, and Status Bar
+ * Integrates Toolbar, Tool Strip, 2D Canvas, Floating Inspector, and Status Bar
  * with Undo/Redo, Autosave, Keyboard Shortcuts, Validation, and Exporting.
  */
 
@@ -8,7 +8,7 @@ import React, { useState, useEffect, useRef, useMemo, useDeferredValue } from 'r
 import { View, StyleSheet, Modal, Text, TouchableOpacity, Platform } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import EditorToolbar from './EditorToolbar';
-import EditorLeftSidebar from './EditorLeftSidebar';
+import EditorToolStrip from './EditorToolStrip';
 import EditorCanvas from './EditorCanvas';
 import EditorRightPanel from './EditorRightPanel';
 import EditorStatusBar from './EditorStatusBar';
@@ -16,7 +16,7 @@ import { HistoryManager } from './historyManager';
 import { validateLayout } from './layoutValidation';
 import { saveProject, exportProjectJSON, SAVE_STATUS } from './projectStorage';
 import { exportAsPNG, exportAsSVG, printLayoutPlan } from './exportUtils';
-import { cloneLayout, applySiteChange, getPlotDimensionMeta } from './layoutModel';
+import { cloneLayout, applySiteChange, getPlotDimensionMeta, resizePlotBoundary, describeOutsidePlot } from './layoutModel';
 import { UNIT_TYPES } from './units';
 import { COLLECTIONS, copySelection, copyToClipboard, deleteSelection, insertCopies, joinSelection, makeTranslate, rectangularArray } from './cadCommands';
 import { selectionFromItems, selectionItems } from './selectionModel';
@@ -45,6 +45,7 @@ export default function LayoutEditor({
     angle: 90, factor: 2, offset: 1, radius: 0, chamferA: 1, chamferB: 1, sides: 6,
     count: 4, polarAngle: 360, rows: 2, cols: 2, dx: 12, dy: 12, gap: 0, text: 'Text',
   });
+  const [propertiesOpen, setPropertiesOpen] = useState(false);
   const [notice, setNotice] = useState(null);
   const noticeTimer = useRef(null);
   const clipboardRef = useRef(null);
@@ -309,23 +310,30 @@ export default function LayoutEditor({
     setLayout(result.nextLayout);
   };
 
-  // Every site change goes through the constraint engine. A change whose
-  // reflow has conflicts is held back: the last valid layout stays on screen
-  // until the user picks a resolution.
-  // `base` lets the canvas pass the layout it just restored after a rejected
-  // drag (this closure's `layout` would still be the last preview).
-  const requestSiteChange = (change, base = layout) => {
-    const result = applySiteChange(base, change);
+  // Setback changes go through the constraint engine, which reflows the
+  // building. A change with conflicts is held back: the last valid layout stays
+  // on screen until the user picks a resolution.
+  const requestSiteChange = (change) => {
+    const result = applySiteChange(layout, change);
     if (result.success) {
       commitSiteResult(result);
       return true;
     }
-    setPendingResize({ change, result, base });
+    setPendingResize({ change, result, base: layout });
     return false;
   };
 
-  // Legacy signature used by the dimension label editor and inspectors.
-  const requestPlotResize = (axis, feet, options = {}) => requestSiteChange({ ...options, [axis]: feet });
+  // Plot size edits move the site boundary only; the building never changes.
+  const requestPlotResize = (axis, feet, options = {}) => {
+    const result = resizePlotBoundary(layout, { [axis]: feet, edge: options.edge });
+    if (!result.success) {
+      showNotice(result.reason);
+      return false;
+    }
+    if (result.nextLayout !== layout) commitSiteResult(result);
+    if (result.outside.length) showNotice(describeOutsidePlot(result.outside));
+    return true;
+  };
 
   const handleRelaxFixedResize = () => {
     if (!pendingResize) return;
@@ -382,27 +390,29 @@ export default function LayoutEditor({
         onClose={handleCloseAndApply}
       />
 
-      {/* 2. Middle Workspace: Left Sidebar + Center Canvas + Right Inspector */}
-      <View style={styles.middleWorkspace}>
-        {/* Left Sidebar */}
-        <EditorLeftSidebar
-          activeTool={activeTool}
-          onSelectTool={setActiveTool}
-          layout={layout}
-          onUpdateLayout={setLayout}
-          onSelectElement={setSelectedElement}
-          historyManager={history}
-          toolParams={toolParams}
-          onChangeToolParams={setToolParams}
-          unit={unit}
-          onDuplicate={handleDuplicateSelection}
-          onJoin={handleJoinSelection}
-          onRectangularArray={handleRectangularArray}
-          onDeleteSelection={() => commitDelete(requireSelection())}
-          onNotice={showNotice}
-        />
+      {/* 2. Horizontal Edit Tools */}
+      <EditorToolStrip
+        activeTool={activeTool}
+        onSelectTool={setActiveTool}
+        layout={layout}
+        onUpdateLayout={setLayout}
+        onSelectElement={setSelectedElement}
+        historyManager={history}
+        toolParams={toolParams}
+        onChangeToolParams={setToolParams}
+        unit={unit}
+        onDuplicate={handleDuplicateSelection}
+        onJoin={handleJoinSelection}
+        onRectangularArray={handleRectangularArray}
+        onDeleteSelection={() => commitDelete(requireSelection())}
+        onNotice={showNotice}
+        propertiesOpen={propertiesOpen}
+        onToggleProperties={() => setPropertiesOpen(!propertiesOpen)}
+      />
 
-        {/* Center Interactive CAD Canvas */}
+      {/* 3. Workspace: the canvas fills it; the inspector floats above when opened */}
+      <View style={styles.middleWorkspace}>
+        {/* Interactive CAD Canvas */}
         <EditorCanvas
           layout={layout}
           onUpdateLayout={setLayout}
@@ -420,28 +430,29 @@ export default function LayoutEditor({
           allowDiagonal={allowDiagonal}
           snapTolerance={snapTolerance}
           onRequestPlotResize={requestPlotResize}
-          onRequestSiteChange={requestSiteChange}
           toolParams={toolParams}
           notice={notice}
           onNotice={showNotice}
         />
 
-        {/* Right Properties Panel (Inspector) */}
-        <EditorRightPanel
-          layout={layout}
-          onUpdateLayout={setLayout}
-          selectedElement={selectedElement}
-          onSelectElement={setSelectedElement}
-          unit={unit}
-          validationIssues={validationIssues}
-          historyManager={history}
-          onRequestPlotResize={requestPlotResize}
-          onRequestSiteChange={requestSiteChange}
-          onNotice={showNotice}
-        />
+        {/* Properties Panel (Inspector): stays mounted so its settings survive closing it */}
+        <View style={[styles.propertiesOverlay, !propertiesOpen && styles.hidden]}>
+          <EditorRightPanel
+            layout={layout}
+            onUpdateLayout={setLayout}
+            selectedElement={selectedElement}
+            onSelectElement={setSelectedElement}
+            unit={unit}
+            validationIssues={validationIssues}
+            historyManager={history}
+            onRequestPlotResize={requestPlotResize}
+            onRequestSiteChange={requestSiteChange}
+            onNotice={showNotice}
+          />
+        </View>
       </View>
 
-      {/* 3. Bottom Status Bar */}
+      {/* 4. Bottom Status Bar */}
       <EditorStatusBar
         cursorWorldPos={cursorWorldPos}
         unit={unit}
@@ -700,6 +711,17 @@ const styles = StyleSheet.create({
     width: '100%',
     height: '100%',
     overflow: 'hidden',
+  },
+  propertiesOverlay: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    flexDirection: 'row',
+    zIndex: 40,
+  },
+  hidden: {
+    display: 'none',
   },
   modalBackdrop: {
     flex: 1,

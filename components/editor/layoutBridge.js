@@ -18,7 +18,36 @@ import {
   generateUniqueId,
   WALL_THICKNESS,
   ROOM_PALETTE,
+  getPlotRect,
 } from './layoutModel.js';
+
+/** Identifies a set of inputs, so saved edits are only restored for the same inputs. */
+export function getSourceKey(state) {
+  const { lastEditedLayout, ...sourceInputs } = state;
+  return JSON.stringify(sourceInputs);
+}
+
+/**
+ * Open space on each side of the building. The 2D plan and reports compute the
+ * building as plot size minus open space, so these must be the real distances:
+ * reporting the setbacks after a plot resize would make the building appear to
+ * grow or shrink with the plot.
+ */
+function openSpaceAroundBuilding(layout) {
+  const setbacks = layout.plot?.setbacks || {};
+  const exterior = (layout.walls || []).filter((w) => w.type === 'exterior');
+  if (exterior.length === 0) return setbacks;
+  const xs = exterior.flatMap((w) => [w.x1, w.x2]);
+  const ys = exterior.flatMap((w) => [w.y1, w.y2]);
+  const site = getPlotRect(layout);
+  const gap = (v) => Number(Math.max(0, v).toFixed(4));
+  return {
+    west: gap(Math.min(...xs) - site.x0),
+    east: gap(site.x1 - Math.max(...xs)),
+    north: gap(Math.min(...ys) - site.y0),
+    south: gap(site.y1 - Math.max(...ys)),
+  };
+}
 
 /**
  * Generates structured LayoutData from AutoPlot state using the Vastu zoning algorithm.
@@ -67,8 +96,7 @@ export function generateStructuredLayoutFromState(state) {
   });
 
   // Identifies the inputs this layout came from, so saved edits are only restored for the same inputs.
-  const { lastEditedLayout, ...sourceInputs } = state;
-  layout.sourceKey = JSON.stringify(sourceInputs);
+  layout.sourceKey = getSourceKey(state);
 
   const mainDoorDir = state.mainDoorDirection || 'North';
   let entRow = 1;
@@ -632,14 +660,16 @@ export function syncLayoutToState(layout, currentState) {
     return stillInLayout;
   });
 
+  const open = layout.plot?.setbacks ? openSpaceAroundBuilding(layout) : null;
+
   const nextState = {
     ...currentState,
     siteWidth: layout.plot ? String(layout.plot.width) : currentState.siteWidth,
     siteLength: layout.plot ? String(layout.plot.length) : currentState.siteLength,
-    eastOpen: layout.plot?.setbacks ? String(layout.plot.setbacks.east) : currentState.eastOpen,
-    westOpen: layout.plot?.setbacks ? String(layout.plot.setbacks.west) : currentState.westOpen,
-    northOpen: layout.plot?.setbacks ? String(layout.plot.setbacks.north) : currentState.northOpen,
-    southOpen: layout.plot?.setbacks ? String(layout.plot.setbacks.south) : currentState.southOpen,
+    eastOpen: open ? String(open.east) : currentState.eastOpen,
+    westOpen: open ? String(open.west) : currentState.westOpen,
+    northOpen: open ? String(open.north) : currentState.northOpen,
+    southOpen: open ? String(open.south) : currentState.southOpen,
     customRooms: filteredCustomRooms.length > 0 ? filteredCustomRooms : updatedCustomRooms,
     lastEditedLayout: layout,
   };

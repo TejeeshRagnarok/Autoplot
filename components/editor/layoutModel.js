@@ -3,6 +3,11 @@
  * Complete 2D structured object representation of a building layout.
  */
 
+import { entityBounds } from './cadGeometry.js';
+import { getPlotRect } from './siteGeometry.js';
+
+export { getPlotRect };
+
 let idCounter = 1000;
 export function generateUniqueId(prefix = 'elem') {
   idCounter += 1;
@@ -613,9 +618,79 @@ export function setPlotDimensionOffset(layout, axis, offset) {
   return syncPlotDimensions(layout);
 }
 
+const MIN_PLOT_SIZE = 5; // ft
+
+const WEST_EDGES = ['left', 'corner-nw', 'corner-sw'];
+const NORTH_EDGES = ['top', 'corner-nw', 'corner-ne'];
+const SYMMETRIC_EDGES = ['symmetric', 'both'];
+
 /**
- * Resize the real plot geometry and reflow every dependent element through the
- * constraint engine. Returns the full engine result:
+ * Plot-only resize: moves the outer site boundary and nothing else. Every
+ * building list is carried over by reference, so the building cannot change.
+ * The opposite edge stays put unless `edge` asks for a symmetric resize.
+ *
+ * @param {object} layout never mutated
+ * @param {{width?:number, length?:number, edge?:string}} change
+ *   edge: 'right'|'left'|'top'|'bottom'|'corner-ne'|'corner-nw'|'corner-se'|'corner-sw'|'symmetric'
+ *   (default: the east and south edges move)
+ * @returns {{success:boolean, nextLayout:object, outside:Array, reason?:string}}
+ */
+export function resizePlotBoundary(layout, change = {}) {
+  if (!layout || !layout.plot) {
+    return { success: false, nextLayout: layout, outside: [], reason: 'There is no plot to resize.' };
+  }
+  const rect = getPlotRect(layout);
+  const width = change.width !== undefined ? Number(change.width) : rect.width;
+  const length = change.length !== undefined ? Number(change.length) : rect.length;
+  if (!Number.isFinite(width) || !Number.isFinite(length)) {
+    return { success: false, nextLayout: layout, outside: [], reason: 'That is not a valid measurement, so the plot was not changed.' };
+  }
+  if (width < MIN_PLOT_SIZE || length < MIN_PLOT_SIZE) {
+    return { success: false, nextLayout: layout, outside: [], reason: `The plot must be at least ${MIN_PLOT_SIZE}' on each side, so it was not changed.` };
+  }
+
+  const round = (v) => Number(v.toFixed(4));
+  const nextW = round(width);
+  const nextL = round(length);
+  if (nextW === rect.width && nextL === rect.length) {
+    return { success: true, nextLayout: layout, outside: findElementsOutsidePlot(layout) };
+  }
+
+  // How far the low edge moves for a growth of `grown`.
+  const lowEdgeMove = (grown, isLowEdge) => {
+    if (SYMMETRIC_EDGES.includes(change.edge)) return grown / 2;
+    return isLowEdge ? grown : 0;
+  };
+  const originX = round(rect.x0 - lowEdgeMove(nextW - rect.width, WEST_EDGES.includes(change.edge)));
+  const originY = round(rect.y0 - lowEdgeMove(nextL - rect.length, NORTH_EDGES.includes(change.edge)));
+
+  const { originX: _x, originY: _y, ...plot } = layout.plot;
+  if (originX !== 0) plot.originX = originX;
+  if (originY !== 0) plot.originY = originY;
+  plot.width = nextW;
+  plot.length = nextL;
+
+  const next = { ...layout, plot, dimensions: [...(layout.dimensions || [])], updatedAt: new Date().toISOString() };
+  syncPlotDimensionAnnotations(next);
+  return { success: true, nextLayout: next, outside: findElementsOutsidePlot(next) };
+}
+
+/**
+ * Warning text naming the objects a plot resize left outside the boundary.
+ * @param {Array<{name:string}>} outside result of findElementsOutsidePlot
+ */
+export function describeOutsidePlot(outside) {
+  const names = [...new Set(outside.map((o) => o.name))];
+  const shown = names.slice(0, 4).join(', ');
+  const more = names.length > 4 ? ` and ${names.length - 4} more` : '';
+  const count = outside.length === 1 ? '1 object extends' : `${outside.length} objects extend`;
+  return `${count} beyond the plot: ${shown}${more}. The building was not changed.`;
+}
+
+/**
+ * Change the site through the constraint engine, which reflows the building.
+ * The editor only uses this for setbacks; plot size edits use
+ * resizePlotBoundary. Returns the full engine result:
  * { nextLayout, conflicts, warnings, success, shift }.
  * @param {object} layout
  * @param {{width?:number, length?:number, setbacks?:object, edge?:string, isSymmetric?:boolean, relaxFixed?:boolean}} change
@@ -639,29 +714,27 @@ export function applySiteChange(layout, change = {}) {
  */
 export function resizePlot(layout, axis, feet, options = {}) {
   if (!layout || !layout.plot) return layout;
-  return applySiteChange(layout, {
-    ...options,
-    [axis]: Number(feet),
-    edge: options.edge || (axis === 'width' ? 'right' : 'bottom'),
-  }).nextLayout;
+  return resizePlotBoundary(layout, { [axis]: Number(feet), edge: options.edge }).nextLayout;
 }
 
 /**
  * Identify elements that fall outside the (possibly resized) plot boundary.
- * Used to warn before an unsafe shrink is applied - never deletes anything.
+ * Diagnostic only: it never moves, resizes, or deletes anything.
  * @returns {Array<{type:string,id:string,name:string}>}
  */
 export function findElementsOutsidePlot(layout, margin = 0.2) {
-  const W = Number(layout?.plot?.width) || 0;
-  const L = Number(layout?.plot?.length) || 0;
+  const { x0, y0, x1, y1 } = getPlotRect(layout, { width: 0, length: 0 });
   const out = [];
+
+  const boxOutside = (minX, minY, maxX, maxY) => (
+    minX < x0 - margin || minY < y0 - margin || maxX > x1 + margin || maxY > y1 + margin
+  );
+  const pointOutside = (x, y) => boxOutside(x, y, x, y);
 
   const checkRect = (e, type, name) => {
     const x = Number(e.x) || 0;
     const y = Number(e.y) || 0;
-    const w = Number(e.width) || 0;
-    const h = Number(e.length) || 0;
-    if (x < -margin || y < -margin || x + w > W + margin || y + h > L + margin) {
+    if (boxOutside(x, y, x + (Number(e.width) || 0), y + (Number(e.length) || 0))) {
       out.push({ type, id: e.id, name });
     }
   };
@@ -672,25 +745,30 @@ export function findElementsOutsidePlot(layout, margin = 0.2) {
   (layout?.utilities || []).forEach((u) => checkRect(u, 'utility', u.name || 'Utility'));
 
   (layout?.walls || []).forEach((w) => {
-    const pts = [[w.x1, w.y1], [w.x2, w.y2]];
-    for (const [x, y] of pts) {
-      if (x < -margin || y < -margin || x > W + margin || y > L + margin) {
-        out.push({ type: 'wall', id: w.id, name: 'Wall' });
-        break;
-      }
+    if (pointOutside(w.x1, w.y1) || pointOutside(w.x2, w.y2)) {
+      out.push({ type: 'wall', id: w.id, name: 'Wall' });
     }
   });
 
   (layout?.doors || []).forEach((d) => {
-    if (d.x < -margin || d.y < -margin || d.x > W + margin || d.y > L + margin) {
-      out.push({ type: 'door', id: d.id, name: 'Door' });
-    }
+    if (pointOutside(d.x, d.y)) out.push({ type: 'door', id: d.id, name: 'Door' });
   });
 
   (layout?.windows || []).forEach((win) => {
-    if (win.x < -margin || win.y < -margin || win.x > W + margin || win.y > L + margin) {
-      out.push({ type: 'window', id: win.id, name: 'Window' });
-    }
+    if (pointOutside(win.x, win.y)) out.push({ type: 'window', id: win.id, name: 'Window' });
+  });
+
+  (layout?.columns || []).forEach((c) => {
+    if (pointOutside(c.x, c.y)) out.push({ type: 'column', id: c.id, name: 'Column' });
+  });
+
+  (layout?.annotations || []).forEach((a) => {
+    if (pointOutside(a.x, a.y)) out.push({ type: 'annotation', id: a.id, name: a.text || 'Text' });
+  });
+
+  (layout?.cadEntities || []).forEach((e) => {
+    const b = entityBounds(e);
+    if (boxOutside(b.minX, b.minY, b.maxX, b.maxY)) out.push({ type: 'entity', id: e.id, name: 'Drawing object' });
   });
 
   return out;

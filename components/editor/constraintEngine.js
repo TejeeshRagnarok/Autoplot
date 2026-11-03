@@ -37,6 +37,7 @@ import {
   normalizeStaircase,
   stairDimensionForAxis,
 } from './staircaseGeometry.js';
+import { getPlotRect } from './siteGeometry.js';
 
 export const CONSTRAINT_TYPES = {
   FIXED: 'fixed',
@@ -463,13 +464,12 @@ export function validateOpenings(layout) {
  */
 export function validateSiteFit(layout) {
   const conflicts = [];
-  const W = Number(layout.plot?.width) || 0;
-  const L = Number(layout.plot?.length) || 0;
+  const site = getPlotRect(layout, { width: 0, length: 0 });
   const sb = readSetbacks(layout.plot?.setbacks);
-  const bx0 = sb.west;
-  const bx1 = W - sb.east;
-  const by0 = sb.north;
-  const by1 = L - sb.south;
+  const bx0 = site.x0 + sb.west;
+  const bx1 = site.x1 - sb.east;
+  const by0 = site.y0 + sb.north;
+  const by1 = site.y1 - sb.south;
   const e = 0.02;
 
   const rects = [];
@@ -482,7 +482,7 @@ export function validateSiteFit(layout) {
   for (const p of layout.parking || []) rects.push({ kind: 'Parking', id: p.id, name: p.label || 'Parking', x: p.x, y: p.y, w: p.width, l: p.length, buildable: false });
 
   for (const r of rects) {
-    if (r.x < -e || r.y < -e || r.x + r.w > W + e || r.y + r.l > L + e) {
+    if (r.x < site.x0 - e || r.y < site.y0 - e || r.x + r.w > site.x1 + e || r.y + r.l > site.y1 + e) {
       conflicts.push({ code: 'outside-plot', id: r.id, message: `${r.kind} "${r.name}" extends beyond the plot boundary.` });
     } else if (r.buildable && (r.x < bx0 - e || r.y < by0 - e || r.x + r.w > bx1 + e || r.y + r.l > by1 + e)) {
       conflicts.push({ code: 'outside-buildable', id: r.id, message: `${r.kind} "${r.name}" extends into the setback zone.` });
@@ -612,8 +612,7 @@ function applyAxis(next, axis, solved) {
  * Re-derive the outer plot dimension annotations from the plot size.
  */
 export function syncPlotDimensionAnnotations(layout) {
-  const W = Number(layout?.plot?.width) || 30;
-  const L = Number(layout?.plot?.length) || 40;
+  const { x0, y0, x1, y1, width: W, length: L } = getPlotRect(layout);
   if (!Array.isArray(layout.dimensions)) layout.dimensions = [];
   const upsert = (id, fields) => {
     const idx = layout.dimensions.findIndex((d) => d.id === id);
@@ -621,8 +620,8 @@ export function syncPlotDimensionAnnotations(layout) {
     const off = Number(prev.offset) ? Math.abs(Number(prev.offset)) : 2.5;
     const value = fields.axis === 'width' ? W : L;
     const geom = fields.axis === 'width'
-      ? { x1: 0, y1: -off, x2: W, y2: -off }
-      : { x1: -off, y1: 0, x2: -off, y2: L };
+      ? { x1: x0, y1: y0 - off, x2: x1, y2: y0 - off }
+      : { x1: x0 - off, y1: y0, x2: x0 - off, y2: y1 };
     const merged = { ...prev, ...fields, ...geom, offset: off, value, label: `${value}' (Plot ${fields.axis === 'width' ? 'Width' : 'Length'})` };
     if (idx >= 0) layout.dimensions[idx] = merged; else layout.dimensions.push(merged);
   };
@@ -632,7 +631,36 @@ export function syncPlotDimensionAnnotations(layout) {
 }
 
 /**
- * Intelligent site reflow.
+ * Copy of a layout with the plot and all geometry moved by (dx, dy). Sizes and
+ * relationships are untouched.
+ */
+function translateLayoutGeometry(layout, dx, dy) {
+  const next = clone(layout);
+  const mx = (v) => round4(v + dx);
+  const my = (v) => round4(v + dy);
+  const movePoint = (o) => { o.x = mx(o.x); o.y = my(o.y); };
+  const moveSegment = (o) => { o.x1 = mx(o.x1); o.y1 = my(o.y1); o.x2 = mx(o.x2); o.y2 = my(o.y2); };
+
+  const { x0, y0 } = getPlotRect(layout);
+  next.plot.originX = mx(x0);
+  next.plot.originY = my(y0);
+  for (const key of ['rooms', 'doors', 'windows', 'columns', 'annotations', 'staircases', 'utilities', 'parking']) {
+    (next[key] || []).forEach(movePoint);
+  }
+  (next.walls || []).forEach(moveSegment);
+  (next.dimensions || []).forEach(moveSegment);
+  for (const e of next.cadEntities || []) {
+    if (e.kind === 'line') moveSegment(e);
+    else if (e.points) e.points.forEach(movePoint);
+    else { e.cx = mx(e.cx); e.cy = my(e.cy); }
+  }
+  if (next.footprint) movePoint(next.footprint);
+  return next;
+}
+
+/**
+ * Intelligent site reflow. Plot size edits in the editor do NOT come through
+ * here (see resizePlotBoundary): the editor only uses this for setback changes.
  *
  * @param {object} layout current (valid) layout - never mutated
  * @param {object} options
@@ -647,6 +675,13 @@ export function syncPlotDimensionAnnotations(layout) {
 export function reflowLayoutOnPlotResize(layout, options = {}) {
   if (!layout || !layout.plot) {
     return { nextLayout: layout, conflicts: [{ code: 'invalid', message: 'Invalid layout object' }], warnings: [], success: false, shift: { x: 0, y: 0 } };
+  }
+  // The solver works in plot-relative coordinates, so a moved plot origin is
+  // taken out for the solve and put back afterwards.
+  const origin = getPlotRect(layout);
+  if (origin.x0 !== 0 || origin.y0 !== 0) {
+    const result = reflowLayoutOnPlotResize(translateLayoutGeometry(layout, -origin.x0, -origin.y0), options);
+    return { ...result, nextLayout: translateLayoutGeometry(result.nextLayout, origin.x0, origin.y0) };
   }
   const next = clone(layout);
   const P0w = Number(layout.plot.width) || 30;

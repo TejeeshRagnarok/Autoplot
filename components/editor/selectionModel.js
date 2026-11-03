@@ -13,6 +13,7 @@ import { getStaircaseBounds } from './staircaseGeometry.js';
 import { getOpeningGeometry } from './wallOps.js';
 import { COLLECTIONS, isPlotDimension } from './cadCommands.js';
 import { distanceToOutline, entityBounds, projectToSegment } from './cadGeometry.js';
+import { getPlotRect } from './siteGeometry.js';
 
 export const STROKE_PICK_PX = 5;
 
@@ -108,9 +109,8 @@ export function hitTestAll(layout, wx, wy, scale, { includePlot = true } = {}) {
     if (insideRect(wx, wy, r)) add('room', r, 0, r.width * r.length);
   }
   if (includePlot && layout.plot) {
-    const W = Number(layout.plot.width) || 30;
-    const L = Number(layout.plot.length) || 40;
-    if (wx >= 0 && wx <= W && wy >= 0 && wy <= L) add('plot', layout.plot);
+    const site = getPlotRect(layout);
+    if (wx >= site.x0 && wx <= site.x1 && wy >= site.y0 && wy <= site.y1) add('plot', layout.plot);
   }
 
   // Priority first; then the closest outline; then the smaller of two overlapping areas.

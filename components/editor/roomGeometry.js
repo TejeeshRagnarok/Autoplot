@@ -17,6 +17,7 @@ import {
   cloneLayout,
   generateUniqueId,
 } from './layoutModel.js';
+import { getPlotRect } from './siteGeometry.js';
 
 export const MIN_ROOM_DIMENSION = 2.5; // Feet
 
@@ -24,21 +25,20 @@ export const MIN_ROOM_DIMENSION = 2.5; // Feet
  * Extract plot, setbacks, and buildable footprint bounds
  */
 export function getPlotAndBuildableBounds(layout) {
-  const plotW = Number(layout?.plot?.width) || 30;
-  const plotL = Number(layout?.plot?.length) || 40;
+  const site = getPlotRect(layout);
   const sb = layout?.plot?.setbacks || { east: 2, west: 2, north: 4, south: 4 };
   const northO = Number(sb.north) || 0;
   const southO = Number(sb.south) || 0;
   const eastO = Number(sb.east) || 0;
   const westO = Number(sb.west) || 0;
 
-  const minX = westO;
-  const maxX = Math.max(minX + 2, plotW - eastO);
-  const minY = northO;
-  const maxY = Math.max(minY + 2, plotL - southO);
+  const minX = site.x0 + westO;
+  const maxX = Math.max(minX + 2, site.x1 - eastO);
+  const minY = site.y0 + northO;
+  const maxY = Math.max(minY + 2, site.y1 - southO);
 
   return {
-    plot: { width: plotW, length: plotL },
+    plot: { width: site.width, length: site.length, minX: site.x0, maxX: site.x1, minY: site.y0, maxY: site.y1 },
     setbacks: { north: northO, south: southO, east: eastO, west: westO },
     buildable: {
       minX,
@@ -69,10 +69,10 @@ export function checkRoomPlotFit(room, layout) {
   const eps = 0.05;
 
   const isOutsidePlot =
-    rLeft < -eps ||
-    rTop < -eps ||
-    rRight > plot.width + eps ||
-    rBottom > plot.length + eps;
+    rLeft < plot.minX - eps ||
+    rTop < plot.minY - eps ||
+    rRight > plot.maxX + eps ||
+    rBottom > plot.maxY + eps;
 
   const isOutsideBuildable =
     rLeft < buildable.minX - eps ||
@@ -117,16 +117,16 @@ export function collectAlignmentTargets(layout, excludeRoomId = null) {
 
   // Vertical alignment targets (x-coordinates)
   const verticalTargets = [
-    { pos: 0, label: 'Plot West Boundary', type: 'plot', priority: 1 },
-    { pos: plot.width, label: 'Plot East Boundary', type: 'plot', priority: 1 },
+    { pos: plot.minX, label: 'Plot West Boundary', type: 'plot', priority: 1 },
+    { pos: plot.maxX, label: 'Plot East Boundary', type: 'plot', priority: 1 },
     { pos: buildable.minX, label: 'West Setback Line', type: 'setback', priority: 2 },
     { pos: buildable.maxX, label: 'East Setback Line', type: 'setback', priority: 2 },
   ];
 
   // Horizontal alignment targets (y-coordinates)
   const horizontalTargets = [
-    { pos: 0, label: 'Plot North Boundary', type: 'plot', priority: 1 },
-    { pos: plot.length, label: 'Plot South Boundary', type: 'plot', priority: 1 },
+    { pos: plot.minY, label: 'Plot North Boundary', type: 'plot', priority: 1 },
+    { pos: plot.maxY, label: 'Plot South Boundary', type: 'plot', priority: 1 },
     { pos: buildable.minY, label: 'North Setback Line', type: 'setback', priority: 2 },
     { pos: buildable.maxY, label: 'South Setback Line', type: 'setback', priority: 2 },
   ];

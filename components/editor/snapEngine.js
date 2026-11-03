@@ -10,6 +10,7 @@
 
 import { dist, elementPath, pathSegments, projectToSegment, lineLineIntersection, pointAtAngle, angleOnArc } from './cadGeometry.js';
 import { snapValue } from './layoutModel.js';
+import { getPlotRect } from './siteGeometry.js';
 
 export const SNAP_KINDS = {
   ENDPOINT: 'endpoint',
@@ -149,9 +150,8 @@ export function findPointSnap(point, layout, options = {}) {
   for (const c of layout.columns || []) offer(c.x, c.y, SNAP_KINDS.CENTER);
 
   if (layout.plot) {
-    const W = Number(layout.plot.width) || 0;
-    const L = Number(layout.plot.length) || 0;
-    for (const [a, b] of rectEdges(0, 0, W, L)) {
+    const site = getPlotRect(layout, { width: 0, length: 0 });
+    for (const [a, b] of rectEdges(site.x0, site.y0, site.width, site.length)) {
       offer(a.x, a.y, SNAP_KINDS.ENDPOINT);
       offer((a.x + b.x) / 2, (a.y + b.y) / 2, SNAP_KINDS.MIDPOINT);
       const q = projectToSegment(point, a, b);

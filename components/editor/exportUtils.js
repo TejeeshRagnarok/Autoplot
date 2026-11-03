@@ -12,6 +12,7 @@ import { getOpeningGeometry } from './wallOps.js';
 import { arcSweep, pointAtAngle } from './cadGeometry.js';
 import { dimensionLine } from './selectionModel.js';
 import { isPlotDimension } from './cadCommands.js';
+import { getPlotRect } from './siteGeometry.js';
 
 const xmlText = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
@@ -24,32 +25,37 @@ const xmlText = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt
 export function generateLayoutSVG(layout, unit = 'ft-in') {
   if (!layout) return '';
 
-  const plotW = layout.plot?.width || 30;
-  const plotL = layout.plot?.length || 40;
+  const site = getPlotRect(layout);
+  const plotW = site.width;
+  const plotL = site.length;
   const scale = 20; // 20 px per foot
   const padding = 100;
 
   const svgW = plotW * scale + padding * 2;
   const svgH = plotL * scale + padding * 2 + 80; // Extra room for title block
 
-  const originX = padding;
-  const originY = padding;
+  // The plot's corner sits at (padding, padding); world (0, 0) is offset from it
+  // when the west or north edge has moved.
+  const plotLeft = padding;
+  const plotTop = padding;
+  const originX = plotLeft - site.x0 * scale;
+  const originY = plotTop - site.y0 * scale;
 
   let elementsSvg = '';
 
   // 1. Grid
   elementsSvg += `<g opacity="0.15">`;
   for (let x = 0; x <= plotW; x += 2) {
-    elementsSvg += `<line x1="${originX + x * scale}" y1="${originY}" x2="${originX + x * scale}" y2="${originY + plotL * scale}" stroke="#64748B" stroke-width="0.5"/>`;
+    elementsSvg += `<line x1="${plotLeft + x * scale}" y1="${plotTop}" x2="${plotLeft + x * scale}" y2="${plotTop + plotL * scale}" stroke="#64748B" stroke-width="0.5"/>`;
   }
   for (let y = 0; y <= plotL; y += 2) {
-    elementsSvg += `<line x1="${originX}" y1="${originY + y * scale}" x2="${originX + plotW * scale}" y2="${originY + y * scale}" stroke="#64748B" stroke-width="0.5"/>`;
+    elementsSvg += `<line x1="${plotLeft}" y1="${plotTop + y * scale}" x2="${plotLeft + plotW * scale}" y2="${plotTop + y * scale}" stroke="#64748B" stroke-width="0.5"/>`;
   }
   elementsSvg += `</g>`;
 
   // 2. Plot boundary
   elementsSvg += `
-    <rect x="${originX}" y="${originY}" width="${plotW * scale}" height="${plotL * scale}" 
+    <rect x="${plotLeft}" y="${plotTop}" width="${plotW * scale}" height="${plotL * scale}"
       fill="#FFFFFF" stroke="#D97706" stroke-width="3" stroke-dasharray="6,4"/>
   `;
 
@@ -60,7 +66,7 @@ export function generateLayoutSVG(layout, unit = 'ft-in') {
   const bw = plotW - bx0 - (Number(sb.east) || 0);
   const bl = plotL - by0 - (Number(sb.south) || 0);
   if (bw > 0 && bl > 0) {
-    elementsSvg += `<rect x="${originX + bx0 * scale}" y="${originY + by0 * scale}" width="${bw * scale}" height="${bl * scale}" fill="none" stroke="#94A3B8" stroke-width="1" stroke-dasharray="3,3"/>`;
+    elementsSvg += `<rect x="${plotLeft + bx0 * scale}" y="${plotTop + by0 * scale}" width="${bw * scale}" height="${bl * scale}" fill="none" stroke="#94A3B8" stroke-width="1" stroke-dasharray="3,3"/>`;
   }
 
   // 3. Rooms
@@ -220,7 +226,7 @@ export function generateLayoutSVG(layout, unit = 'ft-in') {
   });
 
   // 7. Title Block & North Compass
-  const titleBlockY = originY + plotL * scale + 24;
+  const titleBlockY = plotTop + plotL * scale + 24;
   const compassX = svgW - padding - 30;
   const compassY = padding - 40;
 
@@ -246,7 +252,7 @@ export function generateLayoutSVG(layout, unit = 'ft-in') {
       </g>
 
       <!-- Architectural Title Block -->
-      <g transform="translate(${originX}, ${titleBlockY})">
+      <g transform="translate(${plotLeft}, ${titleBlockY})">
         <rect x="0" y="0" width="${plotW * scale}" height="64" fill="#FFFFFF" stroke="#0F172A" stroke-width="1.5" rx="4"/>
         <line x1="${plotW * scale * 0.5}" y1="0" x2="${plotW * scale * 0.5}" y2="64" stroke="#CBD5E1" stroke-width="1"/>
         <line x1="${plotW * scale * 0.75}" y1="0" x2="${plotW * scale * 0.75}" y2="64" stroke="#CBD5E1" stroke-width="1"/>

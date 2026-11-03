@@ -14,6 +14,7 @@ import {
 } from 'react-native';
 import { lightTheme as staticTheme } from '../constants/theme';
 import { NAKSHATRAS, calculateOptimalRoomDimensions } from '../constants/vastuData';
+import { getSourceKey } from './editor/layoutBridge';
 import { Ionicons } from '@expo/vector-icons';
 import VastuFooter from './VastuFooter';
 import LandingPage from './LandingPage';
@@ -55,6 +56,9 @@ export default function InputModule({ language, state, updateState, theme: propT
 
   // Automatically calculate optimal, Vastu-compliant room dimensions when footprint or room count changes
   useEffect(() => {
+    // These inputs were just written from the edited layout: re-optimizing them
+    // would discard the editor's room sizes and regenerate the building.
+    if (state.lastEditedLayout?.syncedSourceKey === getSourceKey(state)) return;
     if (state.customRooms && state.customRooms.length > 0) {
       const optimizedRooms = calculateOptimalRoomDimensions(
         state.customRooms,

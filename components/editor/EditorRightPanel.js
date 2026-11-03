@@ -1002,7 +1002,7 @@ export default function EditorRightPanel({
           [{ value: 'bottom', label: 'South edge' }, { value: 'top', label: 'North edge' }, { value: 'symmetric', label: 'Both' }],
           resizeAnchorY, setResizeAnchorY, 'ray'
         )}
-        <Text style={styles.hintText}>On the canvas, drag the orange edge handles; hold Shift to resize symmetrically.</Text>
+        <Text style={styles.hintText}>Only the plot boundary changes; the building stays exactly where it is. On the canvas, drag the orange edge handles; hold Shift to resize symmetrically.</Text>
 
         {/* Setbacks (editable - the building reflows to the new buildable area) */}
         <Text style={styles.subHeading}>Setbacks</Text>

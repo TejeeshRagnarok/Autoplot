@@ -27,6 +27,7 @@
 
 import { inferObjectConstraints, inferRoomConstraintType, validateOpenings, findHostWall } from './constraintEngine.js';
 import { getStaircaseBounds } from './staircaseGeometry.js';
+import { getPlotRect } from './siteGeometry.js';
 
 export const MIN_ROOM_SIZE = 2.5; // ft - absolute minimum for a room the user resizes directly
 const TOL = 0.02;
@@ -84,9 +85,13 @@ const isAcrossAxis = (w, axis) => (axis === 'x' ? Math.abs(w.x1 - w.x2) < TOL : 
  */
 function buildEnvelope(layout, ignoreWallIds) {
   const segs = [];
-  const W = Number(layout.plot?.width) || 0;
-  const L = Number(layout.plot?.length) || 0;
-  segs.push({ x1: 0, y1: 0, x2: W, y2: 0 }, { x1: W, y1: 0, x2: W, y2: L }, { x1: 0, y1: L, x2: W, y2: L }, { x1: 0, y1: 0, x2: 0, y2: L });
+  const site = getPlotRect(layout, { width: 0, length: 0 });
+  segs.push(
+    { x1: site.x0, y1: site.y0, x2: site.x1, y2: site.y0 },
+    { x1: site.x1, y1: site.y0, x2: site.x1, y2: site.y1 },
+    { x1: site.x0, y1: site.y1, x2: site.x1, y2: site.y1 },
+    { x1: site.x0, y1: site.y0, x2: site.x0, y2: site.y1 },
+  );
   const ext = (layout.walls || []).filter((w) => w.type === 'exterior');
   for (const w of ext) if (!ignoreWallIds.has(w.id)) segs.push(w);
   for (const w of layout.walls || []) if (w.isLocked && w.type !== 'exterior') segs.push(w);
@@ -239,11 +244,10 @@ function attemptLineMove(layout, seed, d, relax, envelope, baseline) {
   }
 
   // Validate against the fixed site and the rest of the layout
-  const W = Number(next.plot?.width) || Infinity;
-  const L = Number(next.plot?.length) || Infinity;
+  const site = getPlotRect(next, { width: Infinity, length: Infinity });
   for (const r of next.rooms) {
     if (!actions.has(r.id)) continue;
-    if (r.x < -1e-6 || r.y < -1e-6 || r.x + r.width > W + 1e-6 || r.y + r.length > L + 1e-6) {
+    if (r.x < site.x0 - 1e-6 || r.y < site.y0 - 1e-6 || r.x + r.width > site.x1 + 1e-6 || r.y + r.length > site.y1 + 1e-6) {
       return fail(`"${r.name || 'Room'}" would leave the site boundary.`);
     }
   }
@@ -552,15 +556,14 @@ export function moveRoom(layout, roomId, dx, dy) {
   if (!room || room.isLocked) return { layout, room };
   const old = { ...room };
   // The site boundary is a hard limit for a move (a room already outside it may come back in).
-  const W = Number(next.plot?.width) || Infinity;
-  const L = Number(next.plot?.length) || Infinity;
-  const clampMove = (pos, size, limit, d) => {
-    const lo = Math.min(0, pos);
-    const hi = Math.max(limit - size, pos);
+  const site = getPlotRect(next, { width: Infinity, length: Infinity });
+  const clampMove = (pos, size, low, high, d) => {
+    const lo = Math.min(low, pos);
+    const hi = Math.max(high - size, pos);
     return Math.max(lo, Math.min(hi, pos + d)) - pos;
   };
-  dx = clampMove(old.x, old.width, W, dx);
-  dy = clampMove(old.y, old.length, L, dy);
+  dx = clampMove(old.x, old.width, site.x0, site.x1, dx);
+  dy = clampMove(old.y, old.length, site.y0, site.y1, dy);
   const onEdge = (r, w) => {
     const h = Math.abs(w.y1 - w.y2) < TOL;
     const v = Math.abs(w.x1 - w.x2) < TOL;

@@ -34,7 +34,9 @@ import {
   checkRoomPlotFit,
   findRoomSnapping,
   createRoomBoundaryWalls,
-  applySiteChange,
+  resizePlotBoundary,
+  describeOutsidePlot,
+  getPlotRect,
   calculateStaircaseGeometry,
   getStaircaseBounds,
   resizeStaircaseWorld,
@@ -126,7 +128,6 @@ export default function EditorCanvas({
   allowDiagonal = false,
   snapTolerance = 0.75,
   onRequestPlotResize,
-  onRequestSiteChange,
   toolParams = {},
   notice = null,
   onNotice,
@@ -332,21 +333,22 @@ export default function EditorCanvas({
   const fitToScreen = useCallback(() => {
     if (!containerRef.current || !layout) return;
     const rect = containerRef.current.getBoundingClientRect();
-    const plotW = layout.plot?.width || 30;
-    const plotL = layout.plot?.length || 40;
+    const site = getPlotRect(layout);
+    const plotW = site.width;
+    const plotL = site.length;
 
     const availableW = Math.max(200, rect.width - 160);
     const availableH = Math.max(200, rect.height - 160);
 
     const scaleX = availableW / plotW;
     const scaleY = availableH / plotL;
-    const newScale = Math.min(scaleX, scaleY, 28);
+    const newScale = Math.max(8, Math.min(scaleX, scaleY, 28));
 
-    const newPanX = (rect.width - plotW * newScale) / 2;
-    const newPanY = (rect.height - plotL * newScale) / 2;
+    const newPanX = (rect.width - plotW * newScale) / 2 - site.x0 * newScale;
+    const newPanY = (rect.height - plotL * newScale) / 2 - site.y0 * newScale;
 
     setViewport({
-      scale: Math.max(8, newScale),
+      scale: newScale,
       panX: newPanX,
       panY: newPanY,
     });
@@ -376,7 +378,7 @@ export default function EditorCanvas({
     if (!el) return undefined;
     const onWheel = (e) => {
       e.preventDefault();
-      // A site-edge drag pins the viewport to keep its fixed edge still.
+      // A site-edge drag is measured in the viewport it started with.
       if (siteDragActiveRef.current) return;
       const rect = el.getBoundingClientRect();
       const sx = e.clientX - rect.left;
@@ -395,17 +397,15 @@ export default function EditorCanvas({
 
   // ---- Outer plot dimension annotation helpers (width / height lines) ----
   const getDimLabelWorld = (axis) => {
-    const W = layout?.plot?.width || 30;
-    const L = layout?.plot?.length || 40;
+    const site = getPlotRect(layout);
     const meta = getPlotDimensionMeta(layout, axis);
-    if (axis === 'width') return { x: W / 2, y: -meta.offset };
-    return { x: -meta.offset, y: L / 2 };
+    if (axis === 'width') return { x: site.x0 + site.width / 2, y: site.y0 - meta.offset };
+    return { x: site.x0 - meta.offset, y: site.y0 + site.length / 2 };
   };
 
   const findDimensionAtWorldPoint = (wx, wy) => {
     if (!layout?.plot) return null;
-    const W = layout.plot.width || 30;
-    const L = layout.plot.length || 40;
+    const site = getPlotRect(layout);
     const w = getPlotDimensionMeta(layout, 'width');
     const l = getPlotDimensionMeta(layout, 'length');
 
@@ -419,10 +419,12 @@ export default function EditorCanvas({
     const lineTol = 8 / viewport.scale;
     if (isLabel('width')) return { axis: 'width', meta: w, onLabel: true };
     if (isLabel('length')) return { axis: 'length', meta: l, onLabel: true };
-    if (wy > -w.offset - lineTol && wy < -w.offset + lineTol && wx > -lineTol && wx < W + lineTol) {
+    const widthLineY = site.y0 - w.offset;
+    const lengthLineX = site.x0 - l.offset;
+    if (Math.abs(wy - widthLineY) < lineTol && wx > site.x0 - lineTol && wx < site.x1 + lineTol) {
       return { axis: 'width', meta: w, onLabel: false };
     }
-    if (wx > -l.offset - lineTol && wx < -l.offset + lineTol && wy > -lineTol && wy < L + lineTol) {
+    if (Math.abs(wx - lengthLineX) < lineTol && wy > site.y0 - lineTol && wy < site.y1 + lineTol) {
       return { axis: 'length', meta: l, onLabel: false };
     }
     return null;
@@ -593,18 +595,19 @@ export default function EditorCanvas({
   // the whole edge line is grabbable while the plot is selected.
   const PLOT_EDGE_HANDLE_PX = 9;
   const getPlotHandlePositions = () => {
-    const W = layout?.plot?.width || 30;
-    const L = layout?.plot?.length || 40;
+    const { x0, y0, x1, y1 } = getPlotRect(layout);
+    const midX = (x0 + x1) / 2;
+    const midY = (y0 + y1) / 2;
     const p = (x, y) => worldToScreen(x, y);
     return [
-      { edge: 'top', ...p(W / 2, 0) },
-      { edge: 'bottom', ...p(W / 2, L) },
-      { edge: 'left', ...p(0, L / 2) },
-      { edge: 'right', ...p(W, L / 2) },
-      { edge: 'corner-nw', ...p(0, 0) },
-      { edge: 'corner-ne', ...p(W, 0) },
-      { edge: 'corner-sw', ...p(0, L) },
-      { edge: 'corner-se', ...p(W, L) },
+      { edge: 'top', ...p(midX, y0) },
+      { edge: 'bottom', ...p(midX, y1) },
+      { edge: 'left', ...p(x0, midY) },
+      { edge: 'right', ...p(x1, midY) },
+      { edge: 'corner-nw', ...p(x0, y0) },
+      { edge: 'corner-ne', ...p(x1, y0) },
+      { edge: 'corner-sw', ...p(x0, y1) },
+      { edge: 'corner-se', ...p(x1, y1) },
     ];
   };
 
@@ -613,10 +616,9 @@ export default function EditorCanvas({
     const hit = getPlotHandlePositions().find((h) => Math.hypot(sx - h.x, sy - h.y) <= PLOT_EDGE_HANDLE_PX);
     if (hit) return hit.edge;
     if (selectedElement?.type !== 'plot') return null;
-    const W = layout.plot.width || 30;
-    const L = layout.plot.length || 40;
-    const a = worldToScreen(0, 0);
-    const b = worldToScreen(W, L);
+    const site = getPlotRect(layout);
+    const a = worldToScreen(site.x0, site.y0);
+    const b = worldToScreen(site.x1, site.y1);
     const tol = 5;
     const inX = sx > a.x - tol && sx < b.x + tol;
     const inY = sy > a.y - tol && sy < b.y + tol;
@@ -631,7 +633,6 @@ export default function EditorCanvas({
   // Shift (or Alt) resizes symmetrically about the centre.
   const computeSiteDragChange = (info, worldPos, symmetric) => {
     const plot = info.snapshot.plot;
-    const sb = plot.setbacks || {};
     const dx = worldPos.x - info.startWorld.x;
     const dy = worldPos.y - info.startWorld.y;
     const e = info.edge;
@@ -642,11 +643,9 @@ export default function EditorCanvas({
     if (e === 'left' || e === 'corner-nw' || e === 'corner-sw') width = plot.width - k * dx;
     if (e === 'bottom' || e === 'corner-sw' || e === 'corner-se') length = plot.length + k * dy;
     if (e === 'top' || e === 'corner-nw' || e === 'corner-ne') length = plot.length - k * dy;
-    // Snap to the grid step and keep at least 1 ft of buildable area
-    const minW = (Number(sb.west) || 0) + (Number(sb.east) || 0) + 1;
-    const minL = (Number(sb.north) || 0) + (Number(sb.south) || 0) + 1;
-    width = Math.max(minW, 5, snapEnabled ? snapValue(width, snapStep) : Number(width.toFixed(2)));
-    length = Math.max(minL, 5, snapEnabled ? snapValue(length, snapStep) : Number(length.toFixed(2)));
+    // Snap to the grid step; the plot keeps a minimum size of 5 ft
+    width = Math.max(5, snapEnabled ? snapValue(width, snapStep) : Number(width.toFixed(2)));
+    length = Math.max(5, snapEnabled ? snapValue(length, snapStep) : Number(length.toFixed(2)));
     return { width, length, edge: symmetric ? 'symmetric' : e };
   };
 
@@ -1187,24 +1186,14 @@ export default function EditorCanvas({
     // Site boundary drag: always recomputed from the drag-start snapshot so
     // the preview is deterministic and never accumulates drift.
     if (draggingHandle === 'plot-edge') {
-      // Measure the drag in the drag-start viewport: the live viewport is
-      // shifted below (to pin the fixed edge), which would otherwise feed back.
       const sv = dragStartInfo.startViewport;
       const dragWorld = { x: (sx - sv.panX) / sv.scale, y: (sy - sv.panY) / sv.scale };
       const change = computeSiteDragChange(dragStartInfo, dragWorld, shiftKey || altKey);
-      const res = applySiteChange(dragStartInfo.snapshot, change);
-      // Keep the fixed edge still on screen when the west / north edge moves.
-      setViewport((prev) => ({
-        ...prev,
-        panX: sv.panX - res.shift.x * prev.scale,
-        panY: sv.panY - res.shift.y * prev.scale,
-      }));
+      const res = resizePlotBoundary(dragStartInfo.snapshot, change);
       const preview = {
         width: res.nextLayout.plot.width,
         length: res.nextLayout.plot.length,
-        conflicts: res.conflicts.filter((c) => c.severity !== 'info'),
-        change,
-        success: res.success,
+        outside: res.outside,
       };
       sitePreviewRef.current = preview;
       setSitePreview(preview);
@@ -1545,21 +1534,12 @@ export default function EditorCanvas({
     if (draggingHandle === 'plot-edge' && dragStartInfo) {
       const preview = sitePreviewRef.current;
       sitePreviewRef.current = null;
-      const startViewport = dragStartInfo.startViewport;
       setSitePreview(null);
       setDraggingHandle(null);
       setDragStartInfo(null);
-      if (preview && !preview.success) {
-        // Reject the live preview: restore the last valid layout (no history
-        // step) and hand the change to the editor's conflict dialog.
-        const restored = historyManager.cancelDrag();
-        onUpdateLayout(restored);
-        setViewport((prev) => ({ ...prev, panX: startViewport.panX, panY: startViewport.panY }));
-        if (onRequestSiteChange) onRequestSiteChange(preview.change, restored);
-        return;
-      }
-      // One undoable transaction for the whole resize + reflow
+      // One undoable step for the whole boundary drag
       historyManager.endDrag(historyManager.getCurrent());
+      if (preview?.outside?.length) showNotice(describeOutsidePlot(preview.outside));
       return;
     }
 
@@ -1591,12 +1571,12 @@ export default function EditorCanvas({
   // Rulers Rendering (Top and Left)
   const renderRulers = () => {
     if (!layout) return null;
-    const plotW = layout.plot?.width || 30;
-    const plotL = layout.plot?.length || 40;
+    // Rulers read world coordinates, matching the cursor and object positions.
+    const site = getPlotRect(layout);
 
     const ticksX = [];
     const stepX = 5; // 5 ft major ticks
-    for (let x = 0; x <= plotW; x += stepX) {
+    for (let x = Math.ceil(site.x0 / stepX) * stepX; x <= site.x1; x += stepX) {
       const scr = worldToScreen(x, 0);
       ticksX.push(
         <div key={`rx-${x}`} style={{ position: 'absolute', left: scr.x - 24, top: 0, height: 18, borderLeft: '1px solid #94A3B8', paddingLeft: 3 }}>
@@ -1607,7 +1587,7 @@ export default function EditorCanvas({
 
     const ticksY = [];
     const stepY = 5;
-    for (let y = 0; y <= plotL; y += stepY) {
+    for (let y = Math.ceil(site.y0 / stepY) * stepY; y <= site.y1; y += stepY) {
       const scr = worldToScreen(0, y);
       ticksY.push(
         <div key={`ry-${y}`} style={{ position: 'absolute', top: scr.y - 22, left: 0, width: 24, borderTop: '1px solid #94A3B8', paddingTop: 2 }}>
@@ -1633,8 +1613,7 @@ export default function EditorCanvas({
   // Outer Plot Dimension Lines (selectable + editable annotations)
   const renderPlotDimensions = () => {
     if (!layout || !showDimensions) return null;
-    const W = layout.plot?.width || 30;
-    const L = layout.plot?.length || 40;
+    const { x0, y0, x1, y1, width: W, length: L } = getPlotRect(layout);
     const w = getPlotDimensionMeta(layout, 'width');
     const l = getPlotDimensionMeta(layout, 'length');
     const wSel = selectedElement?.type === 'dimension' && selectedElement.data?.axis === 'width';
@@ -1678,13 +1657,13 @@ export default function EditorCanvas({
       const lsc = worldToScreen(getDimLabelWorld(axis).x, getDimLabelWorld(axis).y);
 
       if (axis === 'width') {
-        const y = -w.offset;
-        const a = worldToScreen(0, y);
-        const b = worldToScreen(W, y);
-        const e1a = worldToScreen(0, 0.4);
-        const e1b = worldToScreen(0, y - 0.6);
-        const e2a = worldToScreen(W, 0.4);
-        const e2b = worldToScreen(W, y - 0.6);
+        const y = y0 - w.offset;
+        const a = worldToScreen(x0, y);
+        const b = worldToScreen(x1, y);
+        const e1a = worldToScreen(x0, y0 + 0.4);
+        const e1b = worldToScreen(x0, y - 0.6);
+        const e2a = worldToScreen(x1, y0 + 0.4);
+        const e2b = worldToScreen(x1, y - 0.6);
         return (
           <g key="dim-width">
             {selected && <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="rgba(37,99,235,0.22)" strokeWidth="12" />}
@@ -1700,13 +1679,13 @@ export default function EditorCanvas({
         );
       }
 
-      const x = -l.offset;
-      const a = worldToScreen(x, 0);
-      const b = worldToScreen(x, L);
-      const e1a = worldToScreen(0.4, 0);
-      const e1b = worldToScreen(x - 0.6, 0);
-      const e2a = worldToScreen(0.4, L);
-      const e2b = worldToScreen(x - 0.6, L);
+      const x = x0 - l.offset;
+      const a = worldToScreen(x, y0);
+      const b = worldToScreen(x, y1);
+      const e1a = worldToScreen(x0 + 0.4, y0);
+      const e1b = worldToScreen(x - 0.6, y0);
+      const e2a = worldToScreen(x0 + 0.4, y1);
+      const e2b = worldToScreen(x - 0.6, y1);
       return (
         <g key="dim-length">
           {selected && <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="rgba(37,99,235,0.22)" strokeWidth="12" />}
@@ -1730,9 +1709,10 @@ export default function EditorCanvas({
     );
   };
 
-  const plotW = layout?.plot?.width || 30;
-  const plotL = layout?.plot?.length || 40;
-  const plotScr = worldToScreen(0, 0);
+  const plotRect = getPlotRect(layout);
+  const plotW = plotRect.width;
+  const plotL = plotRect.length;
+  const plotScr = worldToScreen(plotRect.x0, plotRect.y0);
   const plotWidthPx = plotW * viewport.scale;
   const plotHeightPx = plotL * viewport.scale;
 
@@ -1776,7 +1756,7 @@ export default function EditorCanvas({
         {showGrid && (
           <g opacity="0.35">
             {Array.from({ length: Math.ceil(plotW / 2) + 1 }).map((_, i) => {
-              const p = worldToScreen(i * 2, 0);
+              const p = worldToScreen(plotRect.x0 + i * 2, plotRect.y0);
               return (
                 <line
                   key={`gv-${i}`}
@@ -1790,7 +1770,7 @@ export default function EditorCanvas({
               );
             })}
             {Array.from({ length: Math.ceil(plotL / 2) + 1 }).map((_, i) => {
-              const p = worldToScreen(0, i * 2);
+              const p = worldToScreen(plotRect.x0, plotRect.y0 + i * 2);
               return (
                 <line
                   key={`gh-${i}`}
@@ -1826,7 +1806,7 @@ export default function EditorCanvas({
           const bw = plotW - bx0 - (Number(sb.east) || 0);
           const bl = plotL - by0 - (Number(sb.south) || 0);
           if (bw <= 0 || bl <= 0) return null;
-          const p0 = worldToScreen(bx0, by0);
+          const p0 = worldToScreen(plotRect.x0 + bx0, plotRect.y0 + by0);
           return (
             <rect
               key="buildable-area"
@@ -1876,13 +1856,14 @@ export default function EditorCanvas({
           );
         })}
         {sitePreview && (() => {
+          const outsideCount = sitePreview.outside.length;
           const text = `${formatMeasurement(sitePreview.width, unit)} × ${formatMeasurement(sitePreview.length, unit)}` +
-            (sitePreview.success ? '' : `  ·  ${sitePreview.conflicts.length} conflict${sitePreview.conflicts.length === 1 ? '' : 's'}`);
-          const c = worldToScreen(plotW / 2, plotL / 2);
+            (outsideCount ? `  ·  ${outsideCount} outside plot` : '');
+          const c = worldToScreen(plotRect.x0 + plotW / 2, plotRect.y0 + plotL / 2);
           return (
             <g key="site-preview" transform={`translate(${c.x}, ${c.y})`}>
               <rect x={-(text.length * 3.4 + 14)} y="-12" width={text.length * 6.8 + 28} height="22" rx="11"
-                fill={sitePreview.success ? '#0F172A' : '#991B1B'} opacity="0.92" />
+                fill={outsideCount ? '#991B1B' : '#0F172A'} opacity="0.92" />
               <text x="0" y="3" textAnchor="middle" fill="#FFFFFF" fontSize="11" fontWeight="700" fontFamily="Segoe UI, sans-serif">{text}</text>
             </g>
           );

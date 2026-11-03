@@ -24,9 +24,9 @@ import OnboardingSlides from './components/OnboardingSlides';
 import LoginScreen from './components/LoginScreen';
 import LandingPage from './components/LandingPage';
 import LayoutEditor from './components/editor/LayoutEditor';
-import { generateStructuredLayoutFromState, syncLayoutToState } from './components/editor/layoutBridge';
+import { generateStructuredLayoutFromState, getSourceKey, syncLayoutToState } from './components/editor/layoutBridge';
 import { cloneLayout } from './components/editor/layoutModel';
-import { loadProject } from './components/editor/projectStorage';
+import { loadProject, saveProject } from './components/editor/projectStorage';
 
 export default function App() {
   const [language, setLanguage] = useState('en'); 
@@ -180,8 +180,33 @@ export default function App() {
   const generateOrRestoreLayout = () => {
     const generated = generateStructuredLayoutFromState(state);
     const saved = loadProject();
-    setOriginalGeneratedLayout(cloneLayout(generated));
-    setLayoutData(saved && saved.sourceKey === generated.sourceKey ? saved : generated);
+    const matchesOriginalInputs = saved?.sourceKey === generated.sourceKey;
+    const matchesSyncedInputs = saved?.syncedSourceKey === generated.sourceKey;
+
+    // Inputs rewritten by the editor don't describe a new design, so "Reset"
+    // keeps returning to the layout that was first generated.
+    if (!(matchesSyncedInputs && !matchesOriginalInputs && originalGeneratedLayout)) {
+      setOriginalGeneratedLayout(cloneLayout(generated));
+    }
+
+    if (!matchesOriginalInputs && !matchesSyncedInputs) {
+      setLayoutData(generated);
+      return;
+    }
+    // A restored plot size must reach the inputs too: the 2D plan draws from them.
+    const plotDiffers = String(saved.plot.width) !== state.siteWidth || String(saved.plot.length) !== state.siteLength;
+    if (plotDiffers) applyEditedLayout(saved, state);
+    else setLayoutData(saved);
+  };
+
+  // Closing the editor rewrites the inputs from the layout. Remembering those
+  // inputs on the layout means they restore it, rather than regenerating the building.
+  const applyEditedLayout = (editedLayout, baseState) => {
+    const nextState = syncLayoutToState(editedLayout, baseState);
+    const finalLayout = { ...editedLayout, syncedSourceKey: getSourceKey(nextState) };
+    setLayoutData(finalLayout);
+    saveProject(finalLayout);
+    setState({ ...nextState, lastEditedLayout: finalLayout });
   };
 
   const handleOpenEditor = () => {
@@ -190,9 +215,7 @@ export default function App() {
   };
 
   const handleSaveAndCloseEditor = (updatedLayout) => {
-    setLayoutData(updatedLayout);
-    const nextState = syncLayoutToState(updatedLayout, state);
-    setState(nextState);
+    applyEditedLayout(updatedLayout, state);
     setActiveTab('canvas');
   };
 

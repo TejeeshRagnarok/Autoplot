@@ -10,7 +10,7 @@
  * - Vastu advisory notifications
  */
 
-import { calculateWallLength } from './layoutModel.js';
+import { calculateWallLength, findElementsOutsidePlot } from './layoutModel.js';
 import { validateStaircaseFit } from './staircaseGeometry.js';
 import { validateOpenings } from './constraintEngine.js';
 
@@ -68,18 +68,6 @@ export function validateLayout(layout) {
         message: `"${room.name}" is smaller than 2.5 ft (${room.width}' × ${room.length}'). Standard architectural rooms should be at least 3 ft.`,
       });
     }
-
-    // Room outside plot boundary
-    if (room.x < 0 || room.y < 0 || room.x + room.width > plotW || room.y + room.length > plotL) {
-      issues.push({
-        id: `issue-room-plot-${room.id}`,
-        elementId: room.id,
-        elementType: 'room',
-        severity: SEVERITY.WARNING,
-        title: 'Room Outside Plot Boundaries',
-        message: `"${room.name}" extends beyond the plot boundary (${plotW}' × ${plotL}').`,
-      });
-    }
   });
 
   // 3. Room Overlap Check
@@ -132,19 +120,6 @@ export function validateLayout(layout) {
         severity: SEVERITY.ERROR,
         title: 'Invalid Wall Thickness',
         message: `Wall thickness must be greater than zero.`,
-      });
-    }
-
-    // Check outside plot boundary
-    const margin = 2.0;
-    if (wall.x1 < -margin || wall.y1 < -margin || wall.x2 > plotW + margin || wall.y2 > plotL + margin) {
-      issues.push({
-        id: `issue-wall-bound-${wall.id}`,
-        elementId: wall.id,
-        elementType: 'wall',
-        severity: SEVERITY.WARNING,
-        title: 'Wall Beyond Setback Perimeter',
-        message: `Wall extends significantly outside plot boundary.`,
       });
     }
   });
@@ -201,6 +176,20 @@ export function validateLayout(layout) {
         severity: SEVERITY.WARNING,
         title: isDoor ? 'Detached Door' : 'Detached Window',
         message: `This ${isDoor ? 'door' : 'window'} is not on a wall. Drag it onto a wall.`,
+      });
+    });
+
+  // 6b. Objects beyond the plot boundary (staircases are reported in section 7)
+  findElementsOutsidePlot(layout)
+    .filter((o) => o.type !== 'staircase')
+    .forEach((o) => {
+      issues.push({
+        id: `issue-outside-${o.type}-${o.id}`,
+        elementId: o.id,
+        elementType: o.type,
+        severity: SEVERITY.WARNING,
+        title: 'Object Outside Plot Boundary',
+        message: `${o.name} extends beyond the plot boundary (${plotW}' × ${plotL}').`,
       });
     });
 

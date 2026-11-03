@@ -42,6 +42,7 @@
  */
 
 import { generateUniqueId } from './layoutModel.js';
+import { getPlotRect } from './siteGeometry.js';
 
 export const STAIRCASE_TYPES = {
   DOG_LEGGED: 'dog-legged',
@@ -419,12 +420,11 @@ export function validateStaircaseFit(stair, layout) {
   }
 
   if (layout?.plot) {
-    const W = Number(layout.plot.width) || 0;
-    const L = Number(layout.plot.length) || 0;
+    const site = getPlotRect(layout, { width: 0, length: 0 });
     const b = geo.bounds;
     const eps = 0.01;
-    if (b.x < -eps || b.y < -eps || b.x + b.width > W + eps || b.y + b.length > L + eps) {
-      warnings.push(`Staircase extends beyond the plot boundary (${W}' x ${L}').`);
+    if (b.x < site.x0 - eps || b.y < site.y0 - eps || b.x + b.width > site.x1 + eps || b.y + b.length > site.y1 + eps) {
+      warnings.push(`Staircase extends beyond the plot boundary (${site.width}' x ${site.length}').`);
     }
   }
 

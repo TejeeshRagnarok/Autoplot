@@ -1,5 +1,7 @@
 /**
- * AutoPlot Layout Editor - Left Sidebar (Tools Palette & Component Library)
+ * AutoPlot Layout Editor - Horizontal Tool Strip (Tools Palette & Component Library)
+ * Sits under the top toolbar. Its option boxes float over the canvas, so opening
+ * them never resizes the plot.
  */
 
 import React, { useState } from 'react';
@@ -16,6 +18,7 @@ import {
   createParking,
   createUtility,
   createRoomBoundaryWalls,
+  getPlotRect,
 } from './layoutModel';
 
 export const TOOLS = [
@@ -98,7 +101,25 @@ const ROOM_TEMPLATES = [
   { name: 'Balcony / Verandah', width: 12, length: 4, color: '#ECFDF5' },
 ];
 
-export default function EditorLeftSidebar({
+const ELEMENTS = [
+  { label: "Single Door (3')", ion: 'enter-outline', color: '#B45309', type: 'door', params: { width: 3.0, type: 'single' } },
+  { label: "Main Door (4')", ion: 'enter', color: '#B45309', type: 'door', params: { width: 4.0, type: 'double', isMain: true } },
+  { label: "Window (4')", ion: 'browsers-outline', color: '#0284C7', type: 'window', params: { width: 4.0, type: 'standard' } },
+  { label: "Ventilator (2')", ion: 'grid', color: '#64748B', type: 'window', params: { width: 2.0, type: 'ventilator', isBathroom: true } },
+  { label: 'Dog-Legged Stairs', ion: 'layers-outline', color: '#334155', type: 'staircase', params: { width: 6.0, length: 9.0 } },
+  { label: 'Column Pillar (9")', ion: 'cube-outline', color: '#334155', type: 'column', params: { size: 0.75 } },
+  { label: "Car Parking (9'×16')", ion: 'car-outline', color: '#059669', type: 'parking', params: { width: 9.0, length: 16.0 } },
+  { label: 'Water Sump', ion: 'water-outline', color: '#0284C7', type: 'utility', params: { type: 'sump', name: 'Water Sump', width: 4.0, length: 3.5 } },
+  { label: 'Borewell Point', ion: 'ellipse-outline', color: '#0284C7', type: 'utility', params: { type: 'bore', name: 'Borewell', width: 2.5, length: 2.5 } },
+  { label: 'Septic Tank', ion: 'construct-outline', color: '#475569', type: 'utility', params: { type: 'septic', name: 'Septic Tank', width: 4.5, length: 3.5 } },
+];
+
+// React Native Web drops the `title` prop, so the hover tooltip is set on the DOM node.
+const tooltip = (label) => (node) => {
+  if (node?.setAttribute) node.setAttribute('title', label);
+};
+
+export default function EditorToolStrip({
   activeTool,
   onSelectTool,
   layout,
@@ -113,8 +134,11 @@ export default function EditorLeftSidebar({
   onRectangularArray,
   onDeleteSelection,
   onNotice,
+  propertiesOpen = false,
+  onToggleProperties,
 }) {
-  const [tab, setTab] = useState('tools'); // 'tools' | 'library'
+  const [popover, setPopover] = useState(null); // null | 'library' | 'array'
+  const togglePopover = (name) => setPopover(popover === name ? null : name);
 
   const setParam = (key, value) => onChangeToolParams && onChangeToolParams({ ...toolParams, [key]: value });
   const numParam = (key, label, opts = {}) => (
@@ -131,6 +155,8 @@ export default function EditorLeftSidebar({
   );
 
   const renderToolOptions = () => {
+    if (activeTool === 'select') return null;
+    const tool = [...TOOLS, ...MODIFY_TOOLS].find((t) => t.id === activeTool);
     const fields = {
       polygon: [numParam('sides', 'Sides', { integer: true, min: 3, max: 64 })],
       text: [(
@@ -148,47 +174,55 @@ export default function EditorLeftSidebar({
       'polar-array': [numParam('count', 'Items', { integer: true, min: 2, max: 72 }), numParam('polarAngle', 'Total angle (°)')],
     }[activeTool];
     const prompt = TOOL_PROMPTS[activeTool];
-    if (!fields && !prompt) return null;
     return (
       <View style={styles.optionsBox}>
+        {!!tool && <Text style={styles.optionsTitle}>{tool.name}</Text>}
         {fields}
         {!!prompt && <Text style={styles.promptText}>{prompt}</Text>}
       </View>
     );
   };
 
-  const renderToolItem = (tool) => {
-    const isActive = activeTool === tool.id;
-    return (
-      <TouchableOpacity
-        key={tool.id}
-        style={[styles.toolItem, isActive && styles.toolItemActive]}
-        onPress={() => onSelectTool(tool.id)}
-      >
-        <Ionicons name={tool.ion} size={17} color={isActive ? "#2563EB" : "#334155"} />
-        <Text style={[styles.toolItemText, isActive && styles.toolItemTextActive]}>{tool.name}</Text>
-        {!!tool.shortcut && <Text style={styles.toolShortcut}>{tool.shortcut}</Text>}
-      </TouchableOpacity>
-    );
-  };
+  const renderIconButton = ({ key, label, ion, active = false, onPress }) => (
+    <TouchableOpacity
+      key={key}
+      ref={tooltip(label)}
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      style={[styles.iconBtn, active && styles.iconBtnActive]}
+      onPress={onPress}
+    >
+      <Ionicons name={ion} size={16} color={active ? '#2563EB' : '#334155'} />
+    </TouchableOpacity>
+  );
 
-  const renderAction = (label, ion, onPress) => (
-    <TouchableOpacity key={label} style={styles.toolItem} onPress={onPress}>
-      <Ionicons name={ion} size={17} color="#334155" />
-      <Text style={styles.toolItemText}>{label}</Text>
+  const renderToolItem = (tool) => renderIconButton({
+    key: tool.id,
+    label: tool.shortcut ? `${tool.name} (${tool.shortcut})` : tool.name,
+    ion: tool.ion,
+    active: activeTool === tool.id,
+    onPress: () => onSelectTool(tool.id),
+  });
+
+  const renderTextButton = (label, ion, active, onPress, extraStyle) => (
+    <TouchableOpacity
+      style={[styles.textBtn, active && styles.iconBtnActive, extraStyle]}
+      onPress={onPress}
+    >
+      <Ionicons name={ion} size={15} color={active ? '#2563EB' : '#334155'} />
+      <Text style={[styles.textBtnLabel, active && styles.textBtnLabelActive]}>{label}</Text>
     </TouchableOpacity>
   );
 
   const handleAddRoomTemplate = (tmpl) => {
-    const plotW = layout.plot?.width || 30;
-    const plotL = layout.plot?.length || 40;
+    const site = getPlotRect(layout);
     const newRoom = createRoom({
       name: tmpl.name,
       width: tmpl.width,
       length: tmpl.length,
       color: tmpl.color,
-      x: Math.max(2, (plotW - tmpl.width) / 2),
-      y: Math.max(2, (plotL - tmpl.length) / 2),
+      x: site.x0 + Math.max(2, (site.width - tmpl.width) / 2),
+      y: site.y0 + Math.max(2, (site.length - tmpl.length) / 2),
     });
     const nextWalls = createRoomBoundaryWalls(layout, newRoom);
     const nextLayout = {
@@ -199,13 +233,13 @@ export default function EditorLeftSidebar({
     historyManager.pushState(nextLayout);
     onUpdateLayout(nextLayout);
     onSelectElement({ type: 'room', data: newRoom });
+    setPopover(null);
   };
 
   const handleAddComponent = (type, params = {}) => {
-    const plotW = layout.plot?.width || 30;
-    const plotL = layout.plot?.length || 40;
-    const cx = plotW / 2;
-    const cy = plotL / 2;
+    const site = getPlotRect(layout);
+    const cx = site.x0 + site.width / 2;
+    const cy = site.y0 + site.length / 2;
 
     let newElem = null;
     let elemType = type;
@@ -250,55 +284,54 @@ export default function EditorLeftSidebar({
       historyManager.pushState(nextLayout);
       onUpdateLayout(nextLayout);
       onSelectElement({ type: elemType, data: newElem });
+      setPopover(null);
     }
   };
 
   return (
-    <View style={styles.sidebar}>
-      {/* Tabs */}
-      <View style={styles.tabHeader}>
-        <TouchableOpacity
-          style={[styles.tabBtn, tab === 'tools' && styles.tabBtnActive]}
-          onPress={() => setTab('tools')}
-        >
-          <Text style={[styles.tabBtnText, tab === 'tools' && styles.tabBtnTextActive]}>Tools</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[styles.tabBtn, tab === 'library' && styles.tabBtnActive]}
-          onPress={() => setTab('library')}
-        >
-          <Text style={[styles.tabBtnText, tab === 'library' && styles.tabBtnTextActive]}>Library</Text>
-        </TouchableOpacity>
-      </View>
+    <View style={styles.strip}>
+      {renderTextButton('Library', 'library-outline', popover === 'library', () => togglePopover('library'))}
 
-      <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
-        {tab === 'tools' ? (
-          <View style={styles.toolsList}>
-            {renderToolOptions()}
-            <Text style={styles.sectionHeading}>DRAW</Text>
-            {TOOLS.map(renderToolItem)}
-            <Text style={[styles.sectionHeading, { marginTop: 12 }]}>MODIFY</Text>
-            {MODIFY_TOOLS.map(renderToolItem)}
-            {renderAction('Duplicate (Ctrl+D)', 'duplicate-outline', onDuplicate)}
-            {renderAction('Join Selected', 'link-outline', onJoin)}
-            {renderAction('Delete Selected (Del)', 'trash-bin-outline', onDeleteSelection)}
-            <Text style={[styles.sectionHeading, { marginTop: 12 }]}>RECTANGULAR ARRAY</Text>
-            <View style={styles.optionsBox}>
-              {numParam('rows', 'Rows', { integer: true, min: 1, max: 50 })}
-              {numParam('cols', 'Columns', { integer: true, min: 1, max: 50 })}
-              {lenParam('dx', 'Col. spacing')}
-              {lenParam('dy', 'Row spacing')}
-              {renderAction('Apply to Selection', 'grid-outline', onRectangularArray)}
-            </View>
+      <View style={styles.divider} />
+      {TOOLS.map(renderToolItem)}
+
+      <View style={styles.divider} />
+      {MODIFY_TOOLS.map(renderToolItem)}
+
+      <View style={styles.divider} />
+      {renderIconButton({ key: 'duplicate', label: 'Duplicate (Ctrl+D)', ion: 'duplicate-outline', onPress: onDuplicate })}
+      {renderIconButton({ key: 'join', label: 'Join Selected', ion: 'link-outline', onPress: onJoin })}
+      {renderIconButton({ key: 'delete-selected', label: 'Delete Selected (Del)', ion: 'trash-bin-outline', onPress: onDeleteSelection })}
+      {renderIconButton({ key: 'array', label: 'Rectangular Array', ion: 'grid-outline', active: popover === 'array', onPress: () => togglePopover('array') })}
+
+      {renderTextButton('Properties', 'options-outline', propertiesOpen, onToggleProperties, styles.propertiesBtn)}
+
+      {/* Floating boxes: positioned over the canvas so the plot keeps its size */}
+      {popover === null && !!renderToolOptions() && (
+        <View style={styles.floating}>{renderToolOptions()}</View>
+      )}
+
+      {popover === 'array' && (
+        <View style={styles.floating}>
+          <View style={styles.optionsBox}>
+            <Text style={styles.optionsTitle}>Rectangular Array</Text>
+            {numParam('rows', 'Rows', { integer: true, min: 1, max: 50 })}
+            {numParam('cols', 'Columns', { integer: true, min: 1, max: 50 })}
+            {lenParam('dx', 'Col. spacing')}
+            {lenParam('dy', 'Row spacing')}
+            {renderTextButton('Apply to Selection', 'grid-outline', false, onRectangularArray)}
           </View>
-        ) : (
-          <View style={styles.libraryContainer}>
-            {/* Quick Rooms */}
+        </View>
+      )}
+
+      {popover === 'library' && (
+        <View style={[styles.floating, styles.libraryPopover]}>
+          <ScrollView showsVerticalScrollIndicator={false}>
             <Text style={styles.sectionHeading}>ROOM TEMPLATES</Text>
-            <View style={styles.templatesGrid}>
-              {ROOM_TEMPLATES.map((tmpl, idx) => (
+            <View style={styles.cardGrid}>
+              {ROOM_TEMPLATES.map((tmpl) => (
                 <TouchableOpacity
-                  key={idx}
+                  key={tmpl.name}
                   style={[styles.templateCard, { borderLeftColor: tmpl.color === '#F8FAFC' ? '#64748B' : '#0284C7' }]}
                   onPress={() => handleAddRoomTemplate(tmpl)}
                 >
@@ -308,146 +341,119 @@ export default function EditorLeftSidebar({
               ))}
             </View>
 
-            {/* Components */}
-            <Text style={[styles.sectionHeading, { marginTop: 16 }]}>ARCHITECTURAL ELEMENTS</Text>
-            <View style={styles.componentsGrid}>
-              <TouchableOpacity
-                style={styles.compCard}
-                onPress={() => handleAddComponent('door', { width: 3.0, type: 'single' })}
-              >
-                <Ionicons name="enter-outline" size={16} color="#B45309" />
-                <Text style={styles.compName}>Single Door (3')</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={styles.compCard}
-                onPress={() => handleAddComponent('door', { width: 4.0, type: 'double', isMain: true })}
-              >
-                <Ionicons name="enter" size={16} color="#B45309" />
-                <Text style={styles.compName}>Main Door (4')</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={styles.compCard}
-                onPress={() => handleAddComponent('window', { width: 4.0, type: 'standard' })}
-              >
-                <Ionicons name="browsers-outline" size={16} color="#0284C7" />
-                <Text style={styles.compName}>Window (4')</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={styles.compCard}
-                onPress={() => handleAddComponent('window', { width: 2.0, type: 'ventilator', isBathroom: true })}
-              >
-                <Ionicons name="grid" size={16} color="#64748B" />
-                <Text style={styles.compName}>Ventilator (2')</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={styles.compCard}
-                onPress={() => handleAddComponent('staircase', { width: 6.0, length: 9.0 })}
-              >
-                <Ionicons name="layers-outline" size={16} color="#334155" />
-                <Text style={styles.compName}>Dog-Legged Stairs</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={styles.compCard}
-                onPress={() => handleAddComponent('column', { size: 0.75 })}
-              >
-                <Ionicons name="cube-outline" size={16} color="#334155" />
-                <Text style={styles.compName}>Column Pillar (9")</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={styles.compCard}
-                onPress={() => handleAddComponent('parking', { width: 9.0, length: 16.0 })}
-              >
-                <Ionicons name="car-outline" size={16} color="#059669" />
-                <Text style={styles.compName}>Car Parking (9'×16')</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={styles.compCard}
-                onPress={() => handleAddComponent('utility', { type: 'sump', name: 'Water Sump', width: 4.0, length: 3.5 })}
-              >
-                <Ionicons name="water-outline" size={16} color="#0284C7" />
-                <Text style={styles.compName}>Water Sump</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={styles.compCard}
-                onPress={() => handleAddComponent('utility', { type: 'bore', name: 'Borewell', width: 2.5, length: 2.5 })}
-              >
-                <Ionicons name="ellipse-outline" size={16} color="#0284C7" />
-                <Text style={styles.compName}>Borewell Point</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={styles.compCard}
-                onPress={() => handleAddComponent('utility', { type: 'septic', name: 'Septic Tank', width: 4.5, length: 3.5 })}
-              >
-                <Ionicons name="construct-outline" size={16} color="#475569" />
-                <Text style={styles.compName}>Septic Tank</Text>
-              </TouchableOpacity>
+            <Text style={[styles.sectionHeading, { marginTop: 14 }]}>ARCHITECTURAL ELEMENTS</Text>
+            <View style={styles.cardGrid}>
+              {ELEMENTS.map((el) => (
+                <TouchableOpacity
+                  key={el.label}
+                  style={styles.compCard}
+                  onPress={() => handleAddComponent(el.type, el.params)}
+                >
+                  <Ionicons name={el.ion} size={16} color={el.color} />
+                  <Text style={styles.compName}>{el.label}</Text>
+                </TouchableOpacity>
+              ))}
             </View>
-          </View>
-        )}
-      </ScrollView>
+          </ScrollView>
+        </View>
+      )}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  sidebar: {
-    width: 210,
-    backgroundColor: '#FFFFFF',
-    borderRightWidth: 1.2,
-    borderRightColor: '#CBD5E1',
-    flexDirection: 'column',
-    zIndex: 40,
-  },
-  tabHeader: {
+  strip: {
     flexDirection: 'row',
-    borderBottomWidth: 1,
-    borderBottomColor: '#E2E8F0',
-  },
-  tabBtn: {
-    flex: 1,
-    paddingVertical: 10,
+    flexWrap: 'wrap',
     alignItems: 'center',
-    backgroundColor: '#F8FAFC',
-  },
-  tabBtnActive: {
+    gap: 1,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
     backgroundColor: '#FFFFFF',
-    borderBottomWidth: 2,
-    borderBottomColor: '#2563EB',
+    borderBottomWidth: 1.2,
+    borderBottomColor: '#CBD5E1',
+    zIndex: 45,
   },
-  tabBtnText: {
+  divider: {
+    width: 1,
+    height: 20,
+    backgroundColor: '#CBD5E1',
+    marginHorizontal: 4,
+  },
+  iconBtn: {
+    width: 30,
+    height: 30,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: 'transparent',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  iconBtnActive: {
+    backgroundColor: '#EFF6FF',
+    borderColor: '#BFDBFE',
+  },
+  textBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    height: 30,
+    paddingHorizontal: 8,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: 'transparent',
+  },
+  textBtnLabel: {
     fontSize: 11,
     fontWeight: '600',
-    color: '#64748B',
+    color: '#334155',
   },
-  tabBtnTextActive: {
+  textBtnLabelActive: {
     color: '#2563EB',
     fontWeight: '700',
   },
-  content: {
-    flex: 1,
-    padding: 10,
+  propertiesBtn: {
+    marginLeft: 'auto',
   },
-  toolsList: {
-    gap: 4,
-    paddingBottom: 20,
+  floating: {
+    position: 'absolute',
+    top: '100%',
+    left: 32,
+    marginTop: 28,
+    maxWidth: 340,
+  },
+  libraryPopover: {
+    width: 460,
+    maxWidth: 460,
+    maxHeight: 500,
+    padding: 12,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#CBD5E1',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.15,
+    shadowRadius: 12,
+    elevation: 6,
   },
   optionsBox: {
     padding: 8,
-    marginBottom: 6,
     gap: 6,
     borderRadius: 6,
-    backgroundColor: '#F8FAFC',
+    backgroundColor: '#FFFFFF',
     borderWidth: 1,
-    borderColor: '#E2E8F0',
+    borderColor: '#CBD5E1',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.12,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  optionsTitle: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#1E293B',
   },
   paramRow: {
     flexDirection: 'row',
@@ -476,41 +482,6 @@ const styles = StyleSheet.create({
     lineHeight: 14,
     color: '#475569',
   },
-  toolItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    borderRadius: 6,
-    gap: 10,
-  },
-  toolItemActive: {
-    backgroundColor: '#EFF6FF',
-    borderWidth: 1,
-    borderColor: '#BFDBFE',
-  },
-  toolItemText: {
-    flex: 1,
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#334155',
-  },
-  toolItemTextActive: {
-    color: '#2563EB',
-    fontWeight: '700',
-  },
-  toolShortcut: {
-    fontSize: 10,
-    fontWeight: '700',
-    color: '#94A3B8',
-    backgroundColor: '#F1F5F9',
-    paddingHorizontal: 5,
-    paddingVertical: 2,
-    borderRadius: 4,
-  },
-  libraryContainer: {
-    paddingBottom: 20,
-  },
   sectionHeading: {
     fontSize: 10,
     fontWeight: '800',
@@ -518,10 +489,13 @@ const styles = StyleSheet.create({
     letterSpacing: 0.5,
     marginBottom: 8,
   },
-  templatesGrid: {
+  cardGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: 6,
   },
   templateCard: {
+    width: 212,
     paddingVertical: 6,
     paddingHorizontal: 10,
     backgroundColor: '#F8FAFC',
@@ -543,10 +517,8 @@ const styles = StyleSheet.create({
     color: '#64748B',
     fontWeight: '500',
   },
-  componentsGrid: {
-    gap: 6,
-  },
   compCard: {
+    width: 212,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
