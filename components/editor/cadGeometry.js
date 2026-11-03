@@ -1,17 +1,4 @@
-/**
- * AutoPlot CAD geometry primitives: intersections, projections and entity
- * outlines, all in world feet. No layout knowledge beyond reading an element's
- * own fields.
- *
- * Entities live in `layout.cadEntities`:
- *   line      { x1, y1, x2, y2 }
- *   polyline  { points: [{x,y}...], closed: false }
- *   polygon   { points: [{x,y}...], closed: true, shape: 'rect' | 'polygon' }
- *   circle    { cx, cy, r }
- *   arc       { cx, cy, r, start, end }  degrees; sweeps from start with
- *                                        increasing angle (clockwise on screen,
- *                                        because +y points south)
- */
+
 
 export const EPS = 1e-9;
 const TAU = 360;

@@ -8,6 +8,7 @@ import React, { useState } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, ScrollView } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { MeasureInput, NumberInput, TextField } from './DraftInput';
+import WallThicknessSelect from './WallThicknessSelect';
 import { placeOpeningOnWall } from './wallOps';
 import {
   createRoom,
@@ -24,7 +25,7 @@ import {
 export const TOOLS = [
   { id: 'select', name: 'Select / Move', icon: 'arrow-top-left-thin', shortcut: 'V', ion: 'navigate-outline' },
   { id: 'pan', name: 'Pan View', icon: 'hand-right', shortcut: 'H', ion: 'hand-right-outline' },
-  { id: 'wall', name: 'Draw Wall', icon: 'remove', shortcut: 'W', ion: 'pencil-outline' },
+  { id: 'wall', name: 'Add Wall', icon: 'remove', shortcut: 'W', ion: 'pencil-outline' },
   { id: 'room', name: 'Add Room', icon: 'square', shortcut: 'R', ion: 'crop-outline' },
   { id: 'door', name: 'Add Door', icon: 'enter', shortcut: 'D', ion: 'enter-outline' },
   { id: 'window', name: 'Add Window', icon: 'browsers', shortcut: 'N', ion: 'browsers-outline' },
@@ -158,6 +159,17 @@ export default function EditorToolStrip({
     if (activeTool === 'select') return null;
     const tool = [...TOOLS, ...MODIFY_TOOLS].find((t) => t.id === activeTool);
     const fields = {
+      wall: [(
+        <View style={styles.paramRow} key="wallThickness">
+          <Text style={styles.paramLabel}>Thickness</Text>
+          <WallThicknessSelect
+            longLabels
+            inches={toolParams.wallThicknessIn}
+            onChange={(n) => setParam('wallThicknessIn', n)}
+            style={{ width: 110, height: 26, fontSize: 11 }}
+          />
+        </View>
+      )],
       polygon: [numParam('sides', 'Sides', { integer: true, min: 3, max: 64 })],
       text: [(
         <View style={styles.paramRow} key="text">

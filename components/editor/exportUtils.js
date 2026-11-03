@@ -8,27 +8,95 @@
 
 import { formatMeasurement, formatArea } from './units.js';
 import { calculateStaircaseGeometry } from './staircaseGeometry.js';
-import { getOpeningGeometry } from './wallOps.js';
+import { getOpeningGeometry, getWallShape } from './wallOps.js';
 import { arcSweep, pointAtAngle } from './cadGeometry.js';
 import { dimensionLine } from './selectionModel.js';
 import { isPlotDimension } from './cadCommands.js';
-import { getPlotRect } from './siteGeometry.js';
+import { getPlotRect, getPlotWallPolygons } from './siteGeometry.js';
+import { getStaircaseBounds } from './staircaseGeometry.js';
+import { entityBounds } from './cadGeometry.js';
+import { getPlotDimensionMeta } from './layoutModel.js';
+import { buildJpegPdf } from './pdfWriter.js';
+import { furnitureSvg } from './furnitureSvg.js';
+
+/** Layers of the 2D Plan drawing. Pass with any grid, label, or path toggles applied. */
+export const PLAN_VIEW = { showGrid: true, showLabels: true, showFurniture: true, showCirculation: false, showSite: true };
 
 const xmlText = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+const PX_PER_FT = 20;
+// At 1:50 one real foot is 6.096 mm on paper, so one drawing pixel (1/20 ft) is
+// 0.3048 mm = 0.864 pt. Pages sized this way make the "SCALE: 1:50" label true.
+const PT_PER_PX = 0.864;
+const PDF_DPI = 300;
+const MAX_CANVAS_SIDE = 8000;
+const MAX_CANVAS_AREA = 40e6;
+
+/** A safe file name from the title: letters and digits in any language, joined by hyphens. */
+export const fileBaseName = (layout) => (layout.title || 'autoplot-plan')
+  .toLowerCase()
+  .replace(/[^\p{L}\p{M}\p{N}]+/gu, '-')
+  .replace(/^-+|-+$/g, '') || 'autoplot-plan';
+
+/** World box holding the plot and everything drawn, so an export never cuts anything off. */
+function getDrawingBounds(layout) {
+  const site = getPlotRect(layout);
+  let minX = site.x0;
+  let minY = site.y0;
+  let maxX = site.x1;
+  let maxY = site.y1;
+  const grow = (x0, y0, x1, y1) => {
+    if (![x0, y0, x1, y1].every(Number.isFinite)) return;
+    minX = Math.min(minX, x0);
+    minY = Math.min(minY, y0);
+    maxX = Math.max(maxX, x1);
+    maxY = Math.max(maxY, y1);
+  };
+  const rect = (r) => grow(r.x, r.y, r.x + r.width, r.y + r.length);
+
+  (layout.rooms || []).forEach(rect);
+  (layout.parking || []).forEach(rect);
+  (layout.utilities || []).forEach(rect);
+  (layout.staircases || []).forEach((s) => rect(getStaircaseBounds(s)));
+  (layout.walls || []).forEach((w) => {
+    const half = (Number(w.thickness) || 0) / 2;
+    grow(Math.min(w.x1, w.x2) - half, Math.min(w.y1, w.y2) - half, Math.max(w.x1, w.x2) + half, Math.max(w.y1, w.y2) + half);
+  });
+  [...(layout.doors || []), ...(layout.windows || [])].forEach((o) => {
+    const reach = Number(o.width) || 0;
+    grow(o.x - reach, o.y - reach, o.x + reach, o.y + reach);
+  });
+  (layout.columns || []).forEach((c) => {
+    const half = (Number(c.size) || 0.75) / 2;
+    grow(c.x - half, c.y - half, c.x + half, c.y + half);
+  });
+  (layout.annotations || []).forEach((a) => grow(a.x, a.y - 1, a.x + String(a.text || '').length * 0.5, a.y + 0.5));
+  (layout.cadEntities || []).forEach((e) => {
+    const b = entityBounds(e);
+    grow(b.minX, b.minY, b.maxX, b.maxY);
+  });
+  (layout.dimensions || []).filter((d) => !isPlotDimension(d.id)).forEach((d) => {
+    const l = dimensionLine(d);
+    grow(Math.min(d.x1, d.x2, l.x1, l.x2), Math.min(d.y1, d.y2, l.y1, l.y2), Math.max(d.x1, d.x2, l.x1, l.x2), Math.max(d.y1, d.y2, l.y1, l.y2));
+  });
+  return { minX, minY, maxX, maxY };
+}
 
 /**
  * Generate full SVG string for the entire layout
  * @param {object} layout
  * @param {string} unit
+ * @param {object} [view] layers to draw; see PLAN_VIEW
  * @returns {string} SVG xml content
  */
-export function generateLayoutSVG(layout, unit = 'ft-in') {
+export function generateLayoutSVG(layout, unit = 'ft-in', view = {}) {
   if (!layout) return '';
+  const { showGrid = true, showLabels = true, showFurniture = false, showCirculation = false, showSite = false } = view;
 
   const site = getPlotRect(layout);
   const plotW = site.width;
   const plotL = site.length;
-  const scale = 20; // 20 px per foot
+  const scale = PX_PER_FT;
   const padding = 100;
 
   const svgW = plotW * scale + padding * 2;
@@ -44,20 +112,28 @@ export function generateLayoutSVG(layout, unit = 'ft-in') {
   let elementsSvg = '';
 
   // 1. Grid
-  elementsSvg += `<g opacity="0.15">`;
-  for (let x = 0; x <= plotW; x += 2) {
-    elementsSvg += `<line x1="${plotLeft + x * scale}" y1="${plotTop}" x2="${plotLeft + x * scale}" y2="${plotTop + plotL * scale}" stroke="#64748B" stroke-width="0.5"/>`;
+  if (showGrid) {
+    elementsSvg += `<g data-layer="grid" opacity="0.15">`;
+    for (let x = 0; x <= plotW; x += 2) {
+      elementsSvg += `<line x1="${plotLeft + x * scale}" y1="${plotTop}" x2="${plotLeft + x * scale}" y2="${plotTop + plotL * scale}" stroke="#64748B" stroke-width="0.5"/>`;
+    }
+    for (let y = 0; y <= plotL; y += 2) {
+      elementsSvg += `<line x1="${plotLeft}" y1="${plotTop + y * scale}" x2="${plotLeft + plotW * scale}" y2="${plotTop + y * scale}" stroke="#64748B" stroke-width="0.5"/>`;
+    }
+    elementsSvg += `</g>`;
   }
-  for (let y = 0; y <= plotL; y += 2) {
-    elementsSvg += `<line x1="${plotLeft}" y1="${plotTop + y * scale}" x2="${plotLeft + plotW * scale}" y2="${plotTop + y * scale}" stroke="#64748B" stroke-width="0.5"/>`;
-  }
-  elementsSvg += `</g>`;
 
   // 2. Plot boundary
   elementsSvg += `
     <rect x="${plotLeft}" y="${plotTop}" width="${plotW * scale}" height="${plotL * scale}"
-      fill="#FFFFFF" stroke="#D97706" stroke-width="3" stroke-dasharray="6,4"/>
+      fill="none" stroke="#D97706" stroke-width="3" stroke-dasharray="6,4"/>
   `;
+
+  // 2a. Plot boundary walls
+  Object.entries(getPlotWallPolygons(layout)).forEach(([side, polygon]) => {
+    const points = polygon.map((p) => `${originX + p.x * scale},${originY + p.y * scale}`).join(' ');
+    elementsSvg += `<polygon data-plot-wall="${side}" points="${points}" fill="#64748B"/>`;
+  });
 
   // 2b. Setback line (buildable area)
   const sb = layout.plot?.setbacks || {};
@@ -69,6 +145,16 @@ export function generateLayoutSVG(layout, unit = 'ft-in') {
     elementsSvg += `<rect x="${plotLeft + bx0 * scale}" y="${plotTop + by0 * scale}" width="${bw * scale}" height="${bl * scale}" fill="none" stroke="#94A3B8" stroke-width="1" stroke-dasharray="3,3"/>`;
   }
 
+  // 2c. Vastu quadrant labels, as on the canvas
+  const plotRight = plotLeft + plotW * scale;
+  const plotBottom = plotTop + plotL * scale;
+  elementsSvg += `<g font-family="Arial, sans-serif" font-size="10" font-weight="bold" fill="#B45309">
+    <text x="${plotLeft + 16}" y="${plotTop + 24}">NW</text>
+    <text x="${plotRight - 32}" y="${plotTop + 24}">NE</text>
+    <text x="${plotLeft + 16}" y="${plotBottom - 16}">SW</text>
+    <text x="${plotRight - 32}" y="${plotBottom - 16}">SE</text>
+  </g>`;
+
   // 3. Rooms
   (layout.rooms || []).forEach(room => {
     const rx = originX + room.x * scale;
@@ -77,18 +163,23 @@ export function generateLayoutSVG(layout, unit = 'ft-in') {
     const rh = room.length * scale;
     const area = room.width * room.length;
 
-    elementsSvg += `
-      <g>
-        <rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" fill="${room.color || '#F8FAFC'}" stroke="#CBD5E1" stroke-width="1"/>
-        <text x="${rx + rw / 2}" y="${ry + rh / 2 - 8}" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="#1E293B" text-anchor="middle">
+    // A white outline keeps labels readable where they cross furniture.
+    const halo = showFurniture ? 'paint-order="stroke" stroke="#FFFFFF" stroke-width="3" stroke-linejoin="round"' : '';
+    const labels = !showLabels ? '' : `
+        <text x="${rx + rw / 2}" y="${ry + rh / 2 - 8}" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="#1E293B" text-anchor="middle" ${halo}>
           ${xmlText(room.name || 'Room')}
         </text>
-        <text x="${rx + rw / 2}" y="${ry + rh / 2 + 8}" font-family="Arial, sans-serif" font-size="10" fill="#64748B" text-anchor="middle">
+        <text x="${rx + rw / 2}" y="${ry + rh / 2 + 8}" font-family="Arial, sans-serif" font-size="10" fill="#64748B" text-anchor="middle" ${halo}>
           ${formatMeasurement(room.width, unit)} × ${formatMeasurement(room.length, unit)}
         </text>
-        <text x="${rx + rw / 2}" y="${ry + rh / 2 + 22}" font-family="Arial, sans-serif" font-size="9" font-weight="600" fill="#0284C7" text-anchor="middle">
+        <text x="${rx + rw / 2}" y="${ry + rh / 2 + 22}" font-family="Arial, sans-serif" font-size="9" font-weight="600" fill="#0284C7" text-anchor="middle" ${halo}>
           ${formatArea(area, unit)}
-        </text>
+        </text>`;
+    elementsSvg += `
+      <g>
+        <rect data-room-id="${xmlText(room.id)}" x="${rx}" y="${ry}" width="${rw}" height="${rh}" fill="${room.color || '#F8FAFC'}" stroke="#CBD5E1" stroke-width="1"/>
+        ${showFurniture ? furnitureSvg(room.name, rx, ry, rw, rh, scale) : ''}
+        ${labels}
       </g>
     `;
   });
@@ -146,14 +237,12 @@ export function generateLayoutSVG(layout, unit = 'ft-in') {
 
   // 5. Walls
   (layout.walls || []).forEach(w => {
-    const x1 = originX + w.x1 * scale;
-    const y1 = originY + w.y1 * scale;
-    const x2 = originX + w.x2 * scale;
-    const y2 = originY + w.y2 * scale;
-    const strokeW = Math.max(2, (w.thickness || 0.75) * scale);
-    elementsSvg += `
-      <line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#0F172A" stroke-width="${strokeW}" stroke-linecap="round"/>
-    `;
+    const { polygon, joints } = getWallShape(w, layout.walls);
+    const points = polygon.map((p) => `${originX + p.x * scale},${originY + p.y * scale}`).join(' ');
+    elementsSvg += `<polygon points="${points}" fill="#0F172A" stroke="#0F172A" stroke-width="0.5"/>`;
+    joints.forEach((j) => {
+      elementsSvg += `<circle cx="${originX + j.x * scale}" cy="${originY + j.y * scale}" r="${j.r * scale}" fill="#0F172A"/>`;
+    });
   });
 
   // 6. Doors & Windows (same geometry as the canvas: on the host wall, with hinge and swing)
@@ -225,13 +314,98 @@ export function generateLayoutSVG(layout, unit = 'ft-in') {
     elementsSvg += `<text x="${SX(a.x)}" y="${SY(a.y)}" font-family="Arial, sans-serif" font-size="${a.fontSize || 12}" fill="${a.color || '#334155'}">${xmlText(a.text)}</text>`;
   });
 
-  // 7. Title Block & North Compass
-  const titleBlockY = plotTop + plotL * scale + 24;
-  const compassX = svgW - padding - 30;
-  const compassY = padding - 40;
+  // 6c. Outer plot dimensions, as on the canvas
+  const dimColor = '#B45309';
+  const dimLabel = (x, y, text) => `
+    <rect x="${x - 34}" y="${y - 10}" width="68" height="20" rx="3" fill="#FFFFFF" stroke="${dimColor}" stroke-width="1.2"/>
+    <text x="${x}" y="${y + 4}" font-family="Arial, sans-serif" font-size="11" font-weight="bold" fill="${dimColor}" text-anchor="middle">${xmlText(text)}</text>`;
+  const widthY = plotTop - getPlotDimensionMeta(layout, 'width').offset * scale;
+  const lengthX = plotLeft - getPlotDimensionMeta(layout, 'length').offset * scale;
+  elementsSvg += `<g data-plot-dimensions="true" stroke="${dimColor}" stroke-width="1.4">
+    <line x1="${plotLeft}" y1="${plotTop}" x2="${plotLeft}" y2="${widthY - 12}" stroke-width="1" stroke-dasharray="3,2"/>
+    <line x1="${plotRight}" y1="${plotTop}" x2="${plotRight}" y2="${widthY - 12}" stroke-width="1" stroke-dasharray="3,2"/>
+    <line x1="${plotLeft}" y1="${widthY}" x2="${plotRight}" y2="${widthY}"/>
+    <polygon points="${plotLeft},${widthY} ${plotLeft + 11},${widthY - 4} ${plotLeft + 11},${widthY + 4}" fill="${dimColor}" stroke="none"/>
+    <polygon points="${plotRight},${widthY} ${plotRight - 11},${widthY - 4} ${plotRight - 11},${widthY + 4}" fill="${dimColor}" stroke="none"/>
+    <line x1="${plotLeft}" y1="${plotTop}" x2="${lengthX - 12}" y2="${plotTop}" stroke-width="1" stroke-dasharray="3,2"/>
+    <line x1="${plotLeft}" y1="${plotBottom}" x2="${lengthX - 12}" y2="${plotBottom}" stroke-width="1" stroke-dasharray="3,2"/>
+    <line x1="${lengthX}" y1="${plotTop}" x2="${lengthX}" y2="${plotBottom}"/>
+    <polygon points="${lengthX},${plotTop} ${lengthX - 4},${plotTop + 11} ${lengthX + 4},${plotTop + 11}" fill="${dimColor}" stroke="none"/>
+    <polygon points="${lengthX},${plotBottom} ${lengthX - 4},${plotBottom - 11} ${lengthX + 4},${plotBottom - 11}" fill="${dimColor}" stroke="none"/>
+  </g>
+  <g>${dimLabel((plotLeft + plotRight) / 2, widthY, formatMeasurement(plotW, unit))}${dimLabel(lengthX, (plotTop + plotBottom) / 2, formatMeasurement(plotL, unit))}</g>`;
+
+  // 6d. Plan view only: walking paths, road, main gate, open space around the building
+  const mainDoor = (layout.doors || []).find((d) => d.isMain);
+  if (showCirculation && mainDoor) {
+    const hall = (layout.rooms || []).find((r) => /living|hall/i.test(r.name || ''));
+    if (hall) {
+      const hx = SX(hall.x + hall.width / 2);
+      const hy = SY(hall.y + hall.length / 2);
+      const path = (d) => `<line x1="${hx}" y1="${hy}" x2="${SX(d.x)}" y2="${SY(d.y)}" stroke="#10B981" stroke-width="1.5" stroke-dasharray="4,3"/><circle cx="${SX(d.x)}" cy="${SY(d.y)}" r="3" fill="#10B981"/>`;
+      elementsSvg += `<g data-layer="circulation">${(layout.doors || []).map(path).join('')}<circle cx="${hx}" cy="${hy}" r="3" fill="#10B981"/></g>`;
+    }
+  }
+
+  const road = String(layout.plot?.roadDirection || '');
+  const isCornerEN = /Corner E ?\+ ?N/.test(road);
+  const isCornerWS = /Corner W ?\+ ?S/.test(road);
+  const roadOn = (side) => showSite && (isCornerEN ? ['North', 'East'] : isCornerWS ? ['South', 'West'] : road.includes(side) ? [side] : []).includes(side);
+  const SOUTH_ROAD_SPACE = 34;
+  if (showSite) {
+    const band = (x, y, w, h, side) => {
+      const vertical = h > w;
+      const cx = x + w / 2;
+      const cy = y + h / 2;
+      return `<g data-layer="road" data-road="${side}"><rect x="${x}" y="${y}" width="${w}" height="${h}" fill="#E2E8F0" stroke="#94A3B8" stroke-width="1"/>
+        <text x="${cx}" y="${cy + 3}" transform="${vertical ? `rotate(90 ${cx} ${cy})` : ''}" font-family="Arial, sans-serif" font-size="9" font-weight="bold" fill="#475569" text-anchor="middle">${side.toUpperCase()} ROADWAY</text></g>`;
+    };
+    if (roadOn('North')) elementsSvg += band(plotLeft, plotTop - 88, plotW * scale, 24, 'North');
+    if (roadOn('South')) elementsSvg += band(plotLeft, plotBottom + 6, plotW * scale, 24, 'South');
+    if (roadOn('West')) elementsSvg += band(plotLeft - 88, plotTop, 24, plotL * scale, 'West');
+    if (roadOn('East')) elementsSvg += band(plotRight + 72, plotTop, 24, plotL * scale, 'East');
+
+    if (mainDoor) {
+      const g = getOpeningGeometry(mainDoor, layout.walls);
+      const cx = site.x0 + plotW / 2;
+      const cy = site.y0 + plotL / 2;
+      const away = (mainDoor.x - cx) * g.nx + (mainDoor.y - cy) * g.ny >= 0 ? 1 : -1;
+      const mx = SX(mainDoor.x) + g.nx * away * 34;
+      const my = SY(mainDoor.y) + g.ny * away * 34;
+      elementsSvg += `<g data-layer="main-gate"><circle cx="${mx}" cy="${my}" r="7" fill="#10B981"/>
+        <text x="${mx + 12}" y="${my + 3}" font-family="Arial, sans-serif" font-size="8" font-weight="bold" fill="#047857">MAIN GATE</text></g>`;
+    }
+
+    const exterior = (layout.walls || []).filter((w) => w.type === 'exterior');
+    if (exterior.length) {
+      const xs = exterior.flatMap((w) => [SX(w.x1), SX(w.x2)]);
+      const ys = exterior.flatMap((w) => [SY(w.y1), SY(w.y2)]);
+      const left = Math.min(...xs);
+      const right = Math.max(...xs);
+      const top = Math.min(...ys);
+      const bottom = Math.max(...ys);
+      const atY = plotTop + plotL * scale * 0.72;
+      const atX = plotLeft + plotW * scale * 0.72;
+      const gap = (x1, y1, x2, y2, px) => (px < 12 ? '' : `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#B45309" stroke-width="1" stroke-dasharray="3,2"/>
+        <text x="${(x1 + x2) / 2 + (x1 === x2 ? 4 : 0)}" y="${(y1 + y2) / 2 - (y1 === y2 ? 3 : -3)}" font-family="Arial, sans-serif" font-size="9" font-weight="bold" fill="#B45309" text-anchor="${x1 === x2 ? 'start' : 'middle'}">${formatMeasurement(px / scale, unit)}</text>`);
+      elementsSvg += `<g data-layer="open-space">${gap(plotLeft, atY, left, atY, left - plotLeft)}${gap(right, atY, plotRight, atY, plotRight - right)}${gap(atX, plotTop, atX, top, top - plotTop)}${gap(atX, bottom, atX, plotBottom, plotBottom - bottom)}</g>`;
+    }
+  }
+
+  // 7. Title Block & North Compass. The sheet grows to fit anything beyond the plot.
+  const bounds = getDrawingBounds(layout);
+  const margin = 2 * scale;
+  const titleBlockY = originY + bounds.maxY * scale + 24 + (roadOn('South') ? SOUTH_ROAD_SPACE : 0);
+  // Beside the plot, clear of the width dimension line above it.
+  const compassX = plotRight + padding / 2;
+  const compassY = plotTop + 30;
+  const viewLeft = Math.min(0, originX + bounds.minX * scale - margin);
+  const viewTop = Math.min(0, originY + bounds.minY * scale - margin);
+  const viewRight = Math.max(svgW, originX + bounds.maxX * scale + margin);
+  const viewBottom = Math.max(svgH, titleBlockY + 64 + 24);
 
   return `
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${svgW} ${svgH}" width="100%" height="100%" style="background-color: #F8FAFC;">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewLeft} ${viewTop} ${viewRight - viewLeft} ${viewBottom - viewTop}" width="100%" height="100%" style="background-color: #FFFFFF;">
       <defs>
         <style>
           .txt-title { font-family: 'Segoe UI', Arial, sans-serif; font-size: 16px; font-weight: 800; fill: #070262; }
@@ -284,7 +458,7 @@ export function exportAsSVG(layout, unit = 'ft-in') {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `${(layout.title || 'autoplot-plan').toLowerCase().replace(/\s+/g, '-')}.svg`;
+    link.download = `${fileBaseName(layout)}.svg`;
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -294,39 +468,103 @@ export function exportAsSVG(layout, unit = 'ft-in') {
   }
 }
 
+/** Drawing size in pixels at 20 px/ft, read from the SVG's own viewBox. */
+export function getSvgSheetSize(svg) {
+  const m = svg.match(/viewBox="(-?[\d.]+) (-?[\d.]+) (-?[\d.]+) (-?[\d.]+)"/);
+  return { width: Number(m[3]), height: Number(m[4]) };
+}
+
+/** Image resolution for a sheet: the DPI asked for, within what browsers can allocate. */
+export function getRasterScale(sheet, dpi = PDF_DPI) {
+  const wanted = (dpi / 72) * PT_PER_PX;
+  return Math.min(
+    wanted,
+    MAX_CANVAS_SIDE / Math.max(sheet.width, sheet.height),
+    Math.sqrt(MAX_CANVAS_AREA / (sheet.width * sheet.height)),
+  );
+}
+
+/** Draw the layout onto a white canvas at the given resolution. */
+function rasterizeLayout(layout, unit, pixelScale, view) {
+  return new Promise((resolve, reject) => {
+    const svg = generateLayoutSVG(layout, unit, view);
+    const sheet = getSvgSheetSize(svg);
+    const scale = pixelScale ?? getRasterScale(sheet);
+    const width = Math.round(sheet.width * scale);
+    const height = Math.round(sheet.height * scale);
+    // Explicit pixel size: an image loaded with width="100%" has no reliable size.
+    const sized = svg.replace('width="100%" height="100%"', `width="${width}" height="${height}"`);
+    const url = URL.createObjectURL(new Blob([sized], { type: 'image/svg+xml;charset=utf-8' }));
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, width, height);
+      ctx.drawImage(img, 0, 0, width, height);
+      resolve({ canvas, sheet });
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('The layout drawing could not be rendered.'));
+    };
+    img.src = url;
+  });
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+const canvasToBlob = (canvas, type, quality) => new Promise((resolve, reject) => {
+  canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error('The image could not be created.'))), type, quality);
+});
+
+/**
+ * Download the exact layout as a one-page PDF. The page is sized so the drawing
+ * measures true at 1:50 when printed at 100%.
+ * @param {object} [view] layers to draw, so the file matches the screen it came from
+ * @returns {Promise<boolean>} whether the file was created
+ */
+export async function exportAsPDF(layout, unit = 'ft-in', view = {}) {
+  if (typeof document === 'undefined' || !layout) return false;
+  try {
+    const { canvas, sheet } = await rasterizeLayout(layout, unit, undefined, view);
+    const jpegBlob = await canvasToBlob(canvas, 'image/jpeg', 0.95);
+    const pdf = buildJpegPdf({
+      jpeg: new Uint8Array(await jpegBlob.arrayBuffer()),
+      pixelWidth: canvas.width,
+      pixelHeight: canvas.height,
+      pageWidthPt: sheet.width * PT_PER_PX,
+      pageHeightPt: sheet.height * PT_PER_PX,
+      title: layout.title || 'AutoPlot Layout',
+    });
+    downloadBlob(new Blob([pdf], { type: 'application/pdf' }), `${fileBaseName(layout)}.pdf`);
+    return true;
+  } catch (err) {
+    console.error('Error exporting PDF:', err);
+    return false;
+  }
+}
+
 /**
  * Export high-resolution PNG image
  */
-export function exportAsPNG(layout, unit = 'ft-in') {
-  if (typeof window === 'undefined') return;
+export async function exportAsPNG(layout, unit = 'ft-in') {
+  if (typeof document === 'undefined') return;
   try {
-    const svgStr = generateLayoutSVG(layout, unit);
-    const img = new Image();
-    const svgBlob = new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' });
-    const url = URL.createObjectURL(svgBlob);
-
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      const pixelRatio = 2; // High-DPI 2x
-      canvas.width = img.width * pixelRatio || 1600;
-      canvas.height = img.height * pixelRatio || 1200;
-      const ctx = canvas.getContext('2d');
-      ctx.scale(pixelRatio, pixelRatio);
-      ctx.fillStyle = '#FFFFFF';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(img, 0, 0);
-
-      const pngUrl = canvas.toDataURL('image/png');
-      const link = document.createElement('a');
-      link.href = pngUrl;
-      link.download = `${(layout.title || 'autoplot-plan').toLowerCase().replace(/\s+/g, '-')}.png`;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      URL.revokeObjectURL(url);
-    };
-
-    img.src = url;
+    const { canvas } = await rasterizeLayout(layout, unit, 2);
+    downloadBlob(await canvasToBlob(canvas, 'image/png'), `${fileBaseName(layout)}.png`);
   } catch (err) {
     console.error('Error exporting PNG:', err);
   }
@@ -335,10 +573,10 @@ export function exportAsPNG(layout, unit = 'ft-in') {
 /**
  * Trigger clean browser print preview
  */
-export function printLayoutPlan(layout, unit = 'ft-in') {
+export function printLayoutPlan(layout, unit = 'ft-in', view = {}) {
   if (typeof window === 'undefined') return;
   try {
-    const svgContent = generateLayoutSVG(layout, unit);
+    const svgContent = generateLayoutSVG(layout, unit, view);
     const printWindow = window.open('', '_blank', 'width=1000,height=800');
     if (!printWindow) {
       alert('Please allow popups to open print preview.');

@@ -4,6 +4,8 @@
  * and authenticated user scoping.
  */
 
+import { feetToInches, getPlotWallThicknesses } from './layoutModel.js';
+
 const STORAGE_KEY_PREFIX = 'autoplot_project_';
 const ACTIVE_PROJECT_KEY = 'autoplot_active_project_id';
 
@@ -24,6 +26,9 @@ export function normalizeLoadedLayout(layout) {
   if (!layout || typeof layout !== 'object' || !layout.plot) return null;
   const next = { ...layout };
   for (const key of LAYOUT_LISTS) if (!Array.isArray(next[key])) next[key] = [];
+  // Projects from before wall thickness was stored in inches kept it in feet only.
+  next.walls = next.walls.map((w) => (w.thicknessInches === undefined ? { ...w, thicknessInches: feetToInches(w.thickness) } : w));
+  next.plot = { ...next.plot, boundaryWalls: getPlotWallThicknesses(next) };
   return next;
 }
 

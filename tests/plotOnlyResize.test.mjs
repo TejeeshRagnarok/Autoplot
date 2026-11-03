@@ -287,7 +287,7 @@ test('SVG export draws the plot and building in the right relative positions', (
   // Plot corner at the 100 px padding; world x=2 sits 8 ft (160 px) inside it at 20 px/ft.
   assert.match(svg, /<rect x="100" y="100" width="720" height="800"/);
   const master = next.rooms.find((r) => r.id === 'master');
-  assert.ok(svg.includes(`<rect x="${100 + (master.x + 6) * 20}" y="${100 + master.y * 20}"`));
+  assert.ok(svg.includes(`<rect data-room-id="master" x="${100 + (master.x + 6) * 20}" y="${100 + master.y * 20}"`));
 });
 
 // ---- Leaving the editor: the 2D plan and reports derive the building from state ----

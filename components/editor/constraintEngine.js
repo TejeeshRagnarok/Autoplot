@@ -1,36 +1,3 @@
-/**
- * AutoPlot Constraint-Based Site Reflow Engine
- *
- * Deterministically updates the whole drawing when the site boundary or the
- * setbacks change.
- *
- * HOW IT WORKS (per axis, X then Y)
- * ---------------------------------
- * 1. The building extent is the bounding box of the rooms (or walls when
- *    there are no rooms). Every room edge, and every staircase edge inside the
- *    building, becomes a "grid line". The gaps between consecutive grid lines
- *    are intervals.
- * 2. An interval is RIGID when any room/staircase covering it is fixed,
- *    anchored, locked or has that dimension locked. Other intervals stretch.
- * 3. The required size change is distributed across stretchable intervals
- *    in proportion to their length ("water-filling"), never pushing a flexible
- *    room past its min/max along that axis.
- * 4. Every coordinate in the building (room edges, wall endpoints, door and
- *    window positions, staircase positions, linked dimensions, columns,
- *    annotations) is passed through the same monotone piecewise-linear map.
- *    Because one map moves everything, shared walls stay shared, corners stay
- *    connected, rooms never gain gaps or overlaps, and openings stay on their
- *    host walls. Entity IDs never change.
- * 5. Objects outside the building (in the setback zones - utilities, external
- *    staircase, parking) follow their anchor, or the nearest plot edge.
- * 6. Anything that cannot be satisfied is reported as a conflict. Nothing is
- *    deleted and step counts are never changed.
- *
- * Coordinates: feet, origin at the plot's north-west corner, +x east, +y south.
- * When the west (left) or north (top) edge is dragged, the opposite edge keeps
- * its physical position, which in plot coordinates means existing content is
- * shifted by the size change.
- */
 
 import {
   getStaircaseBounds,

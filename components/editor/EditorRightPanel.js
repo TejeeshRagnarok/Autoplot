@@ -16,6 +16,13 @@ import { formatMeasurement, formatArea, parseToFeet } from './units';
 import {
   calculateWallLength,
   calculateWallAngle,
+  getWallOrientation,
+  getWallThicknessInches,
+  getPlotInnerRect,
+  getPlotRect,
+  getPlotWallThicknesses,
+  PLOT_WALL_SIDES,
+  setPlotWallThickness,
   ROOM_PALETTE,
   setPlotDimensionOffset,
   checkRoomPlotFit,
@@ -33,6 +40,7 @@ import {
 import { checkAyaVyayaYoni } from '../../constants/vastuData';
 import { setRoomDimension, moveRoom } from './roomResize';
 import DraftInput, { MeasureInput, NumberInput, TextField } from './DraftInput';
+import WallThicknessSelect from './WallThicknessSelect';
 import {
   getOpeningHost,
   getOpeningPosition,
@@ -41,6 +49,7 @@ import {
   setOpeningPosition,
   setWallLength,
   setWallProps,
+  setWallThickness,
   splitWall,
 } from './wallOps';
 import {
@@ -408,8 +417,20 @@ export default function EditorRightPanel({
       }
     };
 
-    // Type and thickness change together, as one edit.
-    const setType = (type, thickness) => applyWall({ layout: setWallProps(layout, wall.id, { type, thickness }) });
+    const setType = (type) => applyWall({ layout: setWallProps(layout, wall.id, { type }) });
+
+    const handleThickness = (inches) => {
+      const res = setWallThickness(layout, wall.id, inches);
+      applyWall(res);
+      if (res.reason) return;
+      const shared = res.updatedIds.length - 1;
+      const notes = [];
+      if (shared > 0) notes.push(`${shared} overlapping wall segment${shared === 1 ? '' : 's'} on the same line changed with it.`);
+      if (res.outside) notes.push('This wall now extends beyond the plot boundary.');
+      if (notes.length) notify(notes.join(' '));
+    };
+
+    const orientation = getWallOrientation(wall);
 
     // Numeric endpoint entry moves just that endpoint, and may tilt the wall.
     const setEnd = (which, axis, value) => {
@@ -431,29 +452,41 @@ export default function EditorRightPanel({
           <Text style={styles.elemTitle}>Wall Properties</Text>
         </View>
 
+        <View style={styles.statBox}>
+          <View style={styles.rowBetween}>
+            <Text style={styles.statLabel}>Wall ID:</Text>
+            <Text style={[styles.statValue, { flexShrink: 1, marginLeft: 8 }]} numberOfLines={1}>{wall.name || wall.id}</Text>
+          </View>
+        </View>
+
         {/* Wall Type */}
         <View style={styles.inputGroup}>
           <Text style={styles.inputLabel}>Wall Type</Text>
           <View style={styles.rowTwo}>
-            <TouchableOpacity style={[styles.typeBtn, wall.type === 'exterior' && styles.typeBtnActive]} onPress={() => setType('exterior', 0.75)}>
-              <Text style={[styles.typeBtnText, wall.type === 'exterior' && styles.typeBtnTextActive]}>Exterior (9")</Text>
+            <TouchableOpacity style={[styles.typeBtn, wall.type === 'exterior' && styles.typeBtnActive]} onPress={() => setType('exterior')}>
+              <Text style={[styles.typeBtnText, wall.type === 'exterior' && styles.typeBtnTextActive]}>Exterior</Text>
             </TouchableOpacity>
-            <TouchableOpacity style={[styles.typeBtn, wall.type === 'interior' && styles.typeBtnActive]} onPress={() => setType('interior', 0.375)}>
-              <Text style={[styles.typeBtnText, wall.type === 'interior' && styles.typeBtnTextActive]}>Interior (4.5")</Text>
+            <TouchableOpacity style={[styles.typeBtn, wall.type === 'interior' && styles.typeBtnActive]} onPress={() => setType('interior')}>
+              <Text style={[styles.typeBtnText, wall.type === 'interior' && styles.typeBtnTextActive]}>Interior</Text>
             </TouchableOpacity>
           </View>
         </View>
 
         <View style={styles.rowTwo}>
-          {measureField('Thickness', wall.thickness, (v) => applyWall({ layout: setWallProps(layout, wall.id, { thickness: v }) }), { min: 0.1, editable: !locked })}
+          <View style={[styles.inputGroup, { flex: 1 }]}>
+            <Text style={styles.inputLabel}>Thickness</Text>
+            <WallThicknessSelect inches={getWallThicknessInches(wall)} onChange={handleThickness} disabled={locked} />
+          </View>
           {measureField('Length', len, (v) => applyWall(setWallLength(layout, wall.id, v)), { min: 0.25, editable: !locked })}
         </View>
-        <Text style={styles.hintText}>Changing the length keeps the start point and the wall's direction.</Text>
+        <Text style={styles.hintText}>Thickness grows equally on both sides of the wall's centreline. Changing the length keeps the start point and the wall's direction.</Text>
 
         <View style={styles.statBox}>
           <View style={styles.rowBetween}>
-            <Text style={styles.statLabel}>Orientation Angle:</Text>
-            <Text style={styles.statValue}>{angle.toFixed(1)}°</Text>
+            <Text style={styles.statLabel}>Orientation:</Text>
+            <Text style={styles.statValue}>
+              {orientation === 'horizontal' ? 'Horizontal' : orientation === 'vertical' ? 'Vertical' : 'Angled'} ({angle.toFixed(1)}°)
+            </Text>
           </View>
         </View>
 
@@ -479,6 +512,63 @@ export default function EditorRightPanel({
         <Text style={styles.hintText}>To join walls: select two collinear walls that touch, then use Join in the Modify tools.</Text>
 
         {renderActions(locked)}
+      </View>
+    );
+  };
+
+  // ---------------------------------------------------------
+  // RENDER PLOT BOUNDARY WALL INSPECTOR
+  // ---------------------------------------------------------
+  const applyPlotWallThickness = (side, inches) => {
+    const res = setPlotWallThickness(layout, side, inches);
+    if (res.reason) { notify(res.reason); return; }
+    if (res.layout === layout) return;
+    updateLayoutAndRecord(res.layout);
+    if (res.overlapping.length) {
+      const names = [...new Set(res.overlapping.map((o) => o.name))].slice(0, 3).join(', ');
+      notify(`This plot wall now overlaps: ${names}. The building was not changed.`);
+    }
+  };
+
+  const renderPlotWallInspector = (data) => {
+    const side = data.side;
+    const title = `${side.charAt(0).toUpperCase()}${side.slice(1)} Plot Wall`;
+    const outer = getPlotRect(layout);
+    const inner = getPlotInnerRect(layout);
+    const outerLength = side === 'north' || side === 'south' ? outer.width : outer.length;
+
+    return (
+      <View key={`inspector-plot-wall-${side}`} style={styles.inspectorContent}>
+        <View style={styles.elemHeader}>
+          <Ionicons name="reorder-four-outline" size={18} color="#D97706" />
+          <Text style={styles.elemTitle}>{title}</Text>
+        </View>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.inputLabel}>Thickness</Text>
+          <WallThicknessSelect
+            inches={getPlotWallThicknesses(layout)[side]}
+            onChange={(inches) => applyPlotWallThickness(side, inches)}
+            label={`${title} thickness`}
+            testID="plot-wall-thickness"
+          />
+        </View>
+        <Text style={styles.hintText}>The outer face stays on the plot boundary and the wall grows inward. The plot size and the building do not change.</Text>
+
+        <View style={styles.statBox}>
+          <View style={styles.rowBetween}>
+            <Text style={styles.statLabel}>Outer length:</Text>
+            <Text style={styles.statValue}>{formatMeasurement(outerLength, unit)}</Text>
+          </View>
+          <View style={[styles.rowBetween, { marginTop: 4 }]}>
+            <Text style={styles.statLabel}>Plot size:</Text>
+            <Text style={styles.statValue}>{formatMeasurement(outer.width, unit)} × {formatMeasurement(outer.length, unit)}</Text>
+          </View>
+          <View style={[styles.rowBetween, { marginTop: 4 }]}>
+            <Text style={styles.statLabel}>Inside the walls:</Text>
+            <Text style={styles.statValue}>{formatMeasurement(inner.width, unit)} × {formatMeasurement(inner.length, unit)}</Text>
+          </View>
+        </View>
       </View>
     );
   };
@@ -1004,6 +1094,35 @@ export default function EditorRightPanel({
         )}
         <Text style={styles.hintText}>Only the plot boundary changes; the building stays exactly where it is. On the canvas, drag the orange edge handles; hold Shift to resize symmetrically.</Text>
 
+        {/* Plot boundary walls: each side is independent */}
+        <Text style={styles.subHeading}>Plot Walls</Text>
+        <View style={styles.rowTwo}>
+          {PLOT_WALL_SIDES.slice(0, 2).map((side) => (
+            <View key={`pw-${side}`} style={[styles.inputGroup, { flex: 1 }]}>
+              <Text style={styles.inputLabel}>{side === 'north' ? 'North' : 'South'}</Text>
+              <WallThicknessSelect
+                inches={getPlotWallThicknesses(layout)[side]}
+                onChange={(inches) => applyPlotWallThickness(side, inches)}
+                label={`${side} plot wall thickness`}
+                testID={`plot-wall-${side}`}
+              />
+            </View>
+          ))}
+        </View>
+        <View style={styles.rowTwo}>
+          {PLOT_WALL_SIDES.slice(2).map((side) => (
+            <View key={`pw-${side}`} style={[styles.inputGroup, { flex: 1 }]}>
+              <Text style={styles.inputLabel}>{side === 'east' ? 'East' : 'West'}</Text>
+              <WallThicknessSelect
+                inches={getPlotWallThicknesses(layout)[side]}
+                onChange={(inches) => applyPlotWallThickness(side, inches)}
+                label={`${side} plot wall thickness`}
+                testID={`plot-wall-${side}`}
+              />
+            </View>
+          ))}
+        </View>
+
         {/* Setbacks (editable - the building reflows to the new buildable area) */}
         <Text style={styles.subHeading}>Setbacks</Text>
         <View style={styles.rowTwo}>
@@ -1217,7 +1336,9 @@ export default function EditorRightPanel({
         {tab === 'validation' ? (
           renderValidationTab()
         ) : selectedElement ? (
-          selectedElement.type === 'room' ? (
+          selectedElement.type === 'plotWall' ? (
+            renderPlotWallInspector(selectedElement.data)
+          ) : selectedElement.type === 'room' ? (
             renderRoomInspector(selectedElement.data)
           ) : selectedElement.type === 'wall' ? (
             renderWallInspector(selectedElement.data)

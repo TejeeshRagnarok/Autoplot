@@ -2,6 +2,9 @@ import React, { useState } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, useWindowDimensions, ScrollView, Platform } from 'react-native';
 import { lightTheme as staticTheme } from '../constants/theme';
 import { Ionicons } from '@expo/vector-icons';
+import { getPlotWallBorderStyle } from './editor/siteGeometry';
+import { exportAsPDF, generateLayoutSVG, getSvgSheetSize, PLAN_VIEW } from './editor/exportUtils';
+import { generateStructuredLayoutFromState } from './editor/layoutBridge';
 
 export default function Canvas2D({ language, state, theme: propTheme, onOpenEditor, layoutData }) {
   const { width: SCREEN_WIDTH } = useWindowDimensions();
@@ -77,6 +80,16 @@ export default function Canvas2D({ language, state, theme: propTheme, onOpenEdit
 
   // Dynamic canvas height to fit everything and avoid any vertical overlaps
   const CANVAS_HEIGHT = Math.max(620, currentPlotHeight + 160);
+
+  // On web this tab shows the edited layout, drawn by the same code as the PDF, so
+  // the screen, the file, and the editor are one plan. Native keeps the drawing
+  // below, which has no SVG dependency.
+  const planView = { ...PLAN_VIEW, showGrid, showLabels, showFurniture, showCirculation };
+  const planLayout = Platform.OS === 'web' ? (layoutData || generateStructuredLayoutFromState(state)) : null;
+  const planSvg = planLayout ? generateLayoutSVG(planLayout, 'ft-in', planView) : null;
+  const planSheet = planSvg ? getSvgSheetSize(planSvg) : null;
+  // The drawing is 20 px per foot; keep this tab's existing fit and zoom.
+  const planPxPerPx = pxPerFt / 20;
 
   const getUtilityCoords = (location, utilityType) => {
     if (!location) return { x: 0, y: 0, w: 0, h: 0 };
@@ -1645,6 +1658,20 @@ export default function Canvas2D({ language, state, theme: propTheme, onOpenEdit
                 {isTe ? "లేఅవుట్ ఎడిట్ చేయండి" : "Edit Layout"}
               </Text>
             </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.editLayoutBtn, { marginLeft: 8 }]}
+              onPress={async () => {
+                const ok = await exportAsPDF(layoutData || generateStructuredLayoutFromState(state), 'ft-in', planView);
+                if (!ok) alert(isTe ? "PDF సృష్టించడం సాధ్యం కాలేదు." : "The PDF could not be created. Please try again.");
+              }}
+              activeOpacity={0.8}
+            >
+              <Ionicons name="download-outline" size={13} color="#FFFFFF" style={{ marginRight: 5 }} />
+              <Text style={styles.editLayoutBtnText}>
+                {isTe ? "PDF డౌన్‌లోడ్" : "Download PDF"}
+              </Text>
+            </TouchableOpacity>
           </View>
         </ScrollView>
       </View>
@@ -1653,7 +1680,14 @@ export default function Canvas2D({ language, state, theme: propTheme, onOpenEdit
       <View style={[styles.canvasContainer, Platform.OS === 'web' ? { flex: 1 } : { height: CANVAS_HEIGHT }]}>
         <ScrollView style={styles.scrollV} contentContainerStyle={styles.scrollContentV}>
           <ScrollView horizontal style={styles.scrollH} contentContainerStyle={styles.scrollContentH}>
-            
+
+            {planSvg ? (
+              <div
+                data-testid="plan-drawing"
+                style={{ width: planSheet.width * planPxPerPx, height: planSheet.height * planPxPerPx, flexShrink: 0, backgroundColor: '#FFFFFF' }}
+                dangerouslySetInnerHTML={{ __html: planSvg }}
+              />
+            ) : (
             <View style={[styles.draftSheet, { width: currentPlotWidth + 80, height: CANVAS_HEIGHT - 60 }]}>
               <View style={[
                 styles.rotateWrapper,
@@ -1676,6 +1710,13 @@ export default function Canvas2D({ language, state, theme: propTheme, onOpenEdit
                       ))}
                     </View>
                   )}
+
+                  {/* Plot boundary walls, each side at its own thickness */}
+                  <View
+                    testID="plot-walls-2d"
+                    pointerEvents="none"
+                    style={[StyleSheet.absoluteFill, getPlotWallBorderStyle(layoutData, pxPerFt)]}
+                  />
 
                   {/* Vastu Quadrant Compass Badges (NE, NW, SE, SW) in Plot corners */}
                   <View style={[styles.quadrantBadge, { top: 6, right: 6 }]}><Text style={styles.quadrantText}>NE</Text></View>
@@ -1849,6 +1890,7 @@ export default function Canvas2D({ language, state, theme: propTheme, onOpenEdit
               </View>
 
             </View>
+            )}
 
           </ScrollView>
         </ScrollView>
@@ -1862,6 +1904,10 @@ export default function Canvas2D({ language, state, theme: propTheme, onOpenEdit
             <View style={styles.legendItem}>
               <View style={[styles.legendBox, { backgroundColor: '#0F172A', borderWidth: 0 }]} />
               <Text style={styles.legendText}>{isTe ? "నివాస కాంక్రీట్ గోడ" : "CAD Solid Wall"}</Text>
+            </View>
+            <View style={styles.legendItem}>
+              <View style={[styles.legendBox, { backgroundColor: 'transparent', borderColor: '#64748B', borderWidth: 3 }]} />
+              <Text style={styles.legendText}>{isTe ? "స్థలం సరిహద్దు గోడ" : "Plot Boundary Wall"}</Text>
             </View>
             <View style={styles.legendItem}>
               <View style={[styles.legendBox, { backgroundColor: '#0EA5E9', borderColor: '#0284C7' }]} />

@@ -315,6 +315,7 @@ export default function App() {
             state={state}
             theme={currentTheme}
             onOpenEditor={handleOpenEditor}
+            layoutData={layoutData}
           />
         );
       case 'tables':

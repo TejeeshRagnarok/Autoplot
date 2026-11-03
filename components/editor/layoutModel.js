@@ -4,9 +4,29 @@
  */
 
 import { entityBounds } from './cadGeometry.js';
-import { getPlotRect } from './siteGeometry.js';
+import {
+  DEFAULT_PLOT_WALL_THICKNESS_IN,
+  PLOT_WALL_SIDES,
+  findPlotWallAt,
+  getPlotInnerRect,
+  getPlotRect,
+  getPlotWallBorderStyle,
+  getPlotWallData,
+  getPlotWallPolygons,
+  getPlotWallThicknesses,
+} from './siteGeometry.js';
 
-export { getPlotRect };
+export {
+  DEFAULT_PLOT_WALL_THICKNESS_IN,
+  PLOT_WALL_SIDES,
+  findPlotWallAt,
+  getPlotInnerRect,
+  getPlotRect,
+  getPlotWallBorderStyle,
+  getPlotWallData,
+  getPlotWallPolygons,
+  getPlotWallThicknesses,
+};
 
 let idCounter = 1000;
 export function generateUniqueId(prefix = 'elem') {
@@ -33,6 +53,19 @@ export const WALL_THICKNESS = {
   INTERIOR: 0.375, // 4.5 inches in feet
   PARTITION: 0.25, // 3 inches in feet
 };
+
+// Thicknesses offered when drawing or editing a wall, in inches.
+export const WALL_THICKNESS_OPTIONS = [2, 3, 4, 5, 6, 7, 8];
+export const DEFAULT_WALL_THICKNESS_IN = 6;
+
+export const inchesToFeet = (inches) => Number(inches) / 12;
+export const feetToInches = (feet) => Math.round(Number(feet) * 12 * 100) / 100;
+
+/** A wall's thickness in inches; older walls only stored it in feet. */
+export function getWallThicknessInches(wall) {
+  const stored = Number(wall?.thicknessInches);
+  return Number.isFinite(stored) && stored > 0 ? stored : feetToInches(wall?.thickness);
+}
 
 export const ROOM_PALETTE = [
   '#F0FDF4', // Soft mint / sage
@@ -75,6 +108,12 @@ export function createDefaultLayout(siteParams = {}) {
         north: northO,
         south: southO,
       },
+      boundaryWalls: {
+        north: DEFAULT_PLOT_WALL_THICKNESS_IN,
+        south: DEFAULT_PLOT_WALL_THICKNESS_IN,
+        east: DEFAULT_PLOT_WALL_THICKNESS_IN,
+        west: DEFAULT_PLOT_WALL_THICKNESS_IN,
+      },
     },
     footprint: {
       x: westO,
@@ -97,10 +136,16 @@ export function createDefaultLayout(siteParams = {}) {
 }
 
 /**
- * Create a wall object
+ * Create a wall object. x1/y1 to x2/y2 is the centreline. `thicknessInches` is
+ * the real-world thickness; `thickness` is the same value in feet, the unit of
+ * all editor geometry. Pass either one.
  */
 export function createWall(params = {}) {
-  const thickness = params.thickness !== undefined ? params.thickness : (params.type === 'exterior' ? WALL_THICKNESS.EXTERIOR : WALL_THICKNESS.INTERIOR);
+  const fallbackFeet = params.type === 'exterior' ? WALL_THICKNESS.EXTERIOR : WALL_THICKNESS.INTERIOR;
+  const hasInches = params.thicknessInches !== undefined;
+  const thickness = hasInches
+    ? inchesToFeet(params.thicknessInches)
+    : (params.thickness !== undefined ? params.thickness : fallbackFeet);
   return {
     id: params.id || generateUniqueId('wall'),
     type: params.type || 'interior', // 'exterior' | 'interior' | 'partition'
@@ -109,6 +154,7 @@ export function createWall(params = {}) {
     x2: Number(params.x2 || 0),
     y2: Number(params.y2 || 0),
     thickness: Number(thickness),
+    thicknessInches: hasInches ? Number(params.thicknessInches) : feetToInches(thickness),
     isLocked: !!params.isLocked,
     color: params.color || '#0F172A',
   };
@@ -357,7 +403,7 @@ export function splitWallAtPoint(wall, point) {
  */
 export function canJoinWalls(w1, w2, tolerance = 0.2) {
   if (!w1 || !w2 || w1.id === w2.id) return false;
-  if (Math.abs(w1.thickness - w2.thickness) > 0.1) return false;
+  if (Math.abs(w1.thickness - w2.thickness) > 0.01) return false;
 
   // Check shared endpoints
   const endpoints = [
@@ -676,6 +722,44 @@ export function resizePlotBoundary(layout, change = {}) {
 }
 
 /**
+ * Set the thickness of one plot wall. Only the plot changes: every building list
+ * is carried over by reference, and the plot's size and position stay the same.
+ * @param {'north'|'south'|'east'|'west'} side
+ * @param {number} inches one of WALL_THICKNESS_OPTIONS
+ * @returns {{layout:object, overlapping:Array, reason:string|null}}
+ */
+export function setPlotWallThickness(layout, side, inches) {
+  if (!layout?.plot || !PLOT_WALL_SIDES.includes(side)) {
+    return { layout, overlapping: [], reason: 'Plot wall not found.' };
+  }
+  if (!WALL_THICKNESS_OPTIONS.includes(inches)) {
+    return { layout, overlapping: [], reason: `Wall thickness must be one of ${WALL_THICKNESS_OPTIONS.join(', ')} inches.` };
+  }
+  const current = getPlotWallThicknesses(layout);
+  if (current[side] === inches && layout.plot.boundaryWalls) {
+    return { layout, overlapping: [], reason: null };
+  }
+  const next = {
+    ...layout,
+    plot: { ...layout.plot, boundaryWalls: { ...current, [side]: inches } },
+    updatedAt: new Date().toISOString(),
+  };
+  return { layout: next, overlapping: findElementsInPlotWalls(next), reason: null };
+}
+
+/**
+ * Objects inside the plot but crossing a plot wall's inner face. Diagnostic only:
+ * a plot wall never moves the building.
+ * @returns {Array<{type:string,id:string,name:string}>}
+ */
+export function findElementsInPlotWalls(layout) {
+  const margin = 0.02;
+  const outsidePlot = new Set(findElementsOutsidePlot(layout, margin).map((o) => `${o.type}:${o.id}`));
+  return findElementsOutsidePlot(layout, margin, getPlotInnerRect(layout))
+    .filter((o) => !outsidePlot.has(`${o.type}:${o.id}`));
+}
+
+/**
  * Warning text naming the objects a plot resize left outside the boundary.
  * @param {Array<{name:string}>} outside result of findElementsOutsidePlot
  */
@@ -720,10 +804,11 @@ export function resizePlot(layout, axis, feet, options = {}) {
 /**
  * Identify elements that fall outside the (possibly resized) plot boundary.
  * Diagnostic only: it never moves, resizes, or deletes anything.
+ * @param {object} [rect] area to test against; defaults to the plot boundary
  * @returns {Array<{type:string,id:string,name:string}>}
  */
-export function findElementsOutsidePlot(layout, margin = 0.2) {
-  const { x0, y0, x1, y1 } = getPlotRect(layout, { width: 0, length: 0 });
+export function findElementsOutsidePlot(layout, margin = 0.2, rect = null) {
+  const { x0, y0, x1, y1 } = rect || getPlotRect(layout, { width: 0, length: 0 });
   const out = [];
 
   const boxOutside = (minX, minY, maxX, maxY) => (
@@ -745,7 +830,9 @@ export function findElementsOutsidePlot(layout, margin = 0.2) {
   (layout?.utilities || []).forEach((u) => checkRect(u, 'utility', u.name || 'Utility'));
 
   (layout?.walls || []).forEach((w) => {
-    if (pointOutside(w.x1, w.y1) || pointOutside(w.x2, w.y2)) {
+    // Measured to the wall's faces, not just its centreline.
+    const half = (Number(w.thickness) || 0) / 2;
+    if (boxOutside(Math.min(w.x1, w.x2) - half, Math.min(w.y1, w.y2) - half, Math.max(w.x1, w.x2) + half, Math.max(w.y1, w.y2) + half)) {
       out.push({ type: 'wall', id: w.id, name: 'Wall' });
     }
   });

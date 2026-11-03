@@ -12,7 +12,19 @@
  * from the host wall; `rotation` only applies to an opening without a host.
  */
 
-import { createWall, generateUniqueId, getWallOrientation, splitWallAtPoint, joinWalls, cloneLayout } from './layoutModel.js';
+import {
+  DEFAULT_WALL_THICKNESS_IN,
+  WALL_THICKNESS_OPTIONS,
+  cloneLayout,
+  createWall,
+  feetToInches,
+  findElementsOutsidePlot,
+  generateUniqueId,
+  getWallOrientation,
+  inchesToFeet,
+  joinWalls,
+  splitWallAtPoint,
+} from './layoutModel.js';
 import { findHostWall } from './constraintEngine.js';
 import { moveWallBoundary } from './roomResize.js';
 
@@ -20,6 +32,7 @@ export const MIN_WALL_LENGTH = 0.25; // ft
 export const MIN_OPENING_WIDTH = 1; // ft
 const CONNECT_TOL = 0.05;
 const OPENING_GAP = 0.25; // ft of wall kept between two openings
+const KEEP_WALL_MARGIN = 0.5; // ft another wall must be closer by before a dragged opening changes wall
 const round4 = (v) => Math.round(v * 10000) / 10000;
 
 const wallLen = (w) => Math.hypot(w.x2 - w.x1, w.y2 - w.y1);
@@ -85,11 +98,11 @@ export function getOpeningGeometry(opening, walls) {
 }
 
 /** Occupied [start, end] spans (ft along the wall) of the other openings on a wall. */
-function occupiedSpans(layout, wall, excludeId) {
+function occupiedSpans(layout, wall, excludeId, ignoreIds = null) {
   const len = wallLen(wall);
   const spans = [];
   for (const o of [...(layout.doors || []), ...(layout.windows || [])]) {
-    if (o.id === excludeId) continue;
+    if (o.id === excludeId || ignoreIds?.has(o.id)) continue;
     const host = getOpeningHost(o, [wall], 0.05);
     if (!host) continue;
     const c = host.t * len;
@@ -100,13 +113,13 @@ function occupiedSpans(layout, wall, excludeId) {
 }
 
 /** Closest centre to `wanted` where an opening fits on the wall, or null. */
-function resolveCentreOnWall(layout, wall, wanted, width, excludeId) {
+function resolveCentreOnWall(layout, wall, wanted, width, excludeId, ignoreIds = null) {
   const len = wallLen(wall);
   if (width > len + 1e-6) return null;
   const half = width / 2;
   const lo = half;
   const hi = len - half;
-  const spans = occupiedSpans(layout, wall, excludeId);
+  const spans = occupiedSpans(layout, wall, excludeId, ignoreIds);
   // Free intervals for the centre point
   const free = [];
   let cursor = lo;
@@ -127,9 +140,13 @@ function resolveCentreOnWall(layout, wall, wanted, width, excludeId) {
 /**
  * Where an opening goes when the pointer is at `point`: the nearest wall within
  * `maxDist`, clamped inside the wall and clear of other openings.
+ * @param {boolean} [options.nearestOnly] use only the closest wall, so a drag never
+ *   jumps to some other wall just because the closest one has no room
+ * @param {Set<string>} [options.ignoreIds] openings that do not count as obstacles
+ * @param {string} [options.preferWallId] stay on this wall unless another is clearly closer
  * @returns {{x,y,wallId,rotation}|null}
  */
-export function placeOpeningOnWall(layout, opening, point, { maxDist = 1.5, onlyWallId = null } = {}) {
+export function placeOpeningOnWall(layout, opening, point, { maxDist = 1.5, onlyWallId = null, nearestOnly = false, ignoreIds = null, preferWallId = null } = {}) {
   const width = Number(opening.width) || 0;
   const candidates = [];
   for (const w of layout.walls || []) {
@@ -142,9 +159,12 @@ export function placeOpeningOnWall(layout, opening, point, { maxDist = 1.5, only
     const d = Math.hypot(point.x - px, point.y - py);
     if (d <= maxDist) candidates.push({ w, d, along: t * len, len });
   }
-  candidates.sort((p, q) => p.d - q.d);
-  for (const { w, along, len } of candidates) {
-    const c = resolveCentreOnWall(layout, w, along, width, opening.id);
+  // Grid snapping moves the pointer slightly, which must not hop an opening onto
+  // a neighbouring wall a fraction of an inch away.
+  const rank = (c) => (c.w.id === preferWallId ? Math.max(0, c.d - KEEP_WALL_MARGIN) : c.d);
+  candidates.sort((p, q) => rank(p) - rank(q));
+  for (const { w, along, len } of nearestOnly ? candidates.slice(0, 1) : candidates) {
+    const c = resolveCentreOnWall(layout, w, along, width, opening.id, ignoreIds);
     if (c === null) continue;
     const t = c / len;
     return {
@@ -162,12 +182,36 @@ function replaceOpening(layout, kind, id, patch) {
   return { ...layout, [key]: (layout[key] || []).map((o) => (o.id === id ? { ...o, ...patch } : o)) };
 }
 
-/** Drag / reposition an opening; it can only sit on a wall. */
+/** Openings already overlapping this one, on the wall it sits on. */
+function openingsOverlapping(layout, o) {
+  const host = getOpeningHost(o, layout.walls);
+  if (!host) return new Set();
+  const halfWidth = (Number(o.width) || 0) / 2;
+  const centre = host.t * wallLen(host.wall);
+  const ids = new Set();
+  for (const other of [...(layout.doors || []), ...(layout.windows || [])]) {
+    if (other.id === o.id) continue;
+    const onWall = getOpeningHost(other, [host.wall], 0.05);
+    if (!onWall) continue;
+    const reach = halfWidth + (Number(other.width) || 0) / 2;
+    if (Math.abs(onWall.t * wallLen(host.wall) - centre) < reach) ids.add(other.id);
+  }
+  return ids;
+}
+
+/**
+ * Drag / reposition an opening; it can only sit on a wall. Openings it already
+ * overlaps don't block it, or stacked openings could never be pulled apart.
+ */
 export function moveOpening(layout, kind, id, point, options = {}) {
   const o = (layout[collectionOf(kind)] || []).find((e) => e.id === id);
   if (!o) return { layout, moved: false, reason: 'Opening not found.' };
   if (o.isLocked) return { layout, moved: false, reason: 'This opening is locked.' };
-  const place = placeOpeningOnWall(layout, o, point, options);
+  const place = placeOpeningOnWall(layout, o, point, {
+    preferWallId: getOpeningHost(o, layout.walls)?.wall.id ?? null,
+    ...options,
+    ignoreIds: openingsOverlapping(layout, o),
+  });
   if (!place) return { layout, moved: false, reason: 'A door or window must sit on a wall with enough free length.' };
   return { layout: replaceOpening(layout, kind, id, place), moved: true, reason: null };
 }
@@ -372,9 +416,133 @@ export function moveWallBody(layout, wallId, dx, dy, { allowDiagonal = false } =
   return { layout: reattachOpenings(layout, { ...layout, walls }), reason: null, clamped: false };
 }
 
-/** Patch wall properties (type, thickness) as a single edit. */
+/** Patch wall properties (type, thickness in feet) as a single edit. */
 export function setWallProps(layout, wallId, patch) {
-  return { ...layout, walls: (layout.walls || []).map((w) => (w.id === wallId ? { ...w, ...patch } : w)) };
+  const full = patch.thickness !== undefined ? { ...patch, thicknessInches: feetToInches(patch.thickness) } : patch;
+  return { ...layout, walls: (layout.walls || []).map((w) => (w.id === wallId ? { ...w, ...full } : w)) };
+}
+
+/** Do two walls lie along the same line and overlap, making them one physical wall? */
+function wallsOverlap(a, b) {
+  const len = wallLen(a);
+  if (len < 1e-6) return false;
+  const ux = (a.x2 - a.x1) / len;
+  const uy = (a.y2 - a.y1) / len;
+  const offLine = (x, y) => Math.abs((x - a.x1) * uy - (y - a.y1) * ux);
+  if (offLine(b.x1, b.y1) > CONNECT_TOL || offLine(b.x2, b.y2) > CONNECT_TOL) return false;
+  const along = (x, y) => (x - a.x1) * ux + (y - a.y1) * uy;
+  const s1 = along(b.x1, b.y1);
+  const s2 = along(b.x2, b.y2);
+  return Math.min(len, Math.max(s1, s2)) - Math.max(0, Math.min(s1, s2)) > CONNECT_TOL;
+}
+
+/**
+ * Set a wall's thickness. The centreline stays where it is, so length, direction,
+ * connections, hosted openings and room dimensions are all preserved. Generated
+ * layouts can hold several segments along one physical wall; those overlapping
+ * segments change together, or the wall would keep its old thickness on screen.
+ * @param {number} inches one of WALL_THICKNESS_OPTIONS
+ * @returns {{layout:object, updatedIds:string[], outside:boolean, reason:string|null}}
+ */
+export function setWallThickness(layout, wallId, inches) {
+  const walls = layout.walls || [];
+  const target = walls.find((w) => w.id === wallId);
+  if (!target) return { layout, updatedIds: [], outside: false, reason: 'Wall not found.' };
+  if (target.isLocked) return { layout, updatedIds: [], outside: false, reason: 'This wall is locked.' };
+  if (!WALL_THICKNESS_OPTIONS.includes(inches)) {
+    return { layout, updatedIds: [], outside: false, reason: `Wall thickness must be one of ${WALL_THICKNESS_OPTIONS.join(', ')} inches.` };
+  }
+
+  const ids = new Set([wallId]);
+  const queue = [target];
+  while (queue.length) {
+    const current = queue.pop();
+    for (const w of walls) {
+      if (!ids.has(w.id) && !w.isLocked && wallsOverlap(current, w)) {
+        ids.add(w.id);
+        queue.push(w);
+      }
+    }
+  }
+
+  const feet = inchesToFeet(inches);
+  const needsChange = (w) => ids.has(w.id) && (w.thickness !== feet || w.thicknessInches !== inches);
+  if (!walls.some(needsChange)) return { layout, updatedIds: [], outside: false, reason: null };
+
+  const next = { ...layout, walls: walls.map((w) => (needsChange(w) ? { ...w, thickness: feet, thicknessInches: inches } : w)) };
+  const outside = findElementsOutsidePlot(next).some((o) => o.type === 'wall' && ids.has(o.id));
+  return { layout: next, updatedIds: [...ids], outside, reason: null };
+}
+
+const PERPENDICULAR_DOT = 0.2; // within about 11.5 degrees of square
+const COLLINEAR_DOT = 0.98;
+
+/**
+ * The real outline of a wall: a rectangle around its centreline, with its true
+ * thickness and length. At a square corner each wall runs on to the other's
+ * outer face, so the outside corner is closed with no notch or overlap. An angled
+ * junction gets a round joint for the same reason.
+ * @returns {{polygon:{x:number,y:number}[], joints:{x:number,y:number,r:number}[]}}
+ */
+export function getWallShape(wall, walls = []) {
+  const len = wallLen(wall);
+  if (len < 1e-6) return { polygon: [], joints: [] };
+  const ux = (wall.x2 - wall.x1) / len;
+  const uy = (wall.y2 - wall.y1) / len;
+  const half = (Number(wall.thickness) || 0) / 2;
+  const joints = [];
+
+  // How far the wall runs past this end to meet a square corner's outer face.
+  const endExtension = (px, py, outX, outY) => {
+    const square = [];
+    let continues = false;
+    let angled = false;
+    for (const other of walls) {
+      if (other.id === wall.id) continue;
+      const atStart = Math.hypot(other.x1 - px, other.y1 - py) <= CONNECT_TOL;
+      const atEnd = Math.hypot(other.x2 - px, other.y2 - py) <= CONNECT_TOL;
+      if (!atStart && !atEnd) continue;
+      const otherLen = wallLen(other);
+      if (otherLen < 1e-6) continue;
+      const sign = atStart ? 1 : -1;
+      const vx = (sign * (other.x2 - other.x1)) / otherLen;
+      const vy = (sign * (other.y2 - other.y1)) / otherLen;
+      const dot = vx * outX + vy * outY;
+      if (dot > COLLINEAR_DOT) continues = true;
+      else if (Math.abs(dot) < PERPENDICULAR_DOT) square.push({ vx, vy, half: (Number(other.thickness) || 0) / 2 });
+      else if (dot >= -COLLINEAR_DOT) angled = true;
+    }
+    if (angled) joints.push({ x: px, y: py, r: half });
+    if (continues || square.length === 0) return 0;
+    // Square walls on both sides form a T that this wall butts into.
+    const throughWall = square.some((a) => square.some((b) => a.vx * b.vx + a.vy * b.vy < 0));
+    return throughWall ? 0 : Math.max(...square.map((s) => s.half));
+  };
+
+  const extStart = endExtension(wall.x1, wall.y1, -ux, -uy);
+  const extEnd = endExtension(wall.x2, wall.y2, ux, uy);
+  const sx = wall.x1 - ux * extStart;
+  const sy = wall.y1 - uy * extStart;
+  const ex = wall.x2 + ux * extEnd;
+  const ey = wall.y2 + uy * extEnd;
+  const nx = -uy * half;
+  const ny = ux * half;
+  return {
+    polygon: [
+      { x: sx + nx, y: sy + ny },
+      { x: ex + nx, y: ey + ny },
+      { x: ex - nx, y: ey - ny },
+      { x: sx - nx, y: sy - ny },
+    ],
+    joints,
+  };
+}
+
+/** Outline of every wall, keyed by wall id. */
+export function getWallShapes(walls = []) {
+  const shapes = new Map();
+  for (const w of walls) shapes.set(w.id, getWallShape(w, walls));
+  return shapes;
 }
 
 /** Split a wall at a point on it. Hosted openings move to the segment they sit on. */
@@ -425,7 +593,8 @@ export function joinWallPair(layout, idA, idB) {
 /** New wall between two points, or null when the points coincide. */
 export function buildWall(start, end, params = {}) {
   if (Math.hypot(end.x - start.x, end.y - start.y) < MIN_WALL_LENGTH) return null;
-  return createWall({ id: generateUniqueId('wall'), type: 'interior', ...params, x1: round4(start.x), y1: round4(start.y), x2: round4(end.x), y2: round4(end.y) });
+  const thickness = params.thickness === undefined && params.thicknessInches === undefined ? { thicknessInches: DEFAULT_WALL_THICKNESS_IN } : {};
+  return createWall({ id: generateUniqueId('wall'), type: 'interior', ...thickness, ...params, x1: round4(start.x), y1: round4(start.y), x2: round4(end.x), y2: round4(end.y) });
 }
 
 /** Constrain a draw / drag point to horizontal or vertical from `from`. */

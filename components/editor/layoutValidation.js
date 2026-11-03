@@ -10,7 +10,7 @@
  * - Vastu advisory notifications
  */
 
-import { calculateWallLength, findElementsOutsidePlot } from './layoutModel.js';
+import { calculateWallLength, findElementsInPlotWalls, findElementsOutsidePlot } from './layoutModel.js';
 import { validateStaircaseFit } from './staircaseGeometry.js';
 import { validateOpenings } from './constraintEngine.js';
 
@@ -192,6 +192,18 @@ export function validateLayout(layout) {
         message: `${o.name} extends beyond the plot boundary (${plotW}' × ${plotL}').`,
       });
     });
+
+  // 6c. Objects crossing the inner face of a plot wall
+  findElementsInPlotWalls(layout).forEach((o) => {
+    issues.push({
+      id: `issue-plot-wall-${o.type}-${o.id}`,
+      elementId: o.id,
+      elementType: o.type,
+      severity: SEVERITY.WARNING,
+      title: 'Object Overlaps Plot Wall',
+      message: `${o.name} overlaps a plot boundary wall.`,
+    });
+  });
 
   // 7. Staircase drafting guidelines (geometric checks only)
   (layout.staircases || []).forEach((st) => {

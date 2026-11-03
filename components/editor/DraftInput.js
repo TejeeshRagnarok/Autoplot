@@ -1,10 +1,4 @@
-/**
- * Inspector input with a clear split between its temporary typing state and the
- * committed geometry value. While the field is being edited only the draft
- * changes; the value is committed once, on blur or Enter, and only when the text
- * really differs from what was displayed. Escape abandons the draft, and invalid
- * text is rejected with a message rather than silently changing anything.
- */
+
 
 import React, { useRef, useState } from 'react';
 import { Text, TextInput, View } from 'react-native';

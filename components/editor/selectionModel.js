@@ -53,6 +53,20 @@ export function dimensionLine(d) {
   return { x1: d.x1 + nx, y1: d.y1 + ny, x2: d.x2 + nx, y2: d.y2 + ny };
 }
 
+/** Is a point on a door's drawn leaf or swing arc? Those are what a user sees and clicks. */
+function isOnDoorSwing(p, geometry, tol) {
+  return geometry.leaves.some((leaf) => {
+    if (projectToSegment(p, leaf.hinge, leaf.tip).distance <= tol) return true;
+    const vx = p.x - leaf.hinge.x;
+    const vy = p.y - leaf.hinge.y;
+    if (Math.abs(Math.hypot(vx, vy) - leaf.radius) > tol) return false;
+    // On the circle: keep only the quarter between the open leaf and the closed position.
+    const towardTip = vx * (leaf.tip.x - leaf.hinge.x) + vy * (leaf.tip.y - leaf.hinge.y);
+    const towardFree = vx * (leaf.free.x - leaf.hinge.x) + vy * (leaf.free.y - leaf.hinge.y);
+    return towardTip >= 0 && towardFree >= 0;
+  });
+}
+
 /**
  * Every element under a world point, best candidate first.
  * @returns {Array<{type, data, rank}>}
@@ -72,6 +86,7 @@ export function hitTestAll(layout, wx, wy, scale, { includePlot = true } = {}) {
       const along = Math.abs(rx * g.ux + ry * g.uy);
       const across = Math.abs(rx * g.nx + ry * g.ny);
       if (along <= g.width / 2 + tol && across <= g.thickness / 2 + tol) add(type, o, across);
+      else if (type === 'door' && isOnDoorSwing(p, g, tol)) add(type, o, tol);
     }
   }
   for (const a of layout.annotations || []) {
@@ -183,7 +198,7 @@ export function boxSelect(layout, start, end, scale) {
 export function selectionItems(selected) {
   if (!selected) return [];
   if (selected.type === 'multi') return selected.data.items;
-  if (selected.type === 'plot') return [];
+  if (selected.type === 'plot' || selected.type === 'plotWall') return [];
   if (selected.type === 'dimension' && isPlotDimension(selected.data?.id)) return [];
   return selected.data?.id ? [{ type: selected.type, id: selected.data.id }] : [];
 }

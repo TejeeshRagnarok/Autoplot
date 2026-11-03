@@ -1,20 +1,6 @@
-/**
- * AutoPlot Interactive 2D Architectural CAD Canvas
- * Features:
- * - Real world coordinates (feet) <-> screen pixel transformation
- * - Mouse wheel zoom centered at cursor & mouse drag panning
- * - Rulers (Top & Left) with real-world unit tick marks
- * - Grid with toggleable snapping (endpoint, midpoint, center, intersection, perpendicular, wall, room, site, grid)
- * - Hit detection, box selection and multi-selection for all architectural elements
- * - Live interactive handles (Wall endpoints, Room resize corners, Door/Window jambs, Entity vertices)
- * - Drawing tools: Wall, Room, Line, Polyline, Rectangle, Circle, Arc, Polygon, Door, Window, Staircase, Column, Parking, Text, Dimension, Measure
- * - Modify tools: Move, Copy, Rotate, Mirror, Scale, Offset, Trim, Extend, Fillet, Chamfer, Stretch, Break, Polar Array, Delete
- *
- * Every drag is solved from the geometry captured at pointer-down, so nothing
- * accumulates between pointer moves and the result does not depend on zoom.
- */
 
-import React, { useRef, useState, useEffect, useCallback } from 'react';
+
+import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { Platform } from 'react-native';
 import {
   snapValue,
@@ -34,9 +20,14 @@ import {
   checkRoomPlotFit,
   findRoomSnapping,
   createRoomBoundaryWalls,
+  DEFAULT_WALL_THICKNESS_IN,
+  inchesToFeet,
   resizePlotBoundary,
   describeOutsidePlot,
+  findPlotWallAt,
   getPlotRect,
+  getPlotWallData,
+  getPlotWallPolygons,
   calculateStaircaseGeometry,
   getStaircaseBounds,
   resizeStaircaseWorld,
@@ -53,6 +44,8 @@ import {
 import {
   buildWall,
   getOpeningGeometry,
+  getWallShape,
+  getWallShapes,
   moveOpening,
   moveWallBody,
   moveWallEndpointTo,
@@ -92,6 +85,7 @@ import {
   annotationBox,
   boxSelect,
   hitTestAll,
+  STROKE_PICK_PX,
   dimensionLine,
   isItemSelected,
   nextOverlappingHit,
@@ -105,6 +99,7 @@ import { pointAtAngle, arcSweep } from './cadGeometry';
 
 const DRAG_THRESHOLD_PX = 3;
 const OPENING_PICK_PX = 40;
+const isOpening = (type) => type === 'door' || type === 'window';
 const OUTLINE_PICK_PX = 8;
 const HANDLE_PICK_PX = 10;
 
@@ -128,6 +123,7 @@ export default function EditorCanvas({
   allowDiagonal = false,
   snapTolerance = 0.75,
   onRequestPlotResize,
+  onRequestProperties,
   toolParams = {},
   notice = null,
   onNotice,
@@ -163,6 +159,8 @@ export default function EditorCanvas({
   // Inline dimension label editing (Mode B)
   const [editingDim, setEditingDim] = useState(null); // { axis, value, screenX, screenY }
   const [dimInputValue, setDimInputValue] = useState('');
+
+  const wallShapes = useMemo(() => getWallShapes(layout?.walls || []), [layout?.walls]);
 
   // Inline Room Dimension label editing
   const [editingRoomDim, setEditingRoomDim] = useState(null); // { roomId, field, screenX, screenY }
@@ -611,11 +609,16 @@ export default function EditorCanvas({
     ];
   };
 
+  const selectPlotWall = (base, side) => {
+    onSelectElement({ type: 'plotWall', data: getPlotWallData(base, side) });
+    if (onRequestProperties) onRequestProperties();
+  };
+
   const findPlotEdgeHandle = (sx, sy) => {
     if (!layout?.plot) return null;
     const hit = getPlotHandlePositions().find((h) => Math.hypot(sx - h.x, sy - h.y) <= PLOT_EDGE_HANDLE_PX);
     if (hit) return hit.edge;
-    if (selectedElement?.type !== 'plot') return null;
+    if (selectedElement?.type !== 'plot' && selectedElement?.type !== 'plotWall') return null;
     const site = getPlotRect(layout);
     const a = worldToScreen(site.x0, site.y0);
     const b = worldToScreen(site.x1, site.y1);
@@ -722,7 +725,7 @@ export default function EditorCanvas({
     switch (tool) {
       case 'wall': {
         if (!prev) { addPoint(); return; }
-        const wall = buildWall(prev, p);
+        const wall = buildWall(prev, p, { thicknessInches: toolParams.wallThicknessIn ?? DEFAULT_WALL_THICKNESS_IN });
         if (!wall) { showNotice('A wall needs two different points.'); return; }
         commit({ ...base, walls: [...(base.walls || []), wall] }, { type: 'wall', data: wall });
         done();
@@ -998,7 +1001,7 @@ export default function EditorCanvas({
 
     const edgeHit = findPlotEdgeHandle(sx, sy);
     if (edgeHit) {
-      onSelectElement({ type: 'plot', data: base.plot });
+      if (selectedElement?.type !== 'plotWall') onSelectElement({ type: 'plot', data: base.plot });
       beginDrag('plot-edge', {
         startWorld: worldPos,
         edge: edgeHit,
@@ -1034,6 +1037,11 @@ export default function EditorCanvas({
     }
 
     if (objectHits.length === 0) {
+      const plotWallSide = findPlotWallAt(base, worldPos.x, worldPos.y, STROKE_PICK_PX / viewport.scale);
+      if (plotWallSide) {
+        selectPlotWall(base, plotWallSide);
+        return;
+      }
       // Empty plot or empty canvas: a drag draws a selection box, a click (see
       // pointer-up) selects the plot or clears the selection.
       setBoxDrag({
@@ -1060,8 +1068,13 @@ export default function EditorCanvas({
     const hit = already || objectHits[0];
     const cycle = already && objectHits.length > 1 ? objectHits : null;
     onSelectElement(toSelection(hit));
+    // Say so when a door and a window share a spot, or the one underneath seems unselectable.
+    if (!already && isOpening(hit.type) && objectHits.filter((h) => isOpening(h.type)).length > 1) {
+      showNotice('A door and a window overlap here. Click again to switch between them.');
+    }
     const el = hit.data;
     if (el.isLocked) {
+      if (isOpening(hit.type) && onRequestProperties) onRequestProperties();
       if (cycle) setDragStartInfo({ cycle, current: toSelection(hit), snapshot: base });
       return;
     }
@@ -1391,7 +1404,7 @@ export default function EditorCanvas({
       }
       if (type === 'door' || type === 'window') {
         // An opening can only travel along walls; off-wall it waits at its last valid spot.
-        const res = moveOpening(snapshot, type, init.id, { x: snap(init.x + dx), y: snap(init.y + dy) }, { maxDist: OPENING_PICK_PX / viewport.scale });
+        const res = moveOpening(snapshot, type, init.id, { x: snap(init.x + dx), y: snap(init.y + dy) }, { maxDist: OPENING_PICK_PX / viewport.scale, nearestOnly: true });
         if (res.moved) publish(res.layout);
         setResizeConflict(res.moved ? null : res.reason);
         return;
@@ -1533,12 +1546,20 @@ export default function EditorCanvas({
 
     if (draggingHandle === 'plot-edge' && dragStartInfo) {
       const preview = sitePreviewRef.current;
+      const { snapshot, edge } = dragStartInfo;
       sitePreviewRef.current = null;
       setSitePreview(null);
       setDraggingHandle(null);
       setDragStartInfo(null);
       // One undoable step for the whole boundary drag
       historyManager.endDrag(historyManager.getCurrent());
+      // Pressing an edge without resizing it is a click on that plot wall.
+      const resized = preview && (preview.width !== snapshot.plot.width || preview.length !== snapshot.plot.length);
+      const clickedSide = { top: 'north', bottom: 'south', left: 'west', right: 'east' }[edge];
+      if (!resized && clickedSide) {
+        selectPlotWall(snapshot, clickedSide);
+        return;
+      }
       if (preview?.outside?.length) showNotice(describeOutsidePlot(preview.outside));
       return;
     }
@@ -1557,7 +1578,12 @@ export default function EditorCanvas({
       setActiveMeasurements(null);
       setCursorSnap(null);
       movedRef.current = false;
-      if (wasClick && info?.cycle) onSelectElement(toSelection(nextOverlappingHit(info.cycle, info.current)));
+      if (wasClick) {
+        const clicked = info?.cycle ? nextOverlappingHit(info.cycle, info.current) : null;
+        if (clicked) onSelectElement(toSelection(clicked));
+        // Doors and windows are edited in the panel, so a click brings it up.
+        if (isOpening(clicked ? clicked.type : info?.hitType) && onRequestProperties) onRequestProperties();
+      }
       return;
     }
 
@@ -1797,6 +1823,16 @@ export default function EditorCanvas({
           strokeWidth="2.5"
           strokeDasharray="6,4"
         />
+
+        {/* Plot boundary walls: outer face on the boundary, thickness inward */}
+        {Object.entries(getPlotWallPolygons(layout)).map(([side, polygon]) => {
+          const isSel = selectedElement?.type === 'plotWall' && selectedElement.data?.side === side;
+          const points = polygon.map((pt) => {
+            const q = worldToScreen(pt.x, pt.y);
+            return `${q.x},${q.y}`;
+          }).join(' ');
+          return <polygon key={`plot-wall-${side}`} data-plot-wall={side} points={points} fill={isSel ? '#2563EB' : '#64748B'} />;
+        })}
 
         {/* Setback line / buildable area (derived from the plot and setbacks) */}
         {(() => {
@@ -2163,8 +2199,14 @@ export default function EditorCanvas({
         {(layout?.walls || []).map(wall => {
           const p1 = worldToScreen(wall.x1, wall.y1);
           const p2 = worldToScreen(wall.x2, wall.y2);
-          const strokeW = Math.max(3, (wall.thickness || 0.75) * viewport.scale);
+          const widthPx = (wall.thickness || 0.75) * viewport.scale;
           const isSel = isItemSelected(selectedElement, 'wall', wall.id);
+          const shape = wallShapes.get(wall.id) || getWallShape(wall, layout.walls);
+          const fill = isSel ? '#2563EB' : (wall.color || '#0F172A');
+          const outline = shape.polygon.map((pt) => {
+            const q = worldToScreen(pt.x, pt.y);
+            return `${q.x},${q.y}`;
+          }).join(' ');
 
           return (
             <g key={wall.id}>
@@ -2176,21 +2218,17 @@ export default function EditorCanvas({
                   x2={p2.x}
                   y2={p2.y}
                   stroke="rgba(37, 99, 235, 0.35)"
-                  strokeWidth={strokeW + 10}
+                  strokeWidth={widthPx + 10}
                   strokeLinecap="round"
                 />
               )}
 
-              {/* Main Solid Wall Line */}
-              <line
-                x1={p1.x}
-                y1={p1.y}
-                x2={p2.x}
-                y2={p2.y}
-                stroke={isSel ? '#2563EB' : (wall.color || '#0F172A')}
-                strokeWidth={strokeW}
-                strokeLinecap="round"
-              />
+              {/* The wall's real outline; the hairline keeps it visible when zoomed far out */}
+              <polygon data-wall-id={wall.id} points={outline} fill={fill} stroke={fill} strokeWidth="0.5" />
+              {shape.joints.map((j, i) => {
+                const q = worldToScreen(j.x, j.y);
+                return <circle key={`j-${i}`} cx={q.x} cy={q.y} r={j.r * viewport.scale} fill={fill} />;
+              })}
 
               {/* Interactive Endpoint Handles when Selected */}
               {isSel && selectedElement.type === 'wall' && !wall.isLocked && (
@@ -2300,14 +2338,14 @@ export default function EditorCanvas({
           const color = isSel ? '#2563EB' : '#B45309';
           const a = worldToScreen(g.a.x, g.a.y);
           const b = worldToScreen(g.b.x, g.b.y);
-          const gap = Math.max(3, g.thickness * viewport.scale) + 1;
+          const gap = Math.max(1.5, g.thickness * viewport.scale) + 1;
           const single = isSel && selectedElement.type === 'door' && !door.isLocked;
           return (
             <g key={door.id}>
               {/* The opening cuts the wall */}
               <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="#FFFFFF" strokeWidth={gap} />
               {door.type === 'sliding' && (() => {
-                const off = (Math.max(3, g.thickness * viewport.scale)) / 3;
+                const off = (Math.max(1.5, g.thickness * viewport.scale)) / 3;
                 const nx = g.nx * off;
                 const ny = g.ny * off;
                 const mx = (a.x + b.x) / 2;
@@ -2346,7 +2384,7 @@ export default function EditorCanvas({
           const a = worldToScreen(g.a.x, g.a.y);
           const b = worldToScreen(g.b.x, g.b.y);
           const c = worldToScreen(win.x, win.y);
-          const half = Math.max(3, (g.thickness * viewport.scale) / 2);
+          const half = Math.max(1, (g.thickness * viewport.scale) / 2);
           const nx = g.nx * half;
           const ny = g.ny * half;
           const corners = `${a.x + nx},${a.y + ny} ${b.x + nx},${b.y + ny} ${b.x - nx},${b.y - ny} ${a.x - nx},${a.y - ny}`;
@@ -2583,6 +2621,18 @@ export default function EditorCanvas({
           };
           const mid = { x: (last.x + cur.x) / 2, y: (last.y + cur.y) / 2 };
           const dist = Math.hypot(cur.x - last.x, cur.y - last.y);
+          if (activeTool === 'wall' && dist > 1e-3) {
+            // Show the wall at the thickness it will be built with.
+            const thickness = inchesToFeet(toolParams.wallThicknessIn ?? DEFAULT_WALL_THICKNESS_IN);
+            const { polygon } = getWallShape({ id: 'preview', x1: last.x, y1: last.y, x2: cur.x, y2: cur.y, thickness });
+            const points = polygon.map((pt) => { const q = worldToScreen(pt.x, pt.y); return `${q.x},${q.y}`; }).join(' ');
+            return (
+              <g>
+                <polygon points={points} fill="rgba(37, 99, 235, 0.25)" stroke={color} strokeWidth="1" strokeDasharray="5,4" />
+                {label(mid, formatMeasurement(dist, unit))}
+              </g>
+            );
+          }
           if (activeTool === 'rectangle') {
             const pts = [last, { x: cur.x, y: last.y }, cur, { x: last.x, y: cur.y }];
             return (

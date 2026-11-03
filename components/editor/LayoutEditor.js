@@ -15,8 +15,8 @@ import EditorStatusBar from './EditorStatusBar';
 import { HistoryManager } from './historyManager';
 import { validateLayout } from './layoutValidation';
 import { saveProject, exportProjectJSON, SAVE_STATUS } from './projectStorage';
-import { exportAsPNG, exportAsSVG, printLayoutPlan } from './exportUtils';
-import { cloneLayout, applySiteChange, getPlotDimensionMeta, resizePlotBoundary, describeOutsidePlot } from './layoutModel';
+import { exportAsPDF, exportAsPNG, exportAsSVG, printLayoutPlan } from './exportUtils';
+import { cloneLayout, applySiteChange, getPlotDimensionMeta, getPlotWallData, resizePlotBoundary, describeOutsidePlot, DEFAULT_WALL_THICKNESS_IN } from './layoutModel';
 import { UNIT_TYPES } from './units';
 import { COLLECTIONS, copySelection, copyToClipboard, deleteSelection, insertCopies, joinSelection, makeTranslate, rectangularArray } from './cadCommands';
 import { selectionFromItems, selectionItems } from './selectionModel';
@@ -44,6 +44,7 @@ export default function LayoutEditor({
   const [toolParams, setToolParams] = useState({
     angle: 90, factor: 2, offset: 1, radius: 0, chamferA: 1, chamferB: 1, sides: 6,
     count: 4, polarAngle: 360, rows: 2, cols: 2, dx: 12, dy: 12, gap: 0, text: 'Text',
+    wallThicknessIn: DEFAULT_WALL_THICKNESS_IN,
   });
   const [propertiesOpen, setPropertiesOpen] = useState(false);
   const [notice, setNotice] = useState(null);
@@ -83,6 +84,8 @@ export default function LayoutEditor({
       let freshData = null;
       if (type === 'plot') {
         freshData = layout.plot;
+      } else if (type === 'plotWall') {
+        freshData = getPlotWallData(layout, data.side);
       } else if (type === 'dimension' && data.axis) {
         freshData = getPlotDimensionMeta(layout, data.axis);
       } else if (COLLECTIONS[type]) {
@@ -114,7 +117,7 @@ export default function LayoutEditor({
     if (Platform.OS !== 'web' || typeof window === 'undefined') return;
 
     const handleKeyDown = (e) => {
-      const isInput = e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA';
+      const isInput = ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName);
 
       // Global Undo: Ctrl+Z / Cmd+Z
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) {
@@ -430,6 +433,7 @@ export default function LayoutEditor({
           allowDiagonal={allowDiagonal}
           snapTolerance={snapTolerance}
           onRequestPlotResize={requestPlotResize}
+          onRequestProperties={() => setPropertiesOpen(true)}
           toolParams={toolParams}
           notice={notice}
           onNotice={showNotice}
@@ -487,6 +491,24 @@ export default function LayoutEditor({
             <View style={styles.exportList}>
               <TouchableOpacity
                 style={styles.exportItem}
+                onPress={async () => {
+                  setExportModalVisible(false);
+                  const ok = await exportAsPDF(layout, unit);
+                  if (!ok) showNotice('The PDF could not be created. Please try again.');
+                }}
+              >
+                <View style={styles.exportIconBox}>
+                  <Ionicons name="document-text-outline" size={20} color="#DC2626" />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.exportItemTitle}>Download PDF</Text>
+                  <Text style={styles.exportItemDesc}>The exact layout at 1:50, ready to save or print at 100%</Text>
+                </View>
+                <Ionicons name="chevron-forward" size={16} color="#94A3B8" />
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.exportItem}
                 onPress={() => {
                   exportAsPNG(layout, unit);
                   setExportModalVisible(false);
@@ -530,7 +552,7 @@ export default function LayoutEditor({
                   <Ionicons name="print-outline" size={20} color="#D97706" />
                 </View>
                 <View style={{ flex: 1 }}>
-                  <Text style={styles.exportItemTitle}>Print / PDF Document</Text>
+                  <Text style={styles.exportItemTitle}>Print</Text>
                   <Text style={styles.exportItemDesc}>Open landscape blueprint print preview for plotting</Text>
                 </View>
                 <Ionicons name="chevron-forward" size={16} color="#94A3B8" />

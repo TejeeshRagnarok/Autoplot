@@ -1,13 +1,16 @@
 import React, { useState } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, ScrollView, Alert, Dimensions, Platform } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, ScrollView, Dimensions, Platform } from 'react-native';
 import { lightTheme as staticTheme } from '../constants/theme';
 import { NAKSHATRAS, calculateTaraBalam, getPadamFromVarga, checkAyaVyayaYoni, generateBuildingSize } from '../constants/vastuData';
 import { Ionicons } from '@expo/vector-icons';
 import VastuFooter from './VastuFooter';
+import { getPlotWallBorderStyle, getPlotWallThicknesses } from './editor/siteGeometry';
+import { exportAsPDF, PLAN_VIEW, printLayoutPlan } from './editor/exportUtils';
+import { generateStructuredLayoutFromState } from './editor/layoutBridge';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
-export default function ReportsPDF({ language, state, theme: propTheme, onOpenEditor }) {
+export default function ReportsPDF({ language, state, theme: propTheme, onOpenEditor, layoutData }) {
   const isTe = language === 'te';
   const theme = propTheme || staticTheme;
   const styles = getStyles(theme);
@@ -22,13 +25,15 @@ export default function ReportsPDF({ language, state, theme: propTheme, onOpenEd
   const taraResult = calculateTaraBalam(ownerStarObj ? ownerStarObj.id : 1, 17);
   const padamResult = getPadamFromVarga(state.ownerName);
   const footprint = generateBuildingSize(state.siteLength, state.siteWidth, state.eastOpen, state.westOpen, state.northOpen, state.southOpen);
+  const plotWalls = getPlotWallThicknesses(layoutData);
 
-  const triggerPrint = () => {
-    Alert.alert(isTe ? "ప్రింట్" : "Print Report", isTe ? "ప్రింటర్ సిగ్నల్ శోధించబడుతోంది..." : "Searching for architectural plotter printer...", [{ text: "OK" }]);
-  };
+  const exportLayout = layoutData || generateStructuredLayoutFromState(state);
 
-  const triggerDownload = () => {
-    Alert.alert(isTe ? "డౌన్‌లోడ్" : "Download PDF", isTe ? "వాస్తు ప్లాన్ PDF డౌన్‌లోడ్ చేయబడింది." : "Architectural Vastu Report downloaded successfully.", [{ text: "OK" }]);
+  const triggerPrint = () => printLayoutPlan(exportLayout, 'ft-in', PLAN_VIEW);
+
+  const triggerDownload = async () => {
+    const ok = await exportAsPDF(exportLayout, 'ft-in', PLAN_VIEW);
+    if (!ok) alert(isTe ? "PDF సృష్టించడం సాధ్యం కాలేదు." : "The PDF could not be created. Please try again.");
   };
 
   const getVastuTips = () => {
@@ -134,6 +139,9 @@ export default function ReportsPDF({ language, state, theme: propTheme, onOpenEd
 
         <View style={styles.blueprintSheetCard}>
           <View style={styles.blueprintMockFrame}>
+            {/* This frame is a schematic, not to scale. One pixel per inch (12 per foot) keeps
+                every thickness a whole pixel, so browser rounding can't make two sides look equal. */}
+            <View testID="plot-walls-report" pointerEvents="none" style={[StyleSheet.absoluteFill, getPlotWallBorderStyle(layoutData, 12)]} />
             <View style={styles.northIndicatorBadge}>
               <Text style={styles.northText}>N</Text>
             </View>
@@ -179,6 +187,14 @@ export default function ReportsPDF({ language, state, theme: propTheme, onOpenEd
           <View style={styles.sheetTableRow}>
             <Text style={styles.sheetTableCellLabel}>{isTe ? "దక్షిణ సెట్-బ్యాక్" : "South Setback"}</Text>
             <Text style={styles.sheetTableCellValue}>{state.southOpen} ft</Text>
+          </View>
+          <View style={styles.sheetTableRow}>
+            <Text style={styles.sheetTableCellLabel}>{isTe ? "స్థలం సరిహద్దు గోడలు" : "Plot Boundary Walls"}</Text>
+            <Text style={styles.sheetTableCellValue}>
+              {isTe
+                ? `ఉ ${plotWalls.north}" · ద ${plotWalls.south}" · తూ ${plotWalls.east}" · ప ${plotWalls.west}"`
+                : `N ${plotWalls.north}" · S ${plotWalls.south}" · E ${plotWalls.east}" · W ${plotWalls.west}"`}
+            </Text>
           </View>
         </View>
 
