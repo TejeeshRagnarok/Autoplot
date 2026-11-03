@@ -14,6 +14,19 @@ export const SAVE_STATUS = {
   FAILED: 'failed',
 };
 
+const LAYOUT_LISTS = ['walls', 'rooms', 'doors', 'windows', 'staircases', 'columns', 'parking', 'utilities', 'dimensions', 'annotations', 'cadEntities'];
+
+/**
+ * Bring a loaded layout up to the current shape, so projects saved by older
+ * versions open without losing anything.
+ */
+export function normalizeLoadedLayout(layout) {
+  if (!layout || typeof layout !== 'object' || !layout.plot) return null;
+  const next = { ...layout };
+  for (const key of LAYOUT_LISTS) if (!Array.isArray(next[key])) next[key] = [];
+  return next;
+}
+
 /**
  * Save layout to local storage
  * @param {object} layout
@@ -53,7 +66,7 @@ export function loadProject(projectId = 'default', userId = 'default_user') {
       const key = `${STORAGE_KEY_PREFIX}${userId}_${projectId}`;
       const data = window.localStorage.getItem(key);
       if (data) {
-        return JSON.parse(data);
+        return normalizeLoadedLayout(JSON.parse(data));
       }
     }
   } catch (err) {

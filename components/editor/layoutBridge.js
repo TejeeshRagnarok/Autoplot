@@ -66,6 +66,10 @@ export function generateStructuredLayoutFromState(state) {
     title: `${state.ownerName || 'AutoPlot'}'s Residence Plan`,
   });
 
+  // Identifies the inputs this layout came from, so saved edits are only restored for the same inputs.
+  const { lastEditedLayout, ...sourceInputs } = state;
+  layout.sourceKey = JSON.stringify(sourceInputs);
+
   const mainDoorDir = state.mainDoorDirection || 'North';
   let entRow = 1;
   let entCol = 1;

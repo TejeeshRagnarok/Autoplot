@@ -4,45 +4,36 @@
  * - Real world coordinates (feet) <-> screen pixel transformation
  * - Mouse wheel zoom centered at cursor & mouse drag panning
  * - Rulers (Top & Left) with real-world unit tick marks
- * - Grid with toggleable snap-to-grid
- * - Hit detection and selection for all architectural elements
- * - Live interactive handles (Wall endpoints, Room resize corners, Door/Win sliders)
- * - Drawing tools: Draw Wall, Add Room, Add Door, Add Window, Add Staircase, Add Column, Measure Distance
+ * - Grid with toggleable snapping (endpoint, midpoint, center, intersection, perpendicular, wall, room, site, grid)
+ * - Hit detection, box selection and multi-selection for all architectural elements
+ * - Live interactive handles (Wall endpoints, Room resize corners, Door/Window jambs, Entity vertices)
+ * - Drawing tools: Wall, Room, Line, Polyline, Rectangle, Circle, Arc, Polygon, Door, Window, Staircase, Column, Parking, Text, Dimension, Measure
+ * - Modify tools: Move, Copy, Rotate, Mirror, Scale, Offset, Trim, Extend, Fillet, Chamfer, Stretch, Break, Polar Array, Delete
+ *
+ * Every drag is solved from the geometry captured at pointer-down, so nothing
+ * accumulates between pointer moves and the result does not depend on zoom.
  */
 
 import React, { useRef, useState, useEffect, useCallback } from 'react';
-import { View, StyleSheet, Platform, Text } from 'react-native';
+import { Platform } from 'react-native';
 import {
-  calculateWallLength,
-  calculateWallAngle,
-  pointToSegmentDistance,
   snapValue,
-  createWall,
   createRoom,
   createDoor,
   createWindow,
   createStaircase,
   createColumn,
   createParking,
-  createUtility,
-  generateUniqueId,
+  createDimension,
+  createAnnotation,
   cloneLayout,
-  getWallOrientation,
-  translateWall,
-  moveWallEndpoint,
-  moveConnectedEndpoints,
-  findEndpointSnap,
-  findAlignmentGuides,
   getPlotDimensionMeta,
   syncPlotDimensions,
   resizePlot,
   MIN_ROOM_DIMENSION,
-  getPlotAndBuildableBounds,
   checkRoomPlotFit,
-  collectAlignmentTargets,
   findRoomSnapping,
   createRoomBoundaryWalls,
-  syncRoomWithWallsAndOpenings,
   applySiteChange,
   calculateStaircaseGeometry,
   getStaircaseBounds,
@@ -53,11 +44,70 @@ import {
   resizeRoom,
   moveRoom,
   setRoomDimension,
-  moveWallBoundary,
   edgeTargetsForHandle,
   screenToWorldPoint,
   worldToScreenPoint,
 } from './roomResize';
+import {
+  buildWall,
+  getOpeningGeometry,
+  moveOpening,
+  moveWallBody,
+  moveWallEndpointTo,
+  orthoPoint,
+  placeOpeningOnWall,
+  resizeOpening,
+} from './wallOps';
+import {
+  COLLECTIONS,
+  breakAtClick,
+  chamferElements,
+  copySelection,
+  createArcEntity,
+  createCircleEntity,
+  createLineEntity,
+  createPolylineEntity,
+  createRectangleEntity,
+  createRegularPolygonEntity,
+  deleteSelection,
+  extendElement,
+  filletElements,
+  getElement,
+  isPlotDimension,
+  makeMirror,
+  makeRotate,
+  makeScale,
+  makeTranslate,
+  offsetElement,
+  pickOutline,
+  polarArray,
+  stretchInBox,
+  transformElement,
+  transformSelection,
+  trimElement,
+} from './cadCommands';
+import {
+  annotationBox,
+  boxSelect,
+  hitTestAll,
+  dimensionLine,
+  isItemSelected,
+  nextOverlappingHit,
+  selectionFromItems,
+  selectionItems,
+  toSelection,
+  toggleInSelection,
+} from './selectionModel';
+import { findPointSnap } from './snapEngine';
+import { pointAtAngle, arcSweep } from './cadGeometry';
+
+const DRAG_THRESHOLD_PX = 3;
+const OPENING_PICK_PX = 40;
+const OUTLINE_PICK_PX = 8;
+const HANDLE_PICK_PX = 10;
+
+// Tools that act on the current selection and refuse to start without one.
+const NEEDS_SELECTION = new Set(['move', 'copy', 'rotate', 'mirror', 'scale', 'polar-array']);
 
 export default function EditorCanvas({
   layout,
@@ -77,6 +127,9 @@ export default function EditorCanvas({
   snapTolerance = 0.75,
   onRequestPlotResize,
   onRequestSiteChange,
+  toolParams = {},
+  notice = null,
+  onNotice,
 }) {
   const containerRef = useRef(null);
   const dimInputRef = useRef(null);
@@ -94,7 +147,7 @@ export default function EditorCanvas({
   // Interaction State
   const [isPanning, setIsPanning] = useState(false);
   const [panStart, setPanStart] = useState({ x: 0, y: 0 });
-  const [draggingHandle, setDraggingHandle] = useState(null); // 'wall-p1' | 'wall-p2' | 'room-nw'...'room-se' | 'room-body' | 'dimension-line'
+  const [draggingHandle, setDraggingHandle] = useState(null); // 'wall-p1' | 'wall-p2' | 'room-nw'...'room-se' | 'room-body' | 'element-body' | 'multi-body' | 'opening-a' | 'opening-b' | 'entity-vertex' | 'entity-radius' | 'dimension-line' | 'plot-edge' | 'stair-*'
   const [dragStartInfo, setDragStartInfo] = useState(null);
   const [alignmentGuides, setAlignmentGuides] = useState([]);
   const [snapBadges, setSnapBadges] = useState([]);
@@ -105,8 +158,6 @@ export default function EditorCanvas({
 
   // Pending room placement confirmation (room drawn outside buildable area)
   const [pendingRoomPlacement, setPendingRoomPlacement] = useState(null); // { room, warnings, buildable, exceeds }
-  const [placementNotice, setPlacementNotice] = useState(null);
-  const placementNoticeTimer = useRef(null);
 
   // Inline dimension label editing (Mode B)
   const [editingDim, setEditingDim] = useState(null); // { axis, value, screenX, screenY }
@@ -117,9 +168,27 @@ export default function EditorCanvas({
   const [roomDimInputValue, setRoomDimInputValue] = useState('');
 
   // Drawing Tools State
-  const [wallDrawStart, setWallDrawStart] = useState(null); // { x, y }
   const [roomDrawStart, setRoomDrawStart] = useState(null);
-  const [measureStart, setMeasureStart] = useState(null);
+  const [toolPoints, setToolPoints] = useState([]); // points picked so far by the active tool
+  const [toolRefs, setToolRefs] = useState([]); // objects picked so far by the active tool
+  const [measureResult, setMeasureResult] = useState(null); // { a, b } kept on screen after the second click
+  const [cursorSnap, setCursorSnap] = useState(null); // { x, y, kind, label }
+  const [boxDrag, setBoxDrag] = useState(null); // { start, end, purpose: 'select' | 'stretch', additive }
+  const [stretchBox, setStretchBox] = useState(null); // committed stretch window { x1, y1, x2, y2 }
+
+  const movedRef = useRef(false); // has the active drag passed the click threshold?
+  const sitePreviewRef = useRef(null);
+  const activePointerRef = useRef(null);
+  const spaceHeldRef = useRef(false);
+  const pendingMoveRef = useRef(null);
+  const rafRef = useRef(null);
+  const processMoveRef = useRef(null);
+  const viewportRef = useRef(viewport);
+  viewportRef.current = viewport;
+
+  // The latest committed geometry. An inspector field that commits on blur has
+  // already updated this by the time a canvas pointer-down reads it.
+  const liveLayout = () => historyManager?.getCurrent?.() || layout;
 
   // Convert World Coordinates (ft) to Screen Pixels
   const worldToScreen = useCallback((wx, wy) => worldToScreenPoint(viewport, wx, wy), [viewport]);
@@ -133,34 +202,80 @@ export default function EditorCanvas({
     return snapValue(val, snapStep);
   }, [snapEnabled, snapStep]);
 
-  // Room smart-snap tolerance in screen pixels, driven by the configurable
-  // snap tolerance control so it stays consistent at every zoom level.
+  // Snap tolerance in screen pixels, driven by the configurable snap tolerance
+  // control so it stays consistent at every zoom level.
   const roomSnapPixelTolerance = Math.max(6, Math.min(40, (snapTolerance / 0.75) * 12));
 
-  const showPlacementNotice = (text) => {
-    setPlacementNotice(text);
-    if (placementNoticeTimer.current) clearTimeout(placementNoticeTimer.current);
-    placementNoticeTimer.current = setTimeout(() => setPlacementNotice(null), 4500);
+  const showNotice = (text) => {
+    if (onNotice) onNotice(text);
+  };
+
+  /** Resolve a pointer position through the snap engine. `from` enables perpendicular and ortho. */
+  const resolvePoint = (world, { from = null, ortho = false, excludeWallId = null, excludeEntityId = null, base = layout } = {}) => {
+    const hit = findPointSnap(world, base, {
+      scale: viewport.scale,
+      pixelTolerance: roomSnapPixelTolerance,
+      snapEnabled,
+      snapStep,
+      from,
+      excludeWallId,
+      excludeEntityId,
+    });
+    if (ortho && from) {
+      const o = orthoPoint(from, hit);
+      return { ...hit, x: o.x, y: o.y };
+    }
+    return hit;
+  };
+
+  const resetToolState = () => {
+    setToolPoints([]);
+    setToolRefs([]);
+    setStretchBox(null);
+    setBoxDrag(null);
+    setMeasureResult(null);
+    setRoomDrawStart(null);
+  };
+
+  useEffect(() => {
+    resetToolState();
+    if (activeTool !== 'select' && NEEDS_SELECTION.has(activeTool) && selectionItems(selectedElement).length === 0) {
+      showNotice('Select the objects first, then choose this command.');
+    }
+  }, [activeTool]);
+
+  // ----- Committing -----
+
+  const commit = (next, selection) => {
+    historyManager.pushState(next);
+    onUpdateLayout(next);
+    if (selection !== undefined) onSelectElement(selection);
+  };
+
+  /** Commit a command result and report whatever it could not do. */
+  const applyResult = (res, { selectCreated = false, keepSelection = true } = {}) => {
+    if (res.reason) showNotice(res.reason);
+    else if (res.skipped?.length) showNotice(res.skipped[0]);
+    if (!res.layout || res.layout === liveLayout()) return false;
+    let selection;
+    if (selectCreated && res.created?.length) selection = selectionFromItems(res.layout, res.created);
+    else if (!keepSelection) selection = null;
+    commit(res.layout, selection);
+    return true;
   };
 
   // Commit a room into the layout (history + boundary walls + selection)
   const commitRoomPlacement = (room) => {
+    const base = liveLayout();
     const newRoom = createRoom({
-      name: `Room ${layout.rooms?.length ? layout.rooms.length + 1 : 1}`,
+      name: `Room ${base.rooms?.length ? base.rooms.length + 1 : 1}`,
       x: room.x,
       y: room.y,
       width: room.width,
       length: room.length,
     });
-    const nextWalls = createRoomBoundaryWalls(layout, newRoom);
-    const nextLayout = {
-      ...layout,
-      rooms: [...(layout.rooms || []), newRoom],
-      walls: nextWalls,
-    };
-    historyManager.pushState(nextLayout);
-    onUpdateLayout(nextLayout);
-    onSelectElement({ type: 'room', data: newRoom });
+    const nextWalls = createRoomBoundaryWalls(base, newRoom);
+    commit({ ...base, rooms: [...(base.rooms || []), newRoom], walls: nextWalls }, { type: 'room', data: newRoom });
     if (onSelectTool) onSelectTool('select');
   };
 
@@ -192,7 +307,7 @@ export default function EditorCanvas({
     if (exceeds) return; // dimensions don't fit — only "Resize to Fit" is allowed
     const newX = Math.max(buildable.minX, Math.min(room.x, buildable.maxX - room.width));
     const newY = Math.max(buildable.minY, Math.min(room.y, buildable.maxY - room.length));
-    commitRoomPlacement({ ...room, x: Number(newX.toFixed(2)), y: Number(newY.toFixed(2)) });
+    commitRoomPlacement({ ...room, x: Number(newX.toFixed(4)), y: Number(newY.toFixed(4)) });
     setPendingRoomPlacement(null);
   };
 
@@ -205,10 +320,10 @@ export default function EditorCanvas({
     const y = Math.max(buildable.minY, Math.min(room.y, buildable.maxY - l));
     commitRoomPlacement({
       ...room,
-      width: Number(w.toFixed(2)),
-      length: Number(l.toFixed(2)),
-      x: Number(x.toFixed(2)),
-      y: Number(y.toFixed(2)),
+      width: Number(w.toFixed(4)),
+      length: Number(l.toFixed(4)),
+      x: Number(x.toFixed(4)),
+      y: Number(y.toFixed(4)),
     });
     setPendingRoomPlacement(null);
   };
@@ -252,97 +367,31 @@ export default function EditorCanvas({
     }
   }, [fitToScreen]);
 
-  // Mouse Wheel Zoom centered at cursor
-  const handleWheel = (e) => {
-    e.preventDefault();
-    const zoomFactor = e.deltaY < 0 ? 1.12 : 0.89;
-    const newScale = Math.max(6, Math.min(80, viewport.scale * zoomFactor));
-
-    if (!containerRef.current) return;
-    const rect = containerRef.current.getBoundingClientRect();
-    const mouseScreenX = e.clientX - rect.left;
-    const mouseScreenY = e.clientY - rect.top;
-
-    // Zoom centered at mouse cursor
-    const mouseWorld = screenToWorld(mouseScreenX, mouseScreenY);
-    const newPanX = mouseScreenX - mouseWorld.x * newScale;
-    const newPanY = mouseScreenY - mouseWorld.y * newScale;
-
-    setViewport({
-      scale: newScale,
-      panX: newPanX,
-      panY: newPanY,
-    });
-  };
-
-  // Hit-testing to select elements
-  const findElementAtWorldPoint = (wx, wy) => {
-    if (!layout) return null;
-
-    // 1. Check doors first
-    for (const d of layout.doors || []) {
-      const dist = Math.hypot(wx - d.x, wy - d.y);
-      if (dist < 2.0) return { type: 'door', data: d };
-    }
-
-    // 2. Check windows
-    for (const w of layout.windows || []) {
-      const dist = Math.hypot(wx - w.x, wy - w.y);
-      if (dist < 2.0) return { type: 'window', data: w };
-    }
-
-    // 3. Check utilities
-    for (const u of layout.utilities || []) {
-      if (wx >= u.x && wx <= u.x + u.width && wy >= u.y && wy <= u.y + u.length) {
-        return { type: 'utility', data: u };
-      }
-    }
-
-    // 4. Check staircases
-    for (const s of layout.staircases || []) {
-      const b = getStaircaseBounds(s);
-      if (wx >= b.x && wx <= b.x + b.width && wy >= b.y && wy <= b.y + b.length) {
-        return { type: 'staircase', data: s };
-      }
-    }
-
-    // 5. Check parking
-    for (const p of layout.parking || []) {
-      if (wx >= p.x && wx <= p.x + p.width && wy >= p.y && wy <= p.y + p.length) {
-        return { type: 'parking', data: p };
-      }
-    }
-
-    // 6. Check columns
-    for (const c of layout.columns || []) {
-      const dist = Math.hypot(wx - c.x, wy - c.y);
-      if (dist < 1.5) return { type: 'column', data: c };
-    }
-
-    // 7. Check walls (point to segment distance)
-    for (const wall of layout.walls || []) {
-      const res = pointToSegmentDistance(wx, wy, wall.x1, wall.y1, wall.x2, wall.y2);
-      if (res.distance < (wall.thickness || 0.75) + 0.5) {
-        return { type: 'wall', data: wall };
-      }
-    }
-
-    // 8. Check rooms
-    for (const r of layout.rooms || []) {
-      if (wx >= r.x && wx <= r.x + r.width && wy >= r.y && wy <= r.y + r.length) {
-        return { type: 'room', data: r };
-      }
-    }
-
-    // 9. Check plot boundary
-    const plotW = layout.plot?.width || 30;
-    const plotL = layout.plot?.length || 40;
-    if (wx >= 0 && wx <= plotW && wy >= 0 && wy <= plotL) {
-      return { type: 'plot', data: layout.plot };
-    }
-
-    return null;
-  };
+  // Mouse Wheel Zoom centered at cursor. Attached natively because React's
+  // wheel listener is passive, where preventDefault cannot stop the page scrolling.
+  const siteDragActiveRef = useRef(false);
+  siteDragActiveRef.current = draggingHandle === 'plot-edge';
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return undefined;
+    const onWheel = (e) => {
+      e.preventDefault();
+      // A site-edge drag pins the viewport to keep its fixed edge still.
+      if (siteDragActiveRef.current) return;
+      const rect = el.getBoundingClientRect();
+      const sx = e.clientX - rect.left;
+      const sy = e.clientY - rect.top;
+      setViewport((prev) => {
+        const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+        const scale = Math.max(6, Math.min(80, prev.scale * factor));
+        const wx = (sx - prev.panX) / prev.scale;
+        const wy = (sy - prev.panY) / prev.scale;
+        return { scale, panX: sx - wx * scale, panY: sy - wy * scale };
+      });
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, []);
 
   // ---- Outer plot dimension annotation helpers (width / height lines) ----
   const getDimLabelWorld = (axis) => {
@@ -367,12 +416,14 @@ export default function EditorCanvas({
       return Math.abs(clickScr.x - scr.x) <= 38 && Math.abs(clickScr.y - scr.y) <= 13;
     };
 
-    const lineTol = 1.1;
+    const lineTol = 8 / viewport.scale;
+    if (isLabel('width')) return { axis: 'width', meta: w, onLabel: true };
+    if (isLabel('length')) return { axis: 'length', meta: l, onLabel: true };
     if (wy > -w.offset - lineTol && wy < -w.offset + lineTol && wx > -lineTol && wx < W + lineTol) {
-      return { axis: 'width', meta: w, onLabel: isLabel('width') };
+      return { axis: 'width', meta: w, onLabel: false };
     }
     if (wx > -l.offset - lineTol && wx < -l.offset + lineTol && wy > -lineTol && wy < L + lineTol) {
-      return { axis: 'length', meta: l, onLabel: isLabel('length') };
+      return { axis: 'length', meta: l, onLabel: false };
     }
     return null;
   };
@@ -381,25 +432,26 @@ export default function EditorCanvas({
     const meta = getPlotDimensionMeta(layout, axis);
     const lw = getDimLabelWorld(axis);
     const scr = worldToScreen(lw.x, lw.y);
-    setEditingDim({ axis, screenX: scr.x, screenY: scr.y });
+    setEditingDim({ axis, screenX: scr.x, screenY: scr.y, original: formatMeasurement(meta.value, unit) });
     setDimInputValue(formatMeasurement(meta.value, unit));
     onSelectElement({ type: 'dimension', data: meta });
   };
 
   const commitDimensionEdit = () => {
     if (!editingDim) return;
-    const axis = editingDim.axis;
-    const feet = parseToFeet(dimInputValue, unit);
+    const { axis, original } = editingDim;
     setEditingDim(null);
+    if (dimInputValue.trim() === original) return; // untouched: never round the plot to the display precision
+    const feet = parseToFeet(dimInputValue, unit);
     if (feet !== null && feet > 0) {
       if (onRequestPlotResize) {
         // Routed through LayoutEditor so unsafe shrinks can be confirmed first.
         onRequestPlotResize(axis, feet);
       } else {
-        const next = resizePlot(layout, axis, feet);
-        historyManager.pushState(next);
-        onUpdateLayout(next);
+        commit(resizePlot(layout, axis, feet));
       }
+    } else {
+      showNotice('That is not a valid measurement, so the plot was not changed.');
     }
   };
 
@@ -407,7 +459,7 @@ export default function EditorCanvas({
 
   // Inline Room Dimension Editing
   const openRoomDimensionEditor = (roomId, field, sx, sy, curVal) => {
-    setEditingRoomDim({ roomId, field, screenX: sx, screenY: sy });
+    setEditingRoomDim({ roomId, field, screenX: sx, screenY: sy, original: formatMeasurement(curVal, unit) });
     setRoomDimInputValue(formatMeasurement(curVal, unit));
     setTimeout(() => {
       if (roomDimInputRef.current) {
@@ -419,74 +471,95 @@ export default function EditorCanvas({
 
   const commitRoomDimensionEdit = () => {
     if (!editingRoomDim) return;
-    const { roomId, field } = editingRoomDim;
-    const feet = parseToFeet(roomDimInputValue, unit);
+    const { roomId, field, original } = editingRoomDim;
     setEditingRoomDim(null);
-    if (feet !== null && feet >= MIN_ROOM_DIMENSION) {
-      const res = setRoomDimension(layout, roomId, field, Number(feet.toFixed(4)));
-      if (res.room) {
-        historyManager.pushState(res.layout);
-        onUpdateLayout(res.layout);
-        onSelectElement({ type: 'room', data: res.room });
-        if (res.conflicts.length) showPlacementNotice(`Stopped at the nearest valid size: ${res.conflicts[0]}`);
-      }
+    if (roomDimInputValue.trim() === original) return;
+    const feet = parseToFeet(roomDimInputValue, unit);
+    if (feet === null || feet < MIN_ROOM_DIMENSION) {
+      showNotice(`Enter a size of at least ${formatMeasurement(MIN_ROOM_DIMENSION, unit)}.`);
+      return;
+    }
+    const res = setRoomDimension(liveLayout(), roomId, field, Number(feet.toFixed(4)));
+    if (res.room) {
+      commit(res.layout, { type: 'room', data: res.room });
+      if (res.conflicts.length) showNotice(`Stopped at the nearest valid size: ${res.conflicts[0]}`);
     }
   };
 
   const cancelRoomDimensionEdit = () => setEditingRoomDim(null);
 
-  // Escape key cancels placement, drawing, or dimension editing
-  useEffect(() => {
-    if (Platform.OS !== 'web' || typeof window === 'undefined') return;
-    const handleKeyDown = (e) => {
-      if (e.key === 'Escape') {
-        if (pendingRoomPlacement) {
-          setPendingRoomPlacement(null);
-          e.preventDefault();
-          e.stopPropagation();
-          return;
-        }
-        if (roomDrawStart) {
-          setRoomDrawStart(null);
-          setAlignmentGuides([]);
-          setSnapBadges([]);
-          setRoomWarnings([]);
-          setActiveMeasurements(null);
-          e.preventDefault();
-          e.stopPropagation();
-          return;
-        }
-        if (wallDrawStart) {
-          setWallDrawStart(null);
-          e.preventDefault();
-          e.stopPropagation();
-          return;
-        }
-        if (measureStart) {
-          setMeasureStart(null);
-          e.preventDefault();
-          e.stopPropagation();
-          return;
-        }
-        if (editingRoomDim) {
-          setEditingRoomDim(null);
-          e.preventDefault();
-          e.stopPropagation();
-          return;
-        }
-        if (editingDim) {
-          setEditingDim(null);
-          e.preventDefault();
-          e.stopPropagation();
-          return;
-        }
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [pendingRoomPlacement, roomDrawStart, wallDrawStart, measureStart, editingRoomDim, editingDim]);
+  const cancelActiveDrag = () => {
+    const restored = historyManager.cancelDrag();
+    onUpdateLayout(restored);
+    if (dragStartInfo?.startViewport) setViewport(dragStartInfo.startViewport);
+    setDraggingHandle(null);
+    setDragStartInfo(null);
+    setSitePreview(null);
+    setResizeConflict(null);
+    setAlignmentGuides([]);
+    setSnapBadges([]);
+    setRoomWarnings([]);
+    setActiveMeasurements(null);
+    movedRef.current = false;
+  };
 
-  // Pointer Down
+  const finishPolyline = () => {
+    if (activeTool === 'polyline' && toolPoints.length >= 2) {
+      const base = liveLayout();
+      const ent = createPolylineEntity(toolPoints);
+      commit({ ...base, cadEntities: [...(base.cadEntities || []), ent] }, { type: 'entity', data: ent });
+    }
+    setToolPoints([]);
+  };
+
+  // Keyboard: Escape cancels from the innermost state out; Enter finishes a polyline; Space pans.
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof window === 'undefined') return undefined;
+    const typing = (e) => ['INPUT', 'TEXTAREA'].includes(e.target?.tagName);
+    const consume = (e) => {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    };
+    const handleKeyDown = (e) => {
+      if (e.key === ' ' && !typing(e)) {
+        spaceHeldRef.current = true;
+        e.preventDefault();
+        return;
+      }
+      if (e.key === 'Enter' && !typing(e) && activeTool === 'polyline') {
+        finishPolyline();
+        consume(e);
+        return;
+      }
+      if (e.key !== 'Escape') return;
+      if (draggingHandle) { cancelActiveDrag(); consume(e); return; }
+      if (boxDrag) { setBoxDrag(null); consume(e); return; }
+      if (pendingRoomPlacement) { setPendingRoomPlacement(null); consume(e); return; }
+      if (roomDrawStart) {
+        setRoomDrawStart(null);
+        setAlignmentGuides([]);
+        setSnapBadges([]);
+        setRoomWarnings([]);
+        setActiveMeasurements(null);
+        consume(e);
+        return;
+      }
+      if (toolPoints.length || toolRefs.length || stretchBox || measureResult) { resetToolState(); consume(e); return; }
+      if (editingRoomDim) { setEditingRoomDim(null); consume(e); return; }
+      if (editingDim) { setEditingDim(null); consume(e); }
+    };
+    const handleKeyUp = (e) => {
+      if (e.key === ' ') spaceHeldRef.current = false;
+    };
+    // Capture phase: this runs before the editor's own Escape handling.
+    window.addEventListener('keydown', handleKeyDown, true);
+    window.addEventListener('keyup', handleKeyUp, true);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown, true);
+      window.removeEventListener('keyup', handleKeyUp, true);
+    };
+  }, [pendingRoomPlacement, roomDrawStart, toolPoints, toolRefs, stretchBox, measureResult, editingRoomDim, editingDim, draggingHandle, boxDrag, activeTool, layout]);
+
   // Resize handle under the pointer for a selected room: corners first, then
   // the edge midpoint squares, then anywhere along an edge line.
   const findRoomHandle = (room, sx, sy) => {
@@ -502,9 +575,9 @@ export default function EditorCanvas({
       { id: 'room-n', x: p0.x + w / 2, y: p0.y }, { id: 'room-e', x: p0.x + w, y: p0.y + h / 2 },
       { id: 'room-s', x: p0.x + w / 2, y: p0.y + h }, { id: 'room-w', x: p0.x, y: p0.y + h / 2 },
     ];
-    const c = corners.find((k) => Math.hypot(sx - k.x, sy - k.y) <= 10);
+    const c = corners.find((k) => Math.hypot(sx - k.x, sy - k.y) <= HANDLE_PICK_PX);
     if (c) return c.id;
-    const m = mids.find((k) => Math.hypot(sx - k.x, sy - k.y) <= 10);
+    const m = mids.find((k) => Math.hypot(sx - k.x, sy - k.y) <= HANDLE_PICK_PX);
     if (m) return m.id;
     const tol = 5;
     const inX = sx > p0.x + tol && sx < p0.x + w - tol;
@@ -577,56 +650,310 @@ export default function EditorCanvas({
     return { width, length, edge: symmetric ? 'symmetric' : e };
   };
 
+  /** Handle of the selected element under the pointer. Handles outrank object bodies. */
+  const findSelectedHandle = (base, sx, sy) => {
+    if (!selectedElement || selectedElement.type === 'multi' || !selectedElement.data?.id) return null;
+    const { type } = selectedElement;
+    const el = getElement(base, { type, id: selectedElement.data.id });
+    if (!el || el.isLocked) return null;
+    const near = (wx, wy, px = HANDLE_PICK_PX) => {
+      const q = worldToScreen(wx, wy);
+      return Math.hypot(sx - q.x, sy - q.y) <= px;
+    };
+    if (type === 'room') {
+      const id = findRoomHandle(el, sx, sy);
+      return id ? { kind: 'room', id, el } : null;
+    }
+    if (type === 'wall') {
+      if (near(el.x1, el.y1)) return { kind: 'wall', id: 'wall-p1', el };
+      if (near(el.x2, el.y2)) return { kind: 'wall', id: 'wall-p2', el };
+      return null;
+    }
+    if (type === 'door' || type === 'window') {
+      const g = getOpeningGeometry(el, base.walls);
+      if (near(g.a.x, g.a.y, 8)) return { kind: 'opening', id: 'opening-a', el, geometry: g };
+      if (near(g.b.x, g.b.y, 8)) return { kind: 'opening', id: 'opening-b', el, geometry: g };
+      return null;
+    }
+    if (type === 'staircase') {
+      const b = getStaircaseBounds(el);
+      const handles = [
+        { id: 'stair-e', x: b.x + b.width, y: b.y + b.length / 2 },
+        { id: 'stair-w', x: b.x, y: b.y + b.length / 2 },
+        { id: 'stair-s', x: b.x + b.width / 2, y: b.y + b.length },
+        { id: 'stair-n', x: b.x + b.width / 2, y: b.y },
+      ];
+      const h = handles.find((k) => near(k.x, k.y));
+      return h ? { kind: 'stair', id: h.id, el, bounds: b } : null;
+    }
+    if (type === 'entity') {
+      if (el.kind === 'line') {
+        if (near(el.x1, el.y1)) return { kind: 'vertex', id: 'entity-vertex', el, index: 0 };
+        if (near(el.x2, el.y2)) return { kind: 'vertex', id: 'entity-vertex', el, index: 1 };
+      } else if (el.points) {
+        const index = el.points.findIndex((p) => near(p.x, p.y));
+        if (index >= 0) return { kind: 'vertex', id: 'entity-vertex', el, index };
+      } else if (near(el.cx + el.r, el.cy) && el.kind === 'circle') {
+        return { kind: 'radius', id: 'entity-radius', el };
+      } else if (el.kind === 'arc') {
+        const m = pointAtAngle(el, el.start + arcSweep(el) / 2);
+        if (near(m.x, m.y)) return { kind: 'radius', id: 'entity-radius', el };
+      }
+    }
+    return null;
+  };
+
+  // ---------------------------------------------------------------------
+  // Tool actions: a point was picked with the active tool
+  // ---------------------------------------------------------------------
+
+  const addEntity = (base, entity) => commit({ ...base, cadEntities: [...(base.cadEntities || []), entity] }, { type: 'entity', data: entity });
+
+  const handleToolPick = (world, e, base) => {
+    const tool = activeTool;
+    const prev = toolPoints[toolPoints.length - 1] || null;
+    const wantsOrtho = (tool === 'wall' && !allowDiagonal) || e.shiftKey;
+    const pt = resolvePoint(world, { from: prev, ortho: wantsOrtho, base });
+    const p = { x: pt.x, y: pt.y };
+    const pickTol = OUTLINE_PICK_PX / viewport.scale;
+    const selection = selectionItems(selectedElement);
+    const addPoint = () => setToolPoints((list) => [...list, p]);
+    const done = () => setToolPoints([]);
+
+    switch (tool) {
+      case 'wall': {
+        if (!prev) { addPoint(); return; }
+        const wall = buildWall(prev, p);
+        if (!wall) { showNotice('A wall needs two different points.'); return; }
+        commit({ ...base, walls: [...(base.walls || []), wall] }, { type: 'wall', data: wall });
+        done();
+        return;
+      }
+      case 'line': {
+        if (!prev) { addPoint(); return; }
+        if (Math.hypot(p.x - prev.x, p.y - prev.y) < 1e-3) { showNotice('A line needs two different points.'); return; }
+        addEntity(base, createLineEntity(prev, p));
+        done();
+        return;
+      }
+      case 'polyline': {
+        // A double-click lands twice on one point: that finishes the polyline.
+        if (prev && Math.hypot(p.x - prev.x, p.y - prev.y) < 1e-3) { finishPolyline(); return; }
+        addPoint();
+        return;
+      }
+      case 'rectangle': {
+        if (!prev) { addPoint(); return; }
+        if (Math.abs(p.x - prev.x) < 1e-3 || Math.abs(p.y - prev.y) < 1e-3) { showNotice('A rectangle needs a width and a length.'); return; }
+        addEntity(base, createRectangleEntity(prev, p));
+        done();
+        return;
+      }
+      case 'circle': {
+        if (!prev) { addPoint(); return; }
+        const r = Math.hypot(p.x - prev.x, p.y - prev.y);
+        if (r < 1e-3) { showNotice('A circle needs a radius.'); return; }
+        addEntity(base, createCircleEntity(prev, r));
+        done();
+        return;
+      }
+      case 'arc': {
+        if (toolPoints.length < 2) { addPoint(); return; }
+        const arc = createArcEntity(toolPoints[0], toolPoints[1], p);
+        if (!arc) { showNotice('Those three points are in a straight line, so they do not define an arc.'); return; }
+        addEntity(base, arc);
+        done();
+        return;
+      }
+      case 'polygon': {
+        if (!prev) { addPoint(); return; }
+        if (Math.hypot(p.x - prev.x, p.y - prev.y) < 1e-3) { showNotice('A polygon needs a radius.'); return; }
+        addEntity(base, createRegularPolygonEntity(prev, p, toolParams.sides ?? 6));
+        done();
+        return;
+      }
+      case 'text': {
+        const anno = createAnnotation({ x: p.x, y: p.y, text: toolParams.text || 'Text' });
+        commit({ ...base, annotations: [...(base.annotations || []), anno] }, { type: 'annotation', data: anno });
+        return;
+      }
+      case 'dimension': {
+        if (!prev) { addPoint(); return; }
+        if (Math.hypot(p.x - prev.x, p.y - prev.y) < 1e-3) { showNotice('A dimension needs two different points.'); return; }
+        const dim = createDimension({ x1: prev.x, y1: prev.y, x2: p.x, y2: p.y, offset: 1.5 });
+        commit({ ...base, dimensions: [...(base.dimensions || []), dim] }, { type: 'dimension', data: dim });
+        done();
+        return;
+      }
+      case 'door':
+      case 'window': {
+        const proto = tool === 'door' ? createDoor({ width: 3.0 }) : createWindow({ width: 4.0 });
+        const place = placeOpeningOnWall(base, proto, world, { maxDist: OPENING_PICK_PX / viewport.scale });
+        if (!place) { showNotice(`Click on a wall with enough free length to add a ${tool}.`); return; }
+        const opening = { ...proto, ...place };
+        const key = COLLECTIONS[tool];
+        commit({ ...base, [key]: [...(base[key] || []), opening] }, { type: tool, data: opening });
+        return;
+      }
+      case 'column': {
+        const col = createColumn({ x: p.x, y: p.y, size: 0.75 });
+        commit({ ...base, columns: [...(base.columns || []), col] }, { type: 'column', data: col });
+        return;
+      }
+      case 'parking': {
+        const pk = createParking({ x: p.x, y: p.y });
+        commit({ ...base, parking: [...(base.parking || []), pk] }, { type: 'parking', data: pk });
+        return;
+      }
+      case 'staircase': {
+        const stair = createStaircase({ x: p.x, y: p.y, width: 6.0 });
+        commit({ ...base, staircases: [...(base.staircases || []), stair] }, { type: 'staircase', data: stair });
+        return;
+      }
+      case 'measure': {
+        if (!prev) { setMeasureResult(null); addPoint(); return; }
+        setMeasureResult({ a: prev, b: p });
+        done();
+        return;
+      }
+      case 'move':
+      case 'copy': {
+        if (!selection.length) { showNotice('Select the objects first.'); return; }
+        if (!prev) { addPoint(); return; }
+        const dx = p.x - prev.x;
+        const dy = p.y - prev.y;
+        if (tool === 'move') applyResult(transformSelection(base, selection, makeTranslate(dx, dy)));
+        else applyResult(copySelection(base, selection, dx, dy), { selectCreated: true });
+        done();
+        return;
+      }
+      case 'rotate':
+        if (!selection.length) { showNotice('Select the objects first.'); return; }
+        applyResult(transformSelection(base, selection, makeRotate(p, Number(toolParams.angle) || 0)));
+        return;
+      case 'scale':
+        if (!selection.length) { showNotice('Select the objects first.'); return; }
+        if (!(Number(toolParams.factor) > 0)) { showNotice('The scale factor must be greater than zero.'); return; }
+        applyResult(transformSelection(base, selection, makeScale(p, Number(toolParams.factor))));
+        return;
+      case 'mirror': {
+        if (!selection.length) { showNotice('Select the objects first.'); return; }
+        if (!prev) { addPoint(); return; }
+        if (Math.hypot(p.x - prev.x, p.y - prev.y) < 1e-3) { showNotice('The mirror line needs two different points.'); return; }
+        applyResult(transformSelection(base, selection, makeMirror(prev, p)));
+        done();
+        return;
+      }
+      case 'polar-array':
+        if (!selection.length) { showNotice('Select the objects first.'); return; }
+        applyResult(polarArray(base, selection, { count: Number(toolParams.count) || 4, angle: Number(toolParams.polarAngle) || 360, center: p }), { selectCreated: false });
+        return;
+      case 'offset': {
+        if (!toolRefs.length) {
+          const pick = pickOutline(base, world, pickTol);
+          if (!pick) { showNotice('Click a wall, line, polyline, circle or arc to offset.'); return; }
+          setToolRefs([pick]);
+          return;
+        }
+        applyResult(offsetElement(base, toolRefs[0], Number(toolParams.offset) || 0, world), { selectCreated: true });
+        setToolRefs([]);
+        return;
+      }
+      case 'trim':
+      case 'extend': {
+        const pick = pickOutline(base, world, pickTol);
+        if (!pick) { showNotice(tool === 'trim' ? 'Click the piece to remove.' : 'Click near the end to extend.'); return; }
+        applyResult((tool === 'trim' ? trimElement : extendElement)(base, pick, world));
+        return;
+      }
+      case 'break': {
+        const pick = pickOutline(base, world, pickTol);
+        if (!pick) { showNotice('Click the object to break.'); return; }
+        applyResult(breakAtClick(base, pick, world, Number(toolParams.gap) || 0));
+        return;
+      }
+      case 'fillet':
+      case 'chamfer': {
+        const pick = pickOutline(base, world, pickTol);
+        if (!pick) { showNotice('Click a wall or line.'); return; }
+        if (!toolRefs.length) {
+          setToolRefs([{ ...pick, click: world }]);
+          return;
+        }
+        const first = toolRefs[0];
+        const res = tool === 'fillet'
+          ? filletElements(base, first, pick, Number(toolParams.radius) || 0, first.click, world)
+          : chamferElements(base, first, pick, Number(toolParams.chamferA) || 0, Number(toolParams.chamferB) || 0, first.click, world);
+        applyResult(res);
+        setToolRefs([]);
+        return;
+      }
+      case 'stretch': {
+        // The window is dragged first; then a base point and a destination.
+        if (!stretchBox) return;
+        if (!prev) { addPoint(); return; }
+        applyResult(stretchInBox(base, stretchBox, p.x - prev.x, p.y - prev.y));
+        setStretchBox(null);
+        done();
+        return;
+      }
+      case 'delete': {
+        const hits = hitTestAll(base, world.x, world.y, viewport.scale, { includePlot: false });
+        if (!hits.length) return;
+        applyResult(deleteSelection(base, [{ type: hits[0].type, id: hits[0].data.id }]), { keepSelection: false });
+        return;
+      }
+      default:
+    }
+  };
+
+  // ---------------------------------------------------------------------
+  // Pointer Down
+  // ---------------------------------------------------------------------
+
+  const beginDrag = (handle, info) => {
+    movedRef.current = false;
+    setDraggingHandle(handle);
+    setDragStartInfo(info);
+    setResizeConflict(null);
+    historyManager.beginDrag();
+  };
+
   const handlePointerDown = (e) => {
     if (!containerRef.current) return;
+    if (e.button === 2) return; // context menu
+    // A second finger or button must not disturb the operation in progress.
+    if (activePointerRef.current !== null && activePointerRef.current !== e.pointerId) return;
+
+    // Commit any inspector field first, then work from the geometry it produced.
+    const focused = typeof document !== 'undefined' ? document.activeElement : null;
+    if (focused && ['INPUT', 'TEXTAREA'].includes(focused.tagName)) focused.blur();
+    const base = liveLayout();
+
     const rect = containerRef.current.getBoundingClientRect();
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
     const worldPos = screenToWorld(sx, sy);
-    const snappedPos = { x: snap(worldPos.x), y: snap(worldPos.y) };
 
     // Capture the pointer so drags and draws keep receiving events even if
     // the cursor/finger leaves the canvas mid-operation.
     if (e.currentTarget && typeof e.currentTarget.setPointerCapture === 'function' && e.pointerId !== undefined) {
       try { e.currentTarget.setPointerCapture(e.pointerId); } catch (err) { /* not capturable */ }
     }
+    activePointerRef.current = e.pointerId ?? null;
 
     // Middle click or spacebar or Pan Tool -> start panning
-    if (e.button === 1 || e.spaceKey || activeTool === 'pan') {
+    if (e.button === 1 || spaceHeldRef.current || activeTool === 'pan') {
       setIsPanning(true);
       setPanStart({ x: e.clientX - viewport.panX, y: e.clientY - viewport.panY });
       return;
     }
 
-    // 1. Tool: Draw Wall
-    if (activeTool === 'wall') {
-      if (!wallDrawStart) {
-        setWallDrawStart(snappedPos);
-      } else {
-        const newWall = createWall({
-          x1: wallDrawStart.x,
-          y1: wallDrawStart.y,
-          x2: snappedPos.x,
-          y2: snappedPos.y,
-          type: 'interior',
-        });
-        const nextLayout = {
-          ...layout,
-          walls: [...(layout.walls || []), newWall],
-        };
-        historyManager.pushState(nextLayout);
-        onUpdateLayout(nextLayout);
-        onSelectElement({ type: 'wall', data: newWall });
-        setWallDrawStart(null);
-      }
-      return;
-    }
-
-    // 2. Tool: Add Room (Click & Drag to Create)
+    // Add Room: click and drag to create
     if (activeTool === 'room') {
       const snapRes = findRoomSnapping(
         { x: worldPos.x, y: worldPos.y, width: 0, length: 0 },
-        layout,
+        base,
         {
           handle: 'draw',
           viewportScale: viewport.scale,
@@ -640,255 +967,141 @@ export default function EditorCanvas({
       setAlignmentGuides(snapRes.guides);
       setSnapBadges(snapRes.snapBadges);
       setRoomWarnings(snapRes.warnings);
-      setActiveMeasurements({
-        width: 0,
-        length: 0,
-        x: startPt.x,
-        y: startPt.y,
-        area: 0,
-      });
+      setActiveMeasurements({ width: 0, length: 0, x: startPt.x, y: startPt.y, area: 0 });
       return;
     }
 
-    // 3. Tool: Add Door
-    if (activeTool === 'door') {
-      const newDoor = createDoor({
-        x: snappedPos.x,
-        y: snappedPos.y,
-        width: 3.0,
-      });
-      const nextLayout = {
-        ...layout,
-        doors: [...(layout.doors || []), newDoor],
-      };
-      historyManager.pushState(nextLayout);
-      onUpdateLayout(nextLayout);
-      onSelectElement({ type: 'door', data: newDoor });
+    // Stretch: the first drag defines the window
+    if (activeTool === 'stretch' && !stretchBox) {
+      setBoxDrag({ start: worldPos, end: worldPos, purpose: 'stretch', startScreen: { x: sx, y: sy } });
       return;
     }
 
-    // 4. Tool: Add Window
-    if (activeTool === 'window') {
-      const newWin = createWindow({
-        x: snappedPos.x,
-        y: snappedPos.y,
-        width: 4.0,
-      });
-      const nextLayout = {
-        ...layout,
-        windows: [...(layout.windows || []), newWin],
-      };
-      historyManager.pushState(nextLayout);
-      onUpdateLayout(nextLayout);
-      onSelectElement({ type: 'window', data: newWin });
+    if (activeTool !== 'select') {
+      handleToolPick(worldPos, e, base);
       return;
     }
 
-    // 5. Tool: Add Column
-    if (activeTool === 'column') {
-      const newCol = createColumn({
-        x: snappedPos.x,
-        y: snappedPos.y,
-        size: 0.75,
-      });
-      const nextLayout = {
-        ...layout,
-        columns: [...(layout.columns || []), newCol],
-      };
-      historyManager.pushState(nextLayout);
-      onUpdateLayout(nextLayout);
-      onSelectElement({ type: 'column', data: newCol });
+    // ----- Select tool. Priority: the selected object's handles, the site
+    // handles, dimension annotations, then object bodies. -----
+    const handle = findSelectedHandle(base, sx, sy);
+    if (handle) {
+      const info = { startWorld: worldPos, initial: { ...handle.el }, snapshot: base, layoutSnapshot: base };
+      if (handle.kind === 'stair') info.bounds = handle.bounds;
+      if (handle.kind === 'opening') {
+        info.openingType = selectedElement.type;
+        info.geometry = handle.geometry;
+      }
+      if (handle.kind === 'vertex') info.vertexIndex = handle.index;
+      beginDrag(handle.id, info);
       return;
     }
 
-    // 6. Tool: Add Staircase
-    if (activeTool === 'staircase') {
-      const newStair = createStaircase({
-        x: snappedPos.x,
-        y: snappedPos.y,
-        width: 6.0,
-      });
-      const nextLayout = {
-        ...layout,
-        staircases: [...(layout.staircases || []), newStair],
-      };
-      historyManager.pushState(nextLayout);
-      onUpdateLayout(nextLayout);
-      onSelectElement({ type: 'staircase', data: newStair });
-      return;
-    }
-
-    // 7. Tool: Measure Distance
-    if (activeTool === 'measure') {
-      if (!measureStart) {
-        setMeasureStart(snappedPos);
-      } else {
-        setMeasureStart(null);
-      }
-      return;
-    }
-
-    // 8a. Site boundary edge / corner handles (select tool). A selected room's
-    //     own handles take priority so a room resize never resizes the site.
-    const selectedRoomHandle = selectedElement?.type === 'room'
-      ? findRoomHandle((layout.rooms || []).find((r) => r.id === selectedElement.data.id), sx, sy)
-      : null;
-    if (activeTool === 'select' && !selectedRoomHandle) {
-      const edgeHit = findPlotEdgeHandle(sx, sy);
-      if (edgeHit) {
-        onSelectElement({ type: 'plot', data: layout.plot });
-        setDraggingHandle('plot-edge');
-        setDragStartInfo({
-          startWorld: worldPos,
-          edge: edgeHit,
-          snapshot: cloneLayout(layout),
-          startViewport: { ...viewport },
-        });
-        historyManager.beginDrag();
-        return;
-      }
-    }
-
-    // 8b. Staircase width / length handles
-    if (activeTool === 'select' && selectedElement?.type === 'staircase') {
-      const stair = (layout.staircases || []).find((st) => st.id === selectedElement.data.id);
-      if (stair && !stair.isLocked) {
-        const b = getStaircaseBounds(stair);
-        const p0 = worldToScreen(b.x, b.y);
-        const bw = b.width * viewport.scale;
-        const bh = b.length * viewport.scale;
-        const handles = [
-          { id: 'stair-e', x: p0.x + bw, y: p0.y + bh / 2 },
-          { id: 'stair-w', x: p0.x, y: p0.y + bh / 2 },
-          { id: 'stair-s', x: p0.x + bw / 2, y: p0.y + bh },
-          { id: 'stair-n', x: p0.x + bw / 2, y: p0.y },
-        ];
-        const h = handles.find((hh) => Math.hypot(sx - hh.x, sy - hh.y) <= 10);
-        if (h) {
-          setDraggingHandle(h.id);
-          setDragStartInfo({ startWorld: worldPos, initial: { ...stair }, bounds: b });
-          historyManager.beginDrag();
-          return;
-        }
-      }
-    }
-
-    // 8. Dimension annotations take priority in the Select tool so a click on a
-    //    label never falls through and drags a wall.
-    if (activeTool === 'select') {
-      const dimHit = findDimensionAtWorldPoint(worldPos.x, worldPos.y);
-      if (dimHit) {
-        if (dimHit.onLabel) {
-          openDimensionEditor(dimHit.axis);
-          return;
-        }
-        onSelectElement({ type: 'dimension', data: dimHit.meta });
-        setDraggingHandle('dimension-line');
-        setDragStartInfo({
-          startWorld: worldPos,
-          axis: dimHit.axis,
-          initialOffset: dimHit.meta.offset,
-        });
-        historyManager.beginDrag();
-        return;
-      }
-    }
-
-    // 9. Tool: Select / Move / 8-Point Resizing
-    // Check if clicked on a selected element's handles
-    if (selectedElement) {
-      if (selectedElement.type === 'wall') {
-        const wall = selectedElement.data;
-        const d1 = Math.hypot(worldPos.x - wall.x1, worldPos.y - wall.y1);
-        const d2 = Math.hypot(worldPos.x - wall.x2, worldPos.y - wall.y2);
-        if (d1 < 1.0) {
-          setDraggingHandle('wall-p1');
-          setDragStartInfo({
-            startWorld: worldPos,
-            initial: { ...wall },
-            wallSnapshot: cloneLayout(layout.walls || []),
-          });
-          historyManager.beginDrag();
-          return;
-        }
-        if (d2 < 1.0) {
-          setDraggingHandle('wall-p2');
-          setDragStartInfo({
-            startWorld: worldPos,
-            initial: { ...wall },
-            wallSnapshot: cloneLayout(layout.walls || []),
-          });
-          historyManager.beginDrag();
-          return;
-        }
-      } else if (selectedElement.type === 'room') {
-        const room = (layout.rooms || []).find((r) => r.id === selectedElement.data.id) || selectedElement.data;
-        const rPos = worldToScreen(room.x, room.y);
-        const rW = room.width * viewport.scale;
-        const rH = room.length * viewport.scale;
-
-        // Resize: capture the pointer-down world position, the room and the
-        // whole layout. Every move is solved from this snapshot.
-        if (selectedRoomHandle && !room.isLocked) {
-          setDraggingHandle(selectedRoomHandle);
-          setDragStartInfo({
-            startWorld: worldPos,
-            initial: { ...room },
-            layoutSnapshot: cloneLayout(layout),
-          });
-          setResizeConflict(null);
-          historyManager.beginDrag();
-          return;
-        }
-
-        // Inline click-to-edit room dimension label
-        const labelCenter = { x: rPos.x + rW / 2, y: rPos.y + rH / 2 + 7 };
-        if (Math.hypot(sx - labelCenter.x, sy - labelCenter.y) <= 24) {
-          openRoomDimensionEditor(room.id, 'width', labelCenter.x, labelCenter.y, room.width);
-          return;
-        }
-      }
-    }
-
-    // General element hit detection
-    const hit = findElementAtWorldPoint(worldPos.x, worldPos.y);
-    if (hit) {
-      onSelectElement(hit);
-      if (hit.type === 'room') {
-        setDraggingHandle('room-body');
-        setDragStartInfo({
-          startWorld: worldPos,
-          hitType: 'room',
-          initial: { ...hit.data },
-          layoutSnapshot: cloneLayout(layout),
-        });
-        historyManager.beginDrag();
-        return;
-      }
-      setDraggingHandle('element-body');
-      setDragStartInfo({
+    const edgeHit = findPlotEdgeHandle(sx, sy);
+    if (edgeHit) {
+      onSelectElement({ type: 'plot', data: base.plot });
+      beginDrag('plot-edge', {
         startWorld: worldPos,
-        hitType: hit.type,
-        initial: { ...hit.data },
-        wallSnapshot: hit.type === 'wall' ? cloneLayout(layout.walls || []) : null,
-        layoutSnapshot: hit.type === 'wall' ? cloneLayout(layout) : null,
+        edge: edgeHit,
+        snapshot: cloneLayout(base),
+        startViewport: { ...viewport },
       });
-      setResizeConflict(null);
-      historyManager.beginDrag();
-    } else {
-      // Clicked on empty space -> deselect or pan
-      onSelectElement(null);
-      setIsPanning(true);
-      setPanStart({ x: e.clientX - viewport.panX, y: e.clientY - viewport.panY });
+      return;
     }
+
+    const dimHit = findDimensionAtWorldPoint(worldPos.x, worldPos.y);
+    if (dimHit) {
+      if (dimHit.onLabel) {
+        openDimensionEditor(dimHit.axis);
+        return;
+      }
+      onSelectElement({ type: 'dimension', data: dimHit.meta });
+      beginDrag('dimension-line', {
+        startWorld: worldPos,
+        axis: dimHit.axis,
+        initialOffset: dimHit.meta.offset,
+        snapshot: base,
+      });
+      return;
+    }
+
+    const hits = hitTestAll(base, worldPos.x, worldPos.y, viewport.scale);
+    const objectHits = hits.filter((h) => h.type !== 'plot');
+
+    // Shift adds to / removes from the selection and starts no drag.
+    if (e.shiftKey && objectHits.length) {
+      onSelectElement(toggleInSelection(base, selectedElement, objectHits[0]));
+      return;
+    }
+
+    if (objectHits.length === 0) {
+      // Empty plot or empty canvas: a drag draws a selection box, a click (see
+      // pointer-up) selects the plot or clears the selection.
+      setBoxDrag({
+        start: worldPos,
+        end: worldPos,
+        purpose: 'select',
+        additive: e.shiftKey,
+        startScreen: { x: sx, y: sy },
+        onPlot: hits.some((h) => h.type === 'plot'),
+      });
+      return;
+    }
+
+    // Clicking inside a multi-selection keeps it and drags all of it.
+    const selected = selectionItems(selectedElement);
+    if (selectedElement?.type === 'multi' && objectHits.some((h) => isItemSelected(selectedElement, h.type, h.data.id))) {
+      beginDrag('multi-body', { startWorld: worldPos, items: selected, snapshot: base });
+      return;
+    }
+
+    // Keep hold of the selected object when it is among the hits, so a drag never
+    // jumps to whatever overlaps it; a plain click then cycles (see pointer-up).
+    const already = objectHits.find((h) => isItemSelected(selectedElement, h.type, h.data.id));
+    const hit = already || objectHits[0];
+    const cycle = already && objectHits.length > 1 ? objectHits : null;
+    onSelectElement(toSelection(hit));
+    const el = hit.data;
+    if (el.isLocked) {
+      if (cycle) setDragStartInfo({ cycle, current: toSelection(hit), snapshot: base });
+      return;
+    }
+    if (hit.type === 'room') {
+      beginDrag('room-body', { startWorld: worldPos, hitType: 'room', initial: { ...el }, layoutSnapshot: base, snapshot: base, cycle, current: toSelection(hit) });
+      return;
+    }
+    beginDrag('element-body', { startWorld: worldPos, hitType: hit.type, initial: { ...el }, layoutSnapshot: base, snapshot: base, cycle, current: toSelection(hit) });
   };
 
-  // Pointer Move
-  const handlePointerMove = (e) => {
-    if (!containerRef.current) return;
+  const handleDoubleClick = (e) => {
+    if (activeTool === 'polyline') { finishPolyline(); return; }
+    if (activeTool !== 'select' || !containerRef.current) return;
     const rect = containerRef.current.getBoundingClientRect();
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
+    const world = screenToWorld(sx, sy);
+    const base = liveLayout();
+    const hit = hitTestAll(base, world.x, world.y, viewport.scale, { includePlot: false }).find((h) => h.type === 'room');
+    if (!hit || hit.data.isLocked) return;
+    // The label reads "width × length": the side you double-click picks the field.
+    const room = hit.data;
+    const p0 = worldToScreen(room.x, room.y);
+    const cx = p0.x + (room.width * viewport.scale) / 2;
+    const cy = p0.y + (room.length * viewport.scale) / 2 + 7;
+    const field = sx <= cx ? 'width' : 'length';
+    onSelectElement({ type: 'room', data: room });
+    openRoomDimensionEditor(room.id, field, cx, cy, room[field]);
+  };
+
+  // ---------------------------------------------------------------------
+  // Pointer Move (coalesced to one geometry update per animation frame)
+  // ---------------------------------------------------------------------
+
+  const processMove = ({ clientX, clientY, shiftKey, altKey }) => {
+    if (!containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const sx = clientX - rect.left;
+    const sy = clientY - rect.top;
     const worldPos = screenToWorld(sx, sy);
     setMouseWorldPos(worldPos);
 
@@ -900,9 +1113,14 @@ export default function EditorCanvas({
     if (isPanning) {
       setViewport((prev) => ({
         ...prev,
-        panX: e.clientX - panStart.x,
-        panY: e.clientY - panStart.y,
+        panX: clientX - panStart.x,
+        panY: clientY - panStart.y,
       }));
+      return;
+    }
+
+    if (boxDrag) {
+      setBoxDrag((prev) => (prev ? { ...prev, end: worldPos } : prev));
       return;
     }
 
@@ -937,303 +1155,315 @@ export default function EditorCanvas({
       return;
     }
 
-    // Dragging / Resizing Handles
-    if (draggingHandle && dragStartInfo && selectedElement) {
-      const dx = worldPos.x - dragStartInfo.startWorld.x;
-      const dy = worldPos.y - dragStartInfo.startWorld.y;
-
-      // Site boundary drag: always recomputed from the drag-start snapshot so
-      // the preview is deterministic and never accumulates drift.
-      if (draggingHandle === 'plot-edge') {
-        // Measure the drag in the drag-start viewport: the live viewport is
-        // shifted below (to pin the fixed edge), which would otherwise feed back.
-        const sv = dragStartInfo.startViewport;
-        const dragWorld = { x: (sx - sv.panX) / sv.scale, y: (sy - sv.panY) / sv.scale };
-        const change = computeSiteDragChange(dragStartInfo, dragWorld, e.shiftKey || e.altKey);
-        const res = applySiteChange(dragStartInfo.snapshot, change);
-        // Keep the fixed edge still on screen when the west / north edge moves.
-        setViewport((prev) => ({
-          ...prev,
-          panX: sv.panX - res.shift.x * prev.scale,
-          panY: sv.panY - res.shift.y * prev.scale,
-        }));
-        setSitePreview({
-          width: res.nextLayout.plot.width,
-          length: res.nextLayout.plot.length,
-          conflicts: res.conflicts.filter((c) => c.severity !== 'info'),
-          change,
-          success: res.success,
-        });
-        historyManager.updateDuringDrag(res.nextLayout);
-        onUpdateLayout(res.nextLayout);
-        return;
+    // Snap indicator for tools that pick points
+    if (!draggingHandle) {
+      const pickingPoints = activeTool !== 'select' && activeTool !== 'pan' && activeTool !== 'room' && activeTool !== 'delete' &&
+        !['trim', 'extend', 'fillet', 'chamfer', 'break'].includes(activeTool) && !(activeTool === 'stretch' && !stretchBox);
+      if (pickingPoints) {
+        const prev = toolPoints[toolPoints.length - 1] || null;
+        setCursorSnap(resolvePoint(worldPos, { from: prev, ortho: (activeTool === 'wall' && !allowDiagonal) || shiftKey }));
+      } else if (cursorSnap) {
+        setCursorSnap(null);
       }
+      return;
+    }
 
-      // Staircase resize: regenerates the steps (step count is preserved)
-      if (draggingHandle && draggingHandle.startsWith('stair-')) {
-        const { initial, bounds } = dragStartInfo;
-        const side = draggingHandle.slice(6);
-        const minSize = 2;
-        let next;
-        if (side === 'e' || side === 'w') {
-          const raw = side === 'e' ? bounds.width + dx : bounds.width - dx;
-          next = resizeStaircaseWorld(initial, 'x', Math.max(minSize, snap(raw)));
-          const nb = getStaircaseBounds(next);
-          next = { ...next, x: side === 'w' ? bounds.x + bounds.width - nb.width : bounds.x, y: bounds.y };
-        } else {
-          const raw = side === 's' ? bounds.length + dy : bounds.length - dy;
-          next = resizeStaircaseWorld(initial, 'y', Math.max(minSize, snap(raw)));
-          const nb = getStaircaseBounds(next);
-          next = { ...next, y: side === 'n' ? bounds.y + bounds.length - nb.length : bounds.y, x: bounds.x };
-        }
-        const nextLayout = {
-          ...layout,
-          staircases: layout.staircases.map((st) => (st.id === initial.id ? next : st)),
-        };
+    if (!dragStartInfo) return;
+
+    // Below the click threshold nothing moves, so a click can never nudge geometry.
+    if (!movedRef.current) {
+      const start = worldToScreen(dragStartInfo.startWorld.x, dragStartInfo.startWorld.y);
+      if (Math.hypot(sx - start.x, sy - start.y) < DRAG_THRESHOLD_PX) return;
+      movedRef.current = true;
+    }
+
+    const dx = worldPos.x - dragStartInfo.startWorld.x;
+    const dy = worldPos.y - dragStartInfo.startWorld.y;
+    const publish = (next) => {
+      historyManager.updateDuringDrag(next);
+      onUpdateLayout(next);
+    };
+
+    // Site boundary drag: always recomputed from the drag-start snapshot so
+    // the preview is deterministic and never accumulates drift.
+    if (draggingHandle === 'plot-edge') {
+      // Measure the drag in the drag-start viewport: the live viewport is
+      // shifted below (to pin the fixed edge), which would otherwise feed back.
+      const sv = dragStartInfo.startViewport;
+      const dragWorld = { x: (sx - sv.panX) / sv.scale, y: (sy - sv.panY) / sv.scale };
+      const change = computeSiteDragChange(dragStartInfo, dragWorld, shiftKey || altKey);
+      const res = applySiteChange(dragStartInfo.snapshot, change);
+      // Keep the fixed edge still on screen when the west / north edge moves.
+      setViewport((prev) => ({
+        ...prev,
+        panX: sv.panX - res.shift.x * prev.scale,
+        panY: sv.panY - res.shift.y * prev.scale,
+      }));
+      const preview = {
+        width: res.nextLayout.plot.width,
+        length: res.nextLayout.plot.length,
+        conflicts: res.conflicts.filter((c) => c.severity !== 'info'),
+        change,
+        success: res.success,
+      };
+      sitePreviewRef.current = preview;
+      setSitePreview(preview);
+      publish(res.nextLayout);
+      return;
+    }
+
+    const snapshot = dragStartInfo.snapshot;
+
+    // Staircase resize: regenerates the steps (step count is preserved)
+    if (draggingHandle.startsWith('stair-')) {
+      const { initial, bounds } = dragStartInfo;
+      const side = draggingHandle.slice(6);
+      const minSize = 2;
+      let next;
+      if (side === 'e' || side === 'w') {
+        const raw = side === 'e' ? bounds.width + dx : bounds.width - dx;
+        next = resizeStaircaseWorld(initial, 'x', Math.max(minSize, snap(raw)));
         const nb = getStaircaseBounds(next);
-        setActiveMeasurements({ width: nb.width, length: nb.length, x: nb.x, y: nb.y, area: nb.width * nb.length });
-        historyManager.updateDuringDrag(nextLayout);
-        onUpdateLayout(nextLayout);
-        return;
+        next = { ...next, x: side === 'w' ? bounds.x + bounds.width - nb.width : bounds.x, y: bounds.y };
+      } else {
+        const raw = side === 's' ? bounds.length + dy : bounds.length - dy;
+        next = resizeStaircaseWorld(initial, 'y', Math.max(minSize, snap(raw)));
+        const nb = getStaircaseBounds(next);
+        next = { ...next, y: side === 'n' ? bounds.y + bounds.length - nb.length : bounds.y, x: bounds.x };
       }
+      const nb = getStaircaseBounds(next);
+      setActiveMeasurements({ width: nb.width, length: nb.length, x: nb.x, y: nb.y, area: nb.width * nb.length });
+      publish({ ...snapshot, staircases: snapshot.staircases.map((st) => (st.id === initial.id ? next : st)) });
+      return;
+    }
 
-      // 0. Dimension annotation move (Mode A: changes offset only, never plot size)
-      if (draggingHandle === 'dimension-line') {
-        const axis = dragStartInfo.axis;
-        const lineDelta = axis === 'width' ? -dy : -dx;
-        const newOffset = Math.max(0.5, dragStartInfo.initialOffset + lineDelta);
-        const dimId = axis === 'width' ? 'dim-plot-width' : 'dim-plot-length';
-        const nextLayout = {
-          ...layout,
-          dimensions: (layout.dimensions || []).map((d) =>
-            d.id === dimId ? { ...d, offset: newOffset } : d
-          ),
+    // Dimension annotation move (changes offset only, never plot size)
+    if (draggingHandle === 'dimension-line') {
+      const { axis } = dragStartInfo;
+      const lineDelta = axis === 'width' ? -dy : -dx;
+      const newOffset = Math.max(0.5, dragStartInfo.initialOffset + lineDelta);
+      const dimId = axis === 'width' ? 'dim-plot-width' : 'dim-plot-length';
+      const nextLayout = {
+        ...snapshot,
+        dimensions: (snapshot.dimensions || []).map((d) => (d.id === dimId ? { ...d, offset: newOffset } : d)),
+      };
+      syncPlotDimensions(nextLayout);
+      publish(nextLayout);
+      return;
+    }
+
+    // Wall endpoint drag: the opposite endpoint stays where it is
+    if (draggingHandle === 'wall-p1' || draggingHandle === 'wall-p2') {
+      const which = draggingHandle === 'wall-p1' ? 'p1' : 'p2';
+      const wall = dragStartInfo.initial;
+      const fixed = which === 'p1' ? { x: wall.x2, y: wall.y2 } : { x: wall.x1, y: wall.y1 };
+      const target = resolvePoint(worldPos, { from: fixed, excludeWallId: wall.id, base: snapshot, ortho: shiftKey });
+      setCursorSnap(target);
+      const res = moveWallEndpointTo(snapshot, wall.id, which, target, { allowDiagonal });
+      setResizeConflict(res.reason);
+      publish(res.layout);
+      return;
+    }
+
+    // Door / window jamb drag: the opposite jamb stays where it is
+    if (draggingHandle === 'opening-a' || draggingHandle === 'opening-b') {
+      const { geometry: g, initial, openingType } = dragStartInfo;
+      const fixedEnd = draggingHandle === 'opening-a' ? 'b' : 'a';
+      const fixed = fixedEnd === 'b' ? g.b : g.a;
+      const along = Math.abs((worldPos.x - fixed.x) * g.ux + (worldPos.y - fixed.y) * g.uy);
+      const res = resizeOpening(snapshot, openingType, initial.id, snap(along), fixedEnd);
+      setResizeConflict(res.reason);
+      publish(res.layout);
+      return;
+    }
+
+    // Line / polyline vertex drag
+    if (draggingHandle === 'entity-vertex') {
+      const { initial, vertexIndex } = dragStartInfo;
+      const p = resolvePoint(worldPos, { excludeEntityId: initial.id, base: snapshot, ortho: false });
+      setCursorSnap(p);
+      let next;
+      if (initial.kind === 'line') {
+        next = vertexIndex === 0 ? { ...initial, x1: p.x, y1: p.y } : { ...initial, x2: p.x, y2: p.y };
+      } else {
+        next = {
+          ...initial,
+          shape: initial.shape === 'rect' ? 'polygon' : initial.shape,
+          points: initial.points.map((q, i) => (i === vertexIndex ? { x: p.x, y: p.y } : q)),
         };
-        syncPlotDimensions(nextLayout);
-        historyManager.updateDuringDrag(nextLayout);
-        onUpdateLayout(nextLayout);
+      }
+      publish({ ...snapshot, cadEntities: snapshot.cadEntities.map((c) => (c.id === initial.id ? next : c)) });
+      return;
+    }
+
+    // Circle / arc radius drag
+    if (draggingHandle === 'entity-radius') {
+      const { initial } = dragStartInfo;
+      const r = Math.max(0.1, snap(Math.hypot(worldPos.x - initial.cx, worldPos.y - initial.cy)));
+      publish({ ...snapshot, cadEntities: snapshot.cadEntities.map((c) => (c.id === initial.id ? { ...initial, r } : c)) });
+      return;
+    }
+
+    // Room body drag (whole room, smart alignment snapping, walls follow)
+    if (draggingHandle === 'room-body') {
+      const init = dragStartInfo.initial;
+      const proposed = { ...init, x: init.x + dx, y: init.y + dy };
+      const snapRes = findRoomSnapping(proposed, snapshot, {
+        excludeRoomId: init.id,
+        handle: 'body',
+        viewportScale: viewport.scale,
+        screenTolerancePixels: roomSnapPixelTolerance,
+        snapEnabled,
+        snapStep,
+      });
+      const target = snapRes.snappedRoom;
+      const { layout: nextLayout, room: updatedRoom } = moveRoom(snapshot, init.id, target.x - init.x, target.y - init.y);
+      publish(nextLayout);
+      setAlignmentGuides(snapRes.guides);
+      setSnapBadges(snapRes.snapBadges);
+      setRoomWarnings(snapRes.warnings);
+      setActiveMeasurements({
+        width: updatedRoom.width,
+        length: updatedRoom.length,
+        x: updatedRoom.x,
+        y: updatedRoom.y,
+        area: updatedRoom.width * updatedRoom.length,
+      });
+      return;
+    }
+
+    // Room resizing (edges and corners). dx / dy are world-feet deltas from the
+    // pointer-down position; geometry comes from the pointer-down snapshot.
+    if (draggingHandle.startsWith('room-')) {
+      const handleCode = draggingHandle.replace('room-', '');
+      const init = dragStartInfo.initial;
+      const raw = edgeTargetsForHandle(init, handleCode, dx, dy);
+
+      // Snap the moving edge(s) to grid / alignment targets of the snapshot
+      const proposed = {
+        x: raw.left ?? init.x,
+        y: raw.top ?? init.y,
+        width: (raw.right ?? init.x + init.width) - (raw.left ?? init.x),
+        length: (raw.bottom ?? init.y + init.length) - (raw.top ?? init.y),
+      };
+      const snapRes = findRoomSnapping(proposed, snapshot, {
+        excludeRoomId: init.id,
+        handle: handleCode,
+        anchor: {
+          x: handleCode.includes('w') ? init.x + init.width : init.x,
+          y: handleCode.includes('n') ? init.y + init.length : init.y,
+        },
+        viewportScale: viewport.scale,
+        screenTolerancePixels: roomSnapPixelTolerance,
+        snapEnabled,
+        snapStep,
+      });
+      const sr = snapRes.snappedRoom;
+      const targets = {};
+      if (raw.left !== undefined) targets.left = sr.x;
+      if (raw.right !== undefined) targets.right = sr.x + sr.width;
+      if (raw.top !== undefined) targets.top = sr.y;
+      if (raw.bottom !== undefined) targets.bottom = sr.y + sr.length;
+
+      const res = resizeRoom(snapshot, init.id, targets);
+      const updatedRoom = res.room;
+      publish(res.layout);
+      setAlignmentGuides(snapRes.guides);
+      setSnapBadges(snapRes.snapBadges);
+      setRoomWarnings(snapRes.warnings);
+      setResizeConflict(res.conflicts[0] || null);
+      setActiveMeasurements({
+        width: updatedRoom.width,
+        length: updatedRoom.length,
+        x: updatedRoom.x,
+        y: updatedRoom.y,
+        area: updatedRoom.width * updatedRoom.length,
+      });
+      return;
+    }
+
+    // Several objects together
+    if (draggingHandle === 'multi-body') {
+      const res = transformSelection(snapshot, dragStartInfo.items, makeTranslate(snap(dx), snap(dy)));
+      setResizeConflict(res.skipped[0] || null);
+      publish(res.layout);
+      return;
+    }
+
+    // General object body move
+    if (draggingHandle === 'element-body') {
+      const type = dragStartInfo.hitType;
+      const init = dragStartInfo.initial;
+      if (type === 'wall') {
+        const res = moveWallBody(snapshot, init.id, snap(dx), snap(dy), { allowDiagonal });
+        setResizeConflict(res.clamped ? res.reason : null);
+        publish(res.layout);
         return;
       }
-
-      // 1 & 2. Wall Endpoint drag: resize while keeping the wall perfectly straight
-      if ((draggingHandle === 'wall-p1' || draggingHandle === 'wall-p2') && selectedElement.type === 'wall') {
-        const which = draggingHandle === 'wall-p1' ? 'p1' : 'p2';
-        const wallId = dragStartInfo.initial.id;
-        const snapshot = dragStartInfo.wallSnapshot || layout.walls || [];
-        const sel = snapshot.find((w) => w.id === wallId) || dragStartInfo.initial;
-        const orig = which === 'p1' ? { x: sel.x1, y: sel.y1 } : { x: sel.x2, y: sel.y2 };
-        const orientation = getWallOrientation(sel);
-
-        let target = { x: snap(worldPos.x), y: snap(worldPos.y) };
-        let guides = [];
-
-        // Lock the free axis for axis-aligned walls (unless diagonal mode on)
-        const lockAxis = !allowDiagonal && (orientation === 'horizontal' || orientation === 'vertical');
-        if (lockAxis && orientation === 'horizontal') target.y = orig.y;
-        if (lockAxis && orientation === 'vertical') target.x = orig.x;
-
-        // Endpoint / corner snapping to other wall endpoints
-        const endpointHit = findEndpointSnap(
-          { x: worldPos.x, y: worldPos.y },
-          snapshot,
-          snapTolerance,
-          wallId,
-          orig
-        );
-        if (endpointHit) {
-          target = { x: endpointHit.x, y: endpointHit.y };
-        } else if (lockAxis) {
-          const axis = orientation === 'horizontal' ? 'x' : 'y';
-          const aligned = findAlignmentGuides(target, snapshot, axis, snapTolerance * 0.7, wallId);
-          if (aligned.guides.length > 0) {
-            target[axis] = aligned[axis];
-            guides = aligned.guides;
-          }
-        }
-
-        if (lockAxis && orientation === 'horizontal') target.y = orig.y;
-        if (lockAxis && orientation === 'vertical') target.x = orig.x;
-
-        const newSel = moveWallEndpoint(sel, which, target, { allowDiagonal });
-        const newEndpoint = which === 'p1' ? { x: newSel.x1, y: newSel.y1 } : { x: newSel.x2, y: newSel.y2 };
-
-        let nextWalls = snapshot.map((w) => (w.id === wallId ? newSel : w));
-        nextWalls = moveConnectedEndpoints(nextWalls, orig, newEndpoint, wallId, 0.3);
-
-        setAlignmentGuides(guides);
-        const nextLayout = { ...layout, walls: nextWalls };
-        historyManager.updateDuringDrag(nextLayout);
-        onUpdateLayout(nextLayout);
+      if (type === 'door' || type === 'window') {
+        // An opening can only travel along walls; off-wall it waits at its last valid spot.
+        const res = moveOpening(snapshot, type, init.id, { x: snap(init.x + dx), y: snap(init.y + dy) }, { maxDist: OPENING_PICK_PX / viewport.scale });
+        if (res.moved) publish(res.layout);
+        setResizeConflict(res.moved ? null : res.reason);
         return;
       }
-
-      // 3. Room Body Drag (Move whole room with smart alignment snapping & wall sync)
-      if (draggingHandle === 'room-body' && selectedElement.type === 'room') {
-        const snapshot = dragStartInfo.layoutSnapshot;
-        const init = dragStartInfo.initial;
-        const proposed = { ...init, x: init.x + dx, y: init.y + dy };
-        const snapRes = findRoomSnapping(proposed, snapshot, {
-          excludeRoomId: init.id,
-          handle: 'body',
-          viewportScale: viewport.scale,
-          screenTolerancePixels: roomSnapPixelTolerance,
-          snapEnabled,
-          snapStep,
-        });
-        const target = snapRes.snappedRoom;
-        const { layout: nextLayout, room: updatedRoom } = moveRoom(snapshot, init.id, target.x - init.x, target.y - init.y);
-        historyManager.updateDuringDrag(nextLayout);
-        onUpdateLayout(nextLayout);
-        setAlignmentGuides(snapRes.guides);
-        setSnapBadges(snapRes.snapBadges);
-        setRoomWarnings(snapRes.warnings);
-        setActiveMeasurements({
-          width: updatedRoom.width,
-          length: updatedRoom.length,
-          x: updatedRoom.x,
-          y: updatedRoom.y,
-          area: updatedRoom.width * updatedRoom.length,
-        });
-        return;
-      }
-
-      // 4. Room resizing (edges and corners). dx / dy are world-feet deltas from
-      //    the pointer-down position; geometry comes from the pointer-down
-      //    snapshot, so nothing accumulates between move events.
-      if (draggingHandle.startsWith('room-') && selectedElement.type === 'room') {
-        const handleCode = draggingHandle.replace('room-', '');
-        const init = dragStartInfo.initial;
-        const snapshot = dragStartInfo.layoutSnapshot;
-        const raw = edgeTargetsForHandle(init, handleCode, dx, dy);
-
-        // Snap the moving edge(s) to grid / alignment targets of the snapshot
-        const proposed = {
-          x: raw.left ?? init.x,
-          y: raw.top ?? init.y,
-          width: (raw.right ?? init.x + init.width) - (raw.left ?? init.x),
-          length: (raw.bottom ?? init.y + init.length) - (raw.top ?? init.y),
-        };
-        const snapRes = findRoomSnapping(proposed, snapshot, {
-          excludeRoomId: init.id,
-          handle: handleCode,
-          anchor: {
-            x: handleCode.includes('w') ? init.x + init.width : init.x,
-            y: handleCode.includes('n') ? init.y + init.length : init.y,
-          },
-          viewportScale: viewport.scale,
-          screenTolerancePixels: roomSnapPixelTolerance,
-          snapEnabled,
-          snapStep,
-        });
-        const sr = snapRes.snappedRoom;
-        const targets = {};
-        if (raw.left !== undefined) targets.left = sr.x;
-        if (raw.right !== undefined) targets.right = sr.x + sr.width;
-        if (raw.top !== undefined) targets.top = sr.y;
-        if (raw.bottom !== undefined) targets.bottom = sr.y + sr.length;
-
-        const res = resizeRoom(snapshot, init.id, targets);
-        const updatedRoom = res.room;
-        historyManager.updateDuringDrag(res.layout);
-        onUpdateLayout(res.layout);
-        setAlignmentGuides(snapRes.guides);
-        setSnapBadges(snapRes.snapBadges);
-        setRoomWarnings(snapRes.warnings);
-        setResizeConflict(res.conflicts[0] || null);
-        setActiveMeasurements({
-          width: updatedRoom.width,
-          length: updatedRoom.length,
-          x: updatedRoom.x,
-          y: updatedRoom.y,
-          area: updatedRoom.width * updatedRoom.length,
-        });
-        return;
-      }
-
-      // 5. General Element Body Move (wall, door, window, staircase, etc.)
-      if (draggingHandle === 'element-body') {
-        const elemType = dragStartInfo.hitType;
-        const id = dragStartInfo.initial.id;
-
-        if (elemType === 'wall' && dragStartInfo.layoutSnapshot) {
-          const w0 = dragStartInfo.initial;
-          const vertical = Math.abs(w0.x1 - w0.x2) < 0.02;
-          const horizontal = Math.abs(w0.y1 - w0.y2) < 0.02;
-          if (vertical || horizontal) {
-            const res = moveWallBoundary(dragStartInfo.layoutSnapshot, id, vertical ? snap(dx) : snap(dy));
-            if (res) {
-              historyManager.updateDuringDrag(res.layout);
-              onUpdateLayout(res.layout);
-              setResizeConflict(res.clamped ? res.reason : null);
-              return;
-            }
-          }
-        }
-        if (elemType === 'wall') {
-          const moveX = snap(dx);
-          const moveY = snap(dy);
-          const snapshot = dragStartInfo.wallSnapshot || layout.walls || [];
-          const orig = snapshot.find((w) => w.id === id) || dragStartInfo.initial;
-          const newA = { x: orig.x1 + moveX, y: orig.y1 + moveY };
-          const newB = { x: orig.x2 + moveX, y: orig.y2 + moveY };
-          const tolerance = 0.25;
-
-          const nextWalls = snapshot.map((w) => {
-            if (w.id === id) {
-              return { ...w, x1: newA.x, y1: newA.y, x2: newB.x, y2: newB.y };
-            }
-            let nx1 = w.x1, ny1 = w.y1, nx2 = w.x2, ny2 = w.y2, changed = false;
-            if (Math.hypot(w.x1 - orig.x1, w.y1 - orig.y1) <= tolerance) { nx1 = newA.x; ny1 = newA.y; changed = true; }
-            if (Math.hypot(w.x2 - orig.x1, w.y2 - orig.y1) <= tolerance) { nx2 = newA.x; ny2 = newA.y; changed = true; }
-            if (Math.hypot(w.x1 - orig.x2, w.y1 - orig.y2) <= tolerance) { nx1 = newB.x; ny1 = newB.y; changed = true; }
-            if (Math.hypot(w.x2 - orig.x2, w.y2 - orig.y2) <= tolerance) { nx2 = newB.x; ny2 = newB.y; changed = true; }
-            return changed ? { ...w, x1: nx1, y1: ny1, x2: nx2, y2: ny2 } : w;
-          });
-          const nextLayout = { ...layout, walls: nextWalls };
-          historyManager.updateDuringDrag(nextLayout);
-          onUpdateLayout(nextLayout);
-        } else if (elemType === 'door') {
-          const newX = snap(dragStartInfo.initial.x + dx);
-          const newY = snap(dragStartInfo.initial.y + dy);
-          const nextDoors = layout.doors.map((d) => (d.id === id ? { ...d, x: newX, y: newY } : d));
-          const nextLayout = { ...layout, doors: nextDoors };
-          historyManager.updateDuringDrag(nextLayout);
-          onUpdateLayout(nextLayout);
-        } else if (elemType === 'window') {
-          const newX = snap(dragStartInfo.initial.x + dx);
-          const newY = snap(dragStartInfo.initial.y + dy);
-          const nextWins = layout.windows.map((w) => (w.id === id ? { ...w, x: newX, y: newY } : w));
-          const nextLayout = { ...layout, windows: nextWins };
-          historyManager.updateDuringDrag(nextLayout);
-          onUpdateLayout(nextLayout);
-        } else if (elemType === 'staircase') {
-          const newX = snap(dragStartInfo.initial.x + dx);
-          const newY = snap(dragStartInfo.initial.y + dy);
-          const nextStairs = layout.staircases.map((s) => (s.id === id ? { ...s, x: newX, y: newY } : s));
-          const nextLayout = { ...layout, staircases: nextStairs };
-          historyManager.updateDuringDrag(nextLayout);
-          onUpdateLayout(nextLayout);
-        } else if (elemType === 'utility') {
-          const newX = snap(dragStartInfo.initial.x + dx);
-          const newY = snap(dragStartInfo.initial.y + dy);
-          const nextUtils = layout.utilities.map((u) => (u.id === id ? { ...u, x: newX, y: newY } : u));
-          const nextLayout = { ...layout, utilities: nextUtils };
-          historyManager.updateDuringDrag(nextLayout);
-          onUpdateLayout(nextLayout);
-        } else if (elemType === 'parking') {
-          const newX = snap(dragStartInfo.initial.x + dx);
-          const newY = snap(dragStartInfo.initial.y + dy);
-          const nextParks = layout.parking.map((p) => (p.id === id ? { ...p, x: newX, y: newY } : p));
-          const nextLayout = { ...layout, parking: nextParks };
-          historyManager.updateDuringDrag(nextLayout);
-          onUpdateLayout(nextLayout);
-        }
+      // Rigid objects: the object's own position lands on the grid, keeping its shape.
+      const anchorX = type === 'entity' ? (init.kind === 'line' ? init.x1 : init.points ? init.points[0].x : init.cx)
+        : type === 'dimension' ? init.x1 : init.x;
+      const anchorY = type === 'entity' ? (init.kind === 'line' ? init.y1 : init.points ? init.points[0].y : init.cy)
+        : type === 'dimension' ? init.y1 : init.y;
+      const T = makeTranslate(snap(anchorX + dx) - anchorX, snap(anchorY + dy) - anchorY);
+      const res = transformElement(init, type, T);
+      if (res.el) {
+        const key = COLLECTIONS[type];
+        publish({ ...snapshot, [key]: (snapshot[key] || []).map((o) => (o.id === init.id ? res.el : o)) });
       }
     }
   };
+  processMoveRef.current = processMove;
 
+  const flushPendingMove = () => {
+    if (rafRef.current !== null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    if (pendingMoveRef.current) {
+      const move = pendingMoveRef.current;
+      pendingMoveRef.current = null;
+      processMoveRef.current(move);
+    }
+  };
+
+  const handlePointerMove = (e) => {
+    if (activePointerRef.current !== null && e.pointerId !== activePointerRef.current) return;
+    pendingMoveRef.current = { clientX: e.clientX, clientY: e.clientY, shiftKey: e.shiftKey, altKey: e.altKey };
+    if (rafRef.current === null) {
+      rafRef.current = requestAnimationFrame(() => {
+        rafRef.current = null;
+        const move = pendingMoveRef.current;
+        pendingMoveRef.current = null;
+        if (move) processMoveRef.current(move);
+      });
+    }
+  };
+
+  useEffect(() => () => {
+    if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+  }, []);
+
+  // ---------------------------------------------------------------------
   // Pointer Up
+  // ---------------------------------------------------------------------
+
   const handlePointerUp = (e) => {
+    if (activePointerRef.current !== null && e?.pointerId !== undefined && e.pointerId !== activePointerRef.current) return;
+    activePointerRef.current = null;
+    siteDragActiveRef.current = false;
+
+    // Apply the final pointer position even if its frame had not run yet: the
+    // state setters below take effect on the next render, so read through refs.
+    if (pendingMoveRef.current) flushPendingMove();
+
     if (isPanning) {
       setIsPanning(false);
     }
@@ -1242,14 +1472,39 @@ export default function EditorCanvas({
       try { e.currentTarget.releasePointerCapture(e.pointerId); } catch (err) {}
     }
 
+    if (boxDrag) {
+      const box = boxDrag;
+      setBoxDrag(null);
+      const a = worldToScreen(box.start.x, box.start.y);
+      const rect = containerRef.current?.getBoundingClientRect();
+      const upWorld = rect && e?.clientX !== undefined ? screenToWorld(e.clientX - rect.left, e.clientY - rect.top) : box.end;
+      const b = worldToScreen(upWorld.x, upWorld.y);
+      const isDrag = Math.hypot(b.x - a.x, b.y - a.y) >= DRAG_THRESHOLD_PX;
+      if (box.purpose === 'stretch') {
+        if (isDrag) setStretchBox({ x1: box.start.x, y1: box.start.y, x2: upWorld.x, y2: upWorld.y });
+        return;
+      }
+      if (!isDrag) {
+        onSelectElement(box.onPlot ? { type: 'plot', data: layout.plot } : null);
+        return;
+      }
+      const items = boxSelect(liveLayout(), box.start, upWorld, viewport.scale);
+      onSelectElement(selectionFromItems(liveLayout(), items));
+      return;
+    }
+
     if (activeTool === 'room' && roomDrawStart) {
+      const end = (() => {
+        const rect = containerRef.current?.getBoundingClientRect();
+        return rect && e?.clientX !== undefined ? screenToWorld(e.clientX - rect.left, e.clientY - rect.top) : mouseWorldPos;
+      })();
       const rawBox = {
-        x: Math.min(roomDrawStart.x, mouseWorldPos.x),
-        y: Math.min(roomDrawStart.y, mouseWorldPos.y),
-        width: Math.abs(mouseWorldPos.x - roomDrawStart.x),
-        length: Math.abs(mouseWorldPos.y - roomDrawStart.y),
-        freeX: mouseWorldPos.x,
-        freeY: mouseWorldPos.y,
+        x: Math.min(roomDrawStart.x, end.x),
+        y: Math.min(roomDrawStart.y, end.y),
+        width: Math.abs(end.x - roomDrawStart.x),
+        length: Math.abs(end.y - roomDrawStart.y),
+        freeX: end.x,
+        freeY: end.y,
       };
       const snapRes = findRoomSnapping(rawBox, layout, {
         handle: 'draw',
@@ -1265,7 +1520,7 @@ export default function EditorCanvas({
       let finalX = r.x;
       let finalY = r.y;
 
-      const dragDist = Math.hypot(mouseWorldPos.x - roomDrawStart.x, mouseWorldPos.y - roomDrawStart.y);
+      const dragDist = Math.hypot(end.x - roomDrawStart.x, end.y - roomDrawStart.y);
       if (dragDist < 0.6) {
         finalW = 12;
         finalL = 10;
@@ -1276,7 +1531,7 @@ export default function EditorCanvas({
       if (finalW >= MIN_ROOM_DIMENSION && finalL >= MIN_ROOM_DIMENSION) {
         finalizeRoomPlacement({ x: finalX, y: finalY, width: finalW, length: finalL });
       } else {
-        showPlacementNotice(`Room too small - minimum ${formatMeasurement(MIN_ROOM_DIMENSION, unit)} × ${formatMeasurement(MIN_ROOM_DIMENSION, unit)} required`);
+        showNotice(`Room too small - minimum ${formatMeasurement(MIN_ROOM_DIMENSION, unit)} × ${formatMeasurement(MIN_ROOM_DIMENSION, unit)} required`);
       }
 
       setRoomDrawStart(null);
@@ -1288,7 +1543,8 @@ export default function EditorCanvas({
     }
 
     if (draggingHandle === 'plot-edge' && dragStartInfo) {
-      const preview = sitePreview;
+      const preview = sitePreviewRef.current;
+      sitePreviewRef.current = null;
       const startViewport = dragStartInfo.startViewport;
       setSitePreview(null);
       setDraggingHandle(null);
@@ -1303,20 +1559,32 @@ export default function EditorCanvas({
         return;
       }
       // One undoable transaction for the whole resize + reflow
-      historyManager.endDrag(layout);
+      historyManager.endDrag(historyManager.getCurrent());
       return;
     }
 
     if (draggingHandle) {
-      if (resizeConflict) showPlacementNotice(`Stopped at the nearest valid size: ${resizeConflict}`);
+      if (resizeConflict) showNotice(`Stopped at the nearest valid position: ${resizeConflict}`);
+      const wasClick = !movedRef.current;
+      const info = dragStartInfo;
       setResizeConflict(null);
-      historyManager.endDrag(layout);
+      historyManager.endDrag(historyManager.getCurrent());
       setDraggingHandle(null);
       setDragStartInfo(null);
       setAlignmentGuides([]);
       setSnapBadges([]);
       setRoomWarnings([]);
       setActiveMeasurements(null);
+      setCursorSnap(null);
+      movedRef.current = false;
+      if (wasClick && info?.cycle) onSelectElement(toSelection(nextOverlappingHit(info.cycle, info.current)));
+      return;
+    }
+
+    // A locked object has no drag, but a click still cycles through overlaps.
+    if (dragStartInfo?.cycle) {
+      onSelectElement(toSelection(nextOverlappingHit(dragStartInfo.cycle, dragStartInfo.current)));
+      setDragStartInfo(null);
     }
   };
 
@@ -1331,7 +1599,7 @@ export default function EditorCanvas({
     for (let x = 0; x <= plotW; x += stepX) {
       const scr = worldToScreen(x, 0);
       ticksX.push(
-        <div key={`rx-${x}`} style={{ position: 'absolute', left: scr.x, top: 0, height: 18, borderLeft: '1px solid #94A3B8', paddingLeft: 3 }}>
+        <div key={`rx-${x}`} style={{ position: 'absolute', left: scr.x - 24, top: 0, height: 18, borderLeft: '1px solid #94A3B8', paddingLeft: 3 }}>
           <span style={{ fontSize: 9, color: '#64748B', fontWeight: 600 }}>{formatMeasurement(x, unit, 0)}</span>
         </div>
       );
@@ -1342,7 +1610,7 @@ export default function EditorCanvas({
     for (let y = 0; y <= plotL; y += stepY) {
       const scr = worldToScreen(0, y);
       ticksY.push(
-        <div key={`ry-${y}`} style={{ position: 'absolute', top: scr.y, left: 0, width: 24, borderTop: '1px solid #94A3B8', paddingTop: 2 }}>
+        <div key={`ry-${y}`} style={{ position: 'absolute', top: scr.y - 22, left: 0, width: 24, borderTop: '1px solid #94A3B8', paddingTop: 2 }}>
           <span style={{ fontSize: 9, color: '#64748B', fontWeight: 600 }}>{formatMeasurement(y, unit, 0)}</span>
         </div>
       );
@@ -1481,14 +1749,14 @@ export default function EditorCanvas({
         touchAction: 'none',
         userSelect: 'none',
         WebkitUserSelect: 'none',
-        cursor: activeTool === 'pan' || isPanning ? 'grabbing' : (activeTool === 'wall' || activeTool === 'room' ? 'crosshair' : 'default'),
+        cursor: activeTool === 'pan' || isPanning ? 'grabbing' : (activeTool === 'select' ? 'default' : 'crosshair'),
       }}
-      onWheel={handleWheel}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
-      onPointerLeave={handlePointerUp}
       onPointerCancel={handlePointerUp}
+      onLostPointerCapture={(e) => { if (activePointerRef.current !== null) handlePointerUp(e); }}
+      onDoubleClick={handleDoubleClick}
     >
       {/* Top & Left Architectural Precision Rulers */}
       {renderRulers()}
@@ -1620,44 +1888,12 @@ export default function EditorCanvas({
           );
         })()}
 
-        {/* Live alignment guides while dragging wall endpoints */}
-        {alignmentGuides.map((g, i) => {
-          if (g.orientation === 'v') {
-            const p = worldToScreen(g.pos, 0);
-            return (
-              <line
-                key={`ag-${i}`}
-                x1={p.x}
-                y1={plotScr.y - 60}
-                x2={p.x}
-                y2={plotScr.y + plotHeightPx + 60}
-                stroke="#EC4899"
-                strokeWidth="1"
-                strokeDasharray="5,4"
-              />
-            );
-          }
-          const p = worldToScreen(0, g.pos);
-          return (
-            <line
-              key={`ag-${i}`}
-              x1={plotScr.x - 60}
-              y1={p.y}
-              x2={plotScr.x + plotWidthPx + 60}
-              y2={p.y}
-              stroke="#EC4899"
-              strokeWidth="1"
-              strokeDasharray="5,4"
-            />
-          );
-        })}
-
         {/* Rooms Layer */}
         {(layout?.rooms || []).map(room => {
           const rPos = worldToScreen(room.x, room.y);
           const rW = room.width * viewport.scale;
           const rH = room.length * viewport.scale;
-          const isSel = selectedElement?.type === 'room' && selectedElement.data.id === room.id;
+          const isSel = isItemSelected(selectedElement, 'room', room.id);
           const area = room.width * room.length;
 
           return (
@@ -1687,13 +1923,7 @@ export default function EditorCanvas({
               </text>
 
               {showDimensions && (
-                <g
-                  style={{ cursor: 'pointer', pointerEvents: 'all' }}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    openRoomDimensionEditor(room.id, 'width', rPos.x + rW / 2, rPos.y + rH / 2 + 7, room.width);
-                  }}
-                >
+                <g>
                   <text
                     x={rPos.x + rW / 2}
                     y={rPos.y + rH / 2 + 7}
@@ -1720,7 +1950,7 @@ export default function EditorCanvas({
               )}
 
               {/* 8-Point Selection & Resize Handles */}
-              {isSel && (
+              {isSel && selectedElement.type === 'room' && !room.isLocked && (
                 <g key={`room-handles-${room.id}`}>
                   {/* Subtle selection outer glow */}
                   <rect
@@ -1845,7 +2075,7 @@ export default function EditorCanvas({
           const pPos = worldToScreen(p.x, p.y);
           const pW = p.width * viewport.scale;
           const pH = p.length * viewport.scale;
-          const isSel = selectedElement?.type === 'parking' && selectedElement.data.id === p.id;
+          const isSel = isItemSelected(selectedElement, 'parking', p.id);
           return (
             <g key={p.id}>
               <rect
@@ -1869,7 +2099,7 @@ export default function EditorCanvas({
           const uPos = worldToScreen(u.x, u.y);
           const uW = u.width * viewport.scale;
           const uH = u.length * viewport.scale;
-          const isSel = selectedElement?.type === 'utility' && selectedElement.data.id === u.id;
+          const isSel = isItemSelected(selectedElement, 'utility', u.id);
           return (
             <g key={u.id}>
               <rect
@@ -1891,7 +2121,7 @@ export default function EditorCanvas({
 
         {(layout?.staircases || []).map(s => {
           const geo = calculateStaircaseGeometry(s);
-          const isSel = selectedElement?.type === 'staircase' && selectedElement.data.id === s.id;
+          const isSel = isItemSelected(selectedElement, 'staircase', s.id);
           const pts = (poly) => poly.map((pt) => { const q = worldToScreen(pt.x, pt.y); return `${q.x},${q.y}`; }).join(' ');
           const ln = (l, key, stroke, w) => {
             const a = worldToScreen(l.x1, l.y1);
@@ -1921,7 +2151,7 @@ export default function EditorCanvas({
               <text x={label.x} y={label.y + 3} textAnchor="middle" fontSize="9" fontWeight="bold" fill="#0F172A">
                 {`${geo.labelText} · ${geo.metrics.totalRisers}R`}
               </text>
-              {isSel && !s.isLocked && [
+              {isSel && selectedElement.type === 'staircase' && !s.isLocked && [
                 { id: 'e', x: p0.x + bw, y: p0.y + bh / 2, c: 'ew-resize' },
                 { id: 'w', x: p0.x, y: p0.y + bh / 2, c: 'ew-resize' },
                 { id: 's', x: p0.x + bw / 2, y: p0.y + bh, c: 'ns-resize' },
@@ -1937,18 +2167,13 @@ export default function EditorCanvas({
         {(layout?.columns || []).map(col => {
           const cPos = worldToScreen(col.x, col.y);
           const cSize = (col.size || 0.75) * viewport.scale;
-          const isSel = selectedElement?.type === 'column' && selectedElement.data.id === col.id;
+          const isSel = isItemSelected(selectedElement, 'column', col.id);
+          const stroke = isSel ? '#2563EB' : '#0F172A';
           return (
             <g key={col.id}>
-              <rect
-                x={cPos.x - cSize / 2}
-                y={cPos.y - cSize / 2}
-                width={cSize}
-                height={cSize}
-                fill="#475569"
-                stroke={isSel ? '#2563EB' : '#0F172A'}
-                strokeWidth={isSel ? 2 : 1}
-              />
+              {col.shape === 'round'
+                ? <circle cx={cPos.x} cy={cPos.y} r={cSize / 2} fill="#475569" stroke={stroke} strokeWidth={isSel ? 2 : 1} />
+                : <rect x={cPos.x - cSize / 2} y={cPos.y - cSize / 2} width={cSize} height={cSize} fill="#475569" stroke={stroke} strokeWidth={isSel ? 2 : 1} />}
             </g>
           );
         })}
@@ -1958,7 +2183,7 @@ export default function EditorCanvas({
           const p1 = worldToScreen(wall.x1, wall.y1);
           const p2 = worldToScreen(wall.x2, wall.y2);
           const strokeW = Math.max(3, (wall.thickness || 0.75) * viewport.scale);
-          const isSel = selectedElement?.type === 'wall' && selectedElement.data.id === wall.id;
+          const isSel = isItemSelected(selectedElement, 'wall', wall.id);
 
           return (
             <g key={wall.id}>
@@ -1987,7 +2212,7 @@ export default function EditorCanvas({
               />
 
               {/* Interactive Endpoint Handles when Selected */}
-              {isSel && (
+              {isSel && selectedElement.type === 'wall' && !wall.isLocked && (
                 <>
                   <circle cx={p1.x} cy={p1.y} r="7" fill="#2563EB" stroke="#FFFFFF" strokeWidth="2" cursor="move" />
                   <circle cx={p2.x} cy={p2.y} r="7" fill="#2563EB" stroke="#FFFFFF" strokeWidth="2" cursor="move" />
@@ -1997,74 +2222,168 @@ export default function EditorCanvas({
           );
         })}
 
+        {/* CAD Entities */}
+        {(layout?.cadEntities || []).map((ent) => {
+          const isSel = isItemSelected(selectedElement, 'entity', ent.id);
+          const color = isSel ? '#2563EB' : (ent.color || '#0F172A');
+          const props = { fill: 'none', stroke: color, strokeWidth: isSel ? 2.5 : 1.5 };
+          const single = isSel && selectedElement.type === 'entity' && !ent.isLocked;
+          const pts = (list) => list.map((p) => { const q = worldToScreen(p.x, p.y); return `${q.x},${q.y}`; }).join(' ');
+          const dot = (key, x, y) => {
+            const q = worldToScreen(x, y);
+            return <rect key={key} x={q.x - 4} y={q.y - 4} width="8" height="8" fill="#FFFFFF" stroke="#2563EB" strokeWidth="1.5" style={{ cursor: 'move', pointerEvents: 'all' }} />;
+          };
+          if (ent.kind === 'line') {
+            const a = worldToScreen(ent.x1, ent.y1);
+            const b = worldToScreen(ent.x2, ent.y2);
+            return (
+              <g key={ent.id}>
+                <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} {...props} />
+                {single && dot('v0', ent.x1, ent.y1)}
+                {single && dot('v1', ent.x2, ent.y2)}
+              </g>
+            );
+          }
+          if (ent.points) {
+            return (
+              <g key={ent.id}>
+                {ent.closed ? <polygon points={pts(ent.points)} {...props} /> : <polyline points={pts(ent.points)} {...props} />}
+                {single && ent.points.map((p, i) => dot(`v${i}`, p.x, p.y))}
+              </g>
+            );
+          }
+          const c = worldToScreen(ent.cx, ent.cy);
+          const r = ent.r * viewport.scale;
+          if (ent.kind === 'circle') {
+            return (
+              <g key={ent.id}>
+                <circle cx={c.x} cy={c.y} r={r} {...props} />
+                {single && dot('r', ent.cx + ent.r, ent.cy)}
+              </g>
+            );
+          }
+          const sweep = arcSweep(ent);
+          const a = pointAtAngle(ent, ent.start);
+          const b = pointAtAngle(ent, ent.end);
+          const m = pointAtAngle(ent, ent.start + sweep / 2);
+          const sa = worldToScreen(a.x, a.y);
+          const sb = worldToScreen(b.x, b.y);
+          return (
+            <g key={ent.id}>
+              <path d={`M ${sa.x} ${sa.y} A ${r} ${r} 0 ${sweep > 180 ? 1 : 0} 1 ${sb.x} ${sb.y}`} {...props} />
+              {single && dot('r', m.x, m.y)}
+            </g>
+          );
+        })}
+
+        {/* User dimensions (the value always comes from the real distance) */}
+        {(layout?.dimensions || []).filter((d) => !isPlotDimension(d.id)).map((d) => {
+          const isSel = isItemSelected(selectedElement, 'dimension', d.id);
+          const color = isSel ? '#2563EB' : '#B45309';
+          const line = dimensionLine(d);
+          const p1 = worldToScreen(d.x1, d.y1);
+          const p2 = worldToScreen(d.x2, d.y2);
+          const a = worldToScreen(line.x1, line.y1);
+          const b = worldToScreen(line.x2, line.y2);
+          const text = formatMeasurement(Math.hypot(d.x2 - d.x1, d.y2 - d.y1), unit);
+          return (
+            <g key={d.id}>
+              <line x1={p1.x} y1={p1.y} x2={a.x} y2={a.y} stroke={color} strokeWidth="0.8" strokeDasharray="3,2" />
+              <line x1={p2.x} y1={p2.y} x2={b.x} y2={b.y} stroke={color} strokeWidth="0.8" strokeDasharray="3,2" />
+              <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={color} strokeWidth={isSel ? 2 : 1.2} />
+              <circle cx={a.x} cy={a.y} r="2.5" fill={color} />
+              <circle cx={b.x} cy={b.y} r="2.5" fill={color} />
+              <text x={(a.x + b.x) / 2} y={(a.y + b.y) / 2 - 5} textAnchor="middle" fontSize="11" fontWeight="700" fill={color} fontFamily="Segoe UI, sans-serif">{text}</text>
+            </g>
+          );
+        })}
+
+        {/* Text annotations */}
+        {(layout?.annotations || []).map((a) => {
+          const isSel = isItemSelected(selectedElement, 'annotation', a.id);
+          const q = worldToScreen(a.x, a.y);
+          const box = annotationBox(a, viewport.scale);
+          const tl = worldToScreen(box.x, box.y);
+          return (
+            <g key={a.id}>
+              {isSel && <rect x={tl.x - 2} y={tl.y - 2} width={box.width * viewport.scale + 4} height={box.length * viewport.scale + 4} fill="rgba(37,99,235,0.12)" stroke="#2563EB" strokeWidth="1" strokeDasharray="3,2" />}
+              <text x={q.x} y={q.y} fontSize={a.fontSize || 12} fontWeight="600" fill={a.color || '#334155'} fontFamily="Segoe UI, sans-serif">{a.text}</text>
+            </g>
+          );
+        })}
+
         {/* Doors Layer */}
         {(layout?.doors || []).map(door => {
-          const dPos = worldToScreen(door.x, door.y);
-          const dW = (door.width || 3.0) * viewport.scale;
-          const isSel = selectedElement?.type === 'door' && selectedElement.data.id === door.id;
-
+          const g = getOpeningGeometry(door, layout.walls);
+          const isSel = isItemSelected(selectedElement, 'door', door.id);
+          const color = isSel ? '#2563EB' : '#B45309';
+          const a = worldToScreen(g.a.x, g.a.y);
+          const b = worldToScreen(g.b.x, g.b.y);
+          const gap = Math.max(3, g.thickness * viewport.scale) + 1;
+          const single = isSel && selectedElement.type === 'door' && !door.isLocked;
           return (
-            <g key={door.id} transform={`rotate(${door.rotation || 0}, ${dPos.x}, ${dPos.y})`}>
-              {/* Door Gap Opening Clear */}
-              <circle cx={dPos.x} cy={dPos.y} r={dW / 2} fill="#FFFFFF" opacity="0.8" />
-              {/* Hinge point */}
-              <circle cx={dPos.x} cy={dPos.y} r="4" fill={isSel ? '#2563EB' : '#B45309'} />
-              {/* Door Leaf line */}
-              <line
-                x1={dPos.x}
-                y1={dPos.y}
-                x2={dPos.x + dW * 0.7}
-                y2={dPos.y - dW * 0.7}
-                stroke={isSel ? '#2563EB' : '#B45309'}
-                strokeWidth="2.5"
-              />
-              {/* Swing Arc */}
-              <path
-                d={`M ${dPos.x} ${dPos.y - dW} A ${dW} ${dW} 0 0 1 ${dPos.x + dW} ${dPos.y}`}
-                fill="none"
-                stroke={isSel ? '#2563EB' : '#B45309'}
-                strokeWidth="1.2"
-                strokeDasharray="3,3"
-              />
+            <g key={door.id}>
+              {/* The opening cuts the wall */}
+              <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="#FFFFFF" strokeWidth={gap} />
+              {door.type === 'sliding' && (() => {
+                const off = (Math.max(3, g.thickness * viewport.scale)) / 3;
+                const nx = g.nx * off;
+                const ny = g.ny * off;
+                const mx = (a.x + b.x) / 2;
+                const my = (a.y + b.y) / 2;
+                return (
+                  <>
+                    <line x1={a.x + nx} y1={a.y + ny} x2={mx + nx} y2={my + ny} stroke={color} strokeWidth="2.5" />
+                    <line x1={mx - nx} y1={my - ny} x2={b.x - nx} y2={b.y - ny} stroke={color} strokeWidth="2.5" />
+                  </>
+                );
+              })()}
+              {g.leaves.map((leaf, i) => {
+                const h = worldToScreen(leaf.hinge.x, leaf.hinge.y);
+                const tip = worldToScreen(leaf.tip.x, leaf.tip.y);
+                const free = worldToScreen(leaf.free.x, leaf.free.y);
+                const r = leaf.radius * viewport.scale;
+                const cross = (tip.x - h.x) * (free.y - h.y) - (tip.y - h.y) * (free.x - h.x);
+                return (
+                  <g key={`leaf-${i}`}>
+                    <line x1={h.x} y1={h.y} x2={tip.x} y2={tip.y} stroke={color} strokeWidth="2.5" />
+                    <path d={`M ${tip.x} ${tip.y} A ${r} ${r} 0 0 ${cross > 0 ? 1 : 0} ${free.x} ${free.y}`} fill="none" stroke={color} strokeWidth="1.2" strokeDasharray="3,3" />
+                  </g>
+                );
+              })}
+              {single && [a, b].map((p, i) => (
+                <rect key={`j-${i}`} x={p.x - 4} y={p.y - 4} width="8" height="8" fill="#FFFFFF" stroke="#2563EB" strokeWidth="1.5" style={{ cursor: 'ew-resize', pointerEvents: 'all' }} />
+              ))}
             </g>
           );
         })}
 
         {/* Windows Layer */}
         {(layout?.windows || []).map(win => {
-          const wPos = worldToScreen(win.x, win.y);
-          const wW = (win.width || 4.0) * viewport.scale;
-          const isSel = selectedElement?.type === 'window' && selectedElement.data.id === win.id;
-
+          const g = getOpeningGeometry(win, layout.walls);
+          const isSel = isItemSelected(selectedElement, 'window', win.id);
+          const a = worldToScreen(g.a.x, g.a.y);
+          const b = worldToScreen(g.b.x, g.b.y);
+          const c = worldToScreen(win.x, win.y);
+          const half = Math.max(3, (g.thickness * viewport.scale) / 2);
+          const nx = g.nx * half;
+          const ny = g.ny * half;
+          const corners = `${a.x + nx},${a.y + ny} ${b.x + nx},${b.y + ny} ${b.x - nx},${b.y - ny} ${a.x - nx},${a.y - ny}`;
+          const shade = (win.chajjaDepth || 1) * viewport.scale;
+          const single = isSel && selectedElement.type === 'window' && !win.isLocked;
           return (
-            <g key={win.id} transform={`rotate(${win.rotation || 0}, ${wPos.x}, ${wPos.y})`}>
-              {/* Glass Block */}
-              <rect
-                x={wPos.x - wW / 2}
-                y={wPos.y - 4}
-                width={wW}
-                height="8"
-                fill="#0EA5E9"
-                stroke={isSel ? '#2563EB' : '#0284C7'}
-                strokeWidth="1.5"
-                rx="2"
-              />
-              {/* Sunshade Chajja Line */}
+            <g key={win.id}>
+              <polygon points={corners} fill="#BAE6FD" stroke={isSel ? '#2563EB' : '#0284C7'} strokeWidth="1.5" />
+              <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={isSel ? '#2563EB' : '#0284C7'} strokeWidth="1" />
               {win.chajja && (
-                <rect
-                  x={wPos.x - wW / 2 - 4}
-                  y={wPos.y - 14}
-                  width={wW + 8}
-                  height="10"
-                  fill="none"
-                  stroke="#64748B"
-                  strokeWidth="1"
-                  strokeDasharray="3,2"
-                />
+                <line x1={a.x - g.nx * shade} y1={a.y - g.ny * shade} x2={b.x - g.nx * shade} y2={b.y - g.ny * shade} stroke="#64748B" strokeWidth="1" strokeDasharray="3,2" />
               )}
-              <text x={wPos.x} y={wPos.y - 7} fontSize="8" fontWeight="bold" fill="#0284C7" textAnchor="middle">
-                {win.isBathroom ? 'V' : 'W'}
+              <text x={c.x} y={c.y + 3} fontSize="8" fontWeight="bold" fill="#0369A1" textAnchor="middle">
+                {win.isBathroom || win.type === 'ventilator' ? 'V' : 'W'}
               </text>
+              {single && [a, b].map((p, i) => (
+                <rect key={`j-${i}`} x={p.x - 4} y={p.y - 4} width="8" height="8" fill="#FFFFFF" stroke="#2563EB" strokeWidth="1.5" style={{ cursor: 'ew-resize', pointerEvents: 'all' }} />
+              ))}
             </g>
           );
         })}
@@ -2267,44 +2586,155 @@ export default function EditorCanvas({
           );
         })()}
 
-        {/* Wall Drawing Live Preview */}
-        {activeTool === 'wall' && wallDrawStart && (
-          <line
-            x1={worldToScreen(wallDrawStart.x, wallDrawStart.y).x}
-            y1={worldToScreen(wallDrawStart.x, wallDrawStart.y).y}
-            x2={worldToScreen(snap(mouseWorldPos.x), snap(mouseWorldPos.y)).x}
-            y2={worldToScreen(snap(mouseWorldPos.x), snap(mouseWorldPos.y)).y}
-            stroke="#2563EB"
-            strokeWidth="4"
-            strokeDasharray="5,4"
-          />
-        )}
+        {/* Live preview of the shape being drawn or the command in progress */}
+        {toolPoints.length > 0 && (() => {
+          const cur = cursorSnap || mouseWorldPos;
+          const last = toolPoints[toolPoints.length - 1];
+          const color = activeTool === 'measure' ? '#DC2626' : '#2563EB';
+          const seg = (p, q, key) => {
+            const a = worldToScreen(p.x, p.y);
+            const b = worldToScreen(q.x, q.y);
+            return <line key={key} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={color} strokeWidth="2" strokeDasharray="5,4" />;
+          };
+          const label = (p, text) => {
+            const q = worldToScreen(p.x, p.y);
+            return <text x={q.x} y={q.y - 10} textAnchor="middle" fontSize="11" fontWeight="700" fill={color} fontFamily="Segoe UI, sans-serif">{text}</text>;
+          };
+          const mid = { x: (last.x + cur.x) / 2, y: (last.y + cur.y) / 2 };
+          const dist = Math.hypot(cur.x - last.x, cur.y - last.y);
+          if (activeTool === 'rectangle') {
+            const pts = [last, { x: cur.x, y: last.y }, cur, { x: last.x, y: cur.y }];
+            return (
+              <g>
+                {pts.map((p, i) => seg(p, pts[(i + 1) % 4], `r${i}`))}
+                {label(mid, `${formatMeasurement(Math.abs(cur.x - last.x), unit)} × ${formatMeasurement(Math.abs(cur.y - last.y), unit)}`)}
+              </g>
+            );
+          }
+          if (activeTool === 'circle') {
+            const c = worldToScreen(last.x, last.y);
+            return (
+              <g>
+                <circle cx={c.x} cy={c.y} r={dist * viewport.scale} fill="none" stroke={color} strokeWidth="2" strokeDasharray="5,4" />
+                {seg(last, cur, 'r')}
+                {label(mid, `R ${formatMeasurement(dist, unit)}`)}
+              </g>
+            );
+          }
+          if (activeTool === 'polygon' && dist > 1e-3) {
+            const ghost = createRegularPolygonEntity(last, cur, toolParams.sides ?? 6);
+            return <g>{ghost.points.map((p, i) => seg(p, ghost.points[(i + 1) % ghost.points.length], `p${i}`))}</g>;
+          }
+          if (activeTool === 'arc' && toolPoints.length === 2) {
+            const ghost = createArcEntity(toolPoints[0], toolPoints[1], cur);
+            if (ghost) {
+              const a = worldToScreen(pointAtAngle(ghost, ghost.start).x, pointAtAngle(ghost, ghost.start).y);
+              const b = worldToScreen(pointAtAngle(ghost, ghost.end).x, pointAtAngle(ghost, ghost.end).y);
+              const r = ghost.r * viewport.scale;
+              return <path d={`M ${a.x} ${a.y} A ${r} ${r} 0 ${arcSweep(ghost) > 180 ? 1 : 0} 1 ${b.x} ${b.y}`} fill="none" stroke={color} strokeWidth="2" strokeDasharray="5,4" />;
+            }
+          }
+          return (
+            <g>
+              {toolPoints.slice(1).map((p, i) => seg(toolPoints[i], p, `s${i}`))}
+              {seg(last, cur, 'live')}
+              {label(mid, formatMeasurement(dist, unit))}
+            </g>
+          );
+        })()}
 
-        {/* Measure Tool Line */}
-        {activeTool === 'measure' && measureStart && (
-          <g>
-            <line
-              x1={worldToScreen(measureStart.x, measureStart.y).x}
-              y1={worldToScreen(measureStart.x, measureStart.y).y}
-              x2={worldToScreen(mouseWorldPos.x, mouseWorldPos.y).x}
-              y2={worldToScreen(mouseWorldPos.y, mouseWorldPos.y).y}
-              stroke="#DC2626"
-              strokeWidth="2"
-              strokeDasharray="4,4"
+        {/* Measurement stays on screen until the next measurement or Escape */}
+        {activeTool === 'measure' && measureResult && (() => {
+          const a = worldToScreen(measureResult.a.x, measureResult.a.y);
+          const b = worldToScreen(measureResult.b.x, measureResult.b.y);
+          const dx = measureResult.b.x - measureResult.a.x;
+          const dy = measureResult.b.y - measureResult.a.y;
+          return (
+            <g>
+              <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="#DC2626" strokeWidth="2" />
+              <circle cx={a.x} cy={a.y} r="3" fill="#DC2626" />
+              <circle cx={b.x} cy={b.y} r="3" fill="#DC2626" />
+              <text x={(a.x + b.x) / 2} y={(a.y + b.y) / 2 - 10} fontSize="12" fontWeight="bold" fill="#DC2626" textAnchor="middle">
+                {`${formatMeasurement(Math.hypot(dx, dy), unit)}  (ΔX ${formatMeasurement(Math.abs(dx), unit)}, ΔY ${formatMeasurement(Math.abs(dy), unit)})`}
+              </text>
+            </g>
+          );
+        })()}
+
+        {/* Snap indicator: the marker shape names the kind of point */}
+        {cursorSnap && cursorSnap.kind && cursorSnap.kind !== 'grid' && (() => {
+          const q = worldToScreen(cursorSnap.x, cursorSnap.y);
+          const k = cursorSnap.kind;
+          const common = { fill: 'none', stroke: '#16A34A', strokeWidth: 2 };
+          let marker;
+          if (k === 'endpoint') marker = <rect x={q.x - 6} y={q.y - 6} width="12" height="12" {...common} />;
+          else if (k === 'midpoint') marker = <polygon points={`${q.x},${q.y - 7} ${q.x + 7},${q.y + 6} ${q.x - 7},${q.y + 6}`} {...common} />;
+          else if (k === 'center') marker = <circle cx={q.x} cy={q.y} r="6" {...common} />;
+          else if (k === 'intersection') marker = <path d={`M ${q.x - 6} ${q.y - 6} L ${q.x + 6} ${q.y + 6} M ${q.x + 6} ${q.y - 6} L ${q.x - 6} ${q.y + 6}`} {...common} />;
+          else if (k === 'perpendicular') marker = <path d={`M ${q.x - 7} ${q.y + 6} L ${q.x + 7} ${q.y + 6} M ${q.x} ${q.y + 6} L ${q.x} ${q.y - 7}`} {...common} />;
+          else marker = <polygon points={`${q.x},${q.y - 7} ${q.x + 7},${q.y} ${q.x},${q.y + 7} ${q.x - 7},${q.y}`} {...common} />;
+          return (
+            <g>
+              {marker}
+              <text x={q.x + 10} y={q.y - 8} fontSize="10" fontWeight="700" fill="#15803D" fontFamily="Segoe UI, sans-serif">{cursorSnap.label}</text>
+            </g>
+          );
+        })()}
+
+        {/* Selection box: solid = fully inside, dashed green = touching. Stretch window is amber. */}
+        {boxDrag && (() => {
+          const a = worldToScreen(boxDrag.start.x, boxDrag.start.y);
+          const b = worldToScreen(boxDrag.end.x, boxDrag.end.y);
+          const crossing = boxDrag.end.x < boxDrag.start.x;
+          const stretch = boxDrag.purpose === 'stretch';
+          const stroke = stretch ? '#D97706' : (crossing ? '#16A34A' : '#2563EB');
+          return (
+            <rect
+              x={Math.min(a.x, b.x)}
+              y={Math.min(a.y, b.y)}
+              width={Math.abs(b.x - a.x)}
+              height={Math.abs(b.y - a.y)}
+              fill={stretch ? 'rgba(217,119,6,0.08)' : (crossing ? 'rgba(22,163,74,0.08)' : 'rgba(37,99,235,0.08)')}
+              stroke={stroke}
+              strokeWidth="1.2"
+              strokeDasharray={crossing || stretch ? '5,3' : undefined}
             />
-            <text
-              x={(worldToScreen(measureStart.x, measureStart.y).x + worldToScreen(mouseWorldPos.x, mouseWorldPos.y).x) / 2}
-              y={(worldToScreen(measureStart.x, measureStart.y).y + worldToScreen(mouseWorldPos.x, mouseWorldPos.y).y) / 2 - 10}
-              fontSize="12"
-              fontWeight="bold"
-              fill="#DC2626"
-              textAnchor="middle"
-            >
-              {formatMeasurement(Math.hypot(mouseWorldPos.x - measureStart.x, mouseWorldPos.y - measureStart.y), unit)}
-            </text>
-          </g>
-        )}
+          );
+        })()}
+        {stretchBox && (() => {
+          const a = worldToScreen(stretchBox.x1, stretchBox.y1);
+          const b = worldToScreen(stretchBox.x2, stretchBox.y2);
+          return <rect x={Math.min(a.x, b.x)} y={Math.min(a.y, b.y)} width={Math.abs(b.x - a.x)} height={Math.abs(b.y - a.y)} fill="rgba(217,119,6,0.08)" stroke="#D97706" strokeWidth="1.2" strokeDasharray="5,3" />;
+        })()}
       </svg>
+
+      {notice && (
+        <div
+          role="status"
+          data-testid="editor-notice"
+          style={{ position: 'absolute', left: '50%', bottom: 16, transform: 'translateX(-50%)', maxWidth: '80%', padding: '8px 14px', borderRadius: 6, background: '#0F172A', color: '#FFFFFF', fontSize: 12, fontWeight: 600, zIndex: 90, pointerEvents: 'none' }}
+        >
+          {notice}
+        </div>
+      )}
+
+      {pendingRoomPlacement && (
+        <div
+          onPointerDown={(e) => e.stopPropagation()}
+          style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', width: 340, padding: 16, borderRadius: 10, background: '#FFFFFF', boxShadow: '0 10px 30px rgba(15, 23, 42, 0.35)', zIndex: 110, fontFamily: 'Segoe UI, sans-serif' }}
+        >
+          <div style={{ fontSize: 14, fontWeight: 700, color: '#0F172A', marginBottom: 6 }}>Room is outside the buildable area</div>
+          {pendingRoomPlacement.warnings.map((w, i) => (
+            <div key={i} style={{ fontSize: 12, color: '#991B1B', marginBottom: 4 }}>{w}</div>
+          ))}
+          <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
+            <button type="button" onClick={handlePlaceAsIs}>Place as drawn</button>
+            {!pendingRoomPlacement.exceeds && <button type="button" onClick={handleFitInsidePlot}>Move inside</button>}
+            <button type="button" onClick={handleResizeToFitPlot}>Resize to fit</button>
+            <button type="button" onClick={() => setPendingRoomPlacement(null)}>Cancel</button>
+          </div>
+        </div>
+      )}
 
       {/* Inline numeric editor for a selected plot dimension label (Mode B) */}
       {editingDim && (

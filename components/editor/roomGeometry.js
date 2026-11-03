@@ -155,27 +155,20 @@ export function collectAlignmentTargets(layout, excludeRoomId = null) {
 
   // From existing walls
   (layout?.walls || []).forEach((w) => {
-    const halfThick = (Number(w.thickness) || 0.5) / 2;
     const dx = Math.abs(w.x2 - w.x1);
     const dy = Math.abs(w.y2 - w.y1);
 
+    // Room edges lie on wall centrelines, so that is the only line to snap to:
+    // a room snapped to a wall face would leave a sliver beside the shared wall.
     if (dx <= 0.2) {
       // Near vertical wall
       const avgX = (w.x1 + w.x2) / 2;
-      verticalTargets.push(
-        { pos: avgX, label: 'Wall Centerline', type: 'wall', priority: 2 },
-        { pos: avgX - halfThick, label: 'Wall Inner Edge', type: 'wall-edge', priority: 3 },
-        { pos: avgX + halfThick, label: 'Wall Outer Edge', type: 'wall-edge', priority: 3 }
-      );
+      verticalTargets.push({ pos: avgX, label: 'Wall Centerline', type: 'wall', priority: 2 });
     }
     if (dy <= 0.2) {
       // Near horizontal wall
       const avgY = (w.y1 + w.y2) / 2;
-      horizontalTargets.push(
-        { pos: avgY, label: 'Wall Centerline', type: 'wall', priority: 2 },
-        { pos: avgY - halfThick, label: 'Wall Inner Edge', type: 'wall-edge', priority: 3 },
-        { pos: avgY + halfThick, label: 'Wall Outer Edge', type: 'wall-edge', priority: 3 }
-      );
+      horizontalTargets.push({ pos: avgY, label: 'Wall Centerline', type: 'wall', priority: 2 });
     }
 
     // Endpoints
@@ -222,6 +215,8 @@ export function findRoomSnapping(proposedRoom, layout, options = {}) {
 
   // Helper to snap a coordinate to a list of targets or grid
   const snapCoord = (val, targets, axisName) => {
+    // The snap switch controls every kind of snap, not only the grid.
+    if (!snapEnabled) return { snapped: val, delta: 0, target: null };
     let bestDelta = 0;
     let bestDist = Infinity;
     let bestTarget = null;
@@ -423,10 +418,11 @@ export function findRoomSnapping(proposedRoom, layout, options = {}) {
 
   const snappedRoom = {
     ...proposedRoom,
-    x: Number(curX.toFixed(2)),
-    y: Number(curY.toFixed(2)),
-    width: Number(curW.toFixed(2)),
-    length: Number(curL.toFixed(2)),
+    // Same precision as the room solver, so a snapped edge lands exactly on its target.
+    x: Number(curX.toFixed(4)),
+    y: Number(curY.toFixed(4)),
+    width: Number(curW.toFixed(4)),
+    length: Number(curL.toFixed(4)),
   };
 
   const fitCheck = checkRoomPlotFit(snappedRoom, layout);

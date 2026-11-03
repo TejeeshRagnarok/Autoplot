@@ -87,6 +87,7 @@ export function createDefaultLayout(siteParams = {}) {
     utilities: [],
     dimensions: [],
     annotations: [],
+    cadEntities: [],
   };
 }
 
@@ -367,7 +368,7 @@ export function canJoinWalls(w1, w2, tolerance = 0.2) {
       // Check collinearity
       const a1 = calculateWallAngle(w1) % 180;
       const a2 = calculateWallAngle(w2) % 180;
-      if (Math.abs(a1 - a2) < 3 || Math.abs(Math.abs(a1 - a2) - 180) < 3) {
+      if (Math.abs(a1 - a2) < 0.5 || Math.abs(Math.abs(a1 - a2) - 180) < 0.5) {
         return ep.type;
       }
     }
@@ -604,7 +605,7 @@ export function syncPlotDimensions(layout) {
 export function setPlotDimensionOffset(layout, axis, offset) {
   if (!layout || !layout.plot) return layout;
   const off = Math.max(0.5, Number(offset) || 0.5);
-  if (!Array.isArray(layout.dimensions)) layout.dimensions = [];
+  layout.dimensions = Array.isArray(layout.dimensions) ? [...layout.dimensions] : [];
   const id = axis === 'width' ? 'dim-plot-width' : 'dim-plot-length';
   const idx = layout.dimensions.findIndex((d) => d.id === id);
   if (idx >= 0) layout.dimensions[idx] = { ...layout.dimensions[idx], offset: off };

@@ -16,14 +16,10 @@ import { formatMeasurement, formatArea, parseToFeet } from './units';
 import {
   calculateWallLength,
   calculateWallAngle,
-  splitWallAtPoint,
-  generateUniqueId,
   ROOM_PALETTE,
   setPlotDimensionOffset,
   checkRoomPlotFit,
-  syncRoomWithWallsAndOpenings,
   getPlotAndBuildableBounds,
-  cloneLayout,
   normalizeStaircase,
   rotateStaircase,
   calculateStaircaseGeometry,
@@ -32,9 +28,33 @@ import {
   inferRoomConstraintType,
   getRoomTypeMinimum,
   CONSTRAINT_TYPES,
+  cloneLayout,
 } from './layoutModel';
 import { checkAyaVyayaYoni } from '../../constants/vastuData';
 import { setRoomDimension, moveRoom } from './roomResize';
+import DraftInput, { MeasureInput, NumberInput, TextField } from './DraftInput';
+import {
+  getOpeningHost,
+  getOpeningPosition,
+  moveWallEndpointTo,
+  resizeOpening,
+  setOpeningPosition,
+  setWallLength,
+  setWallProps,
+  splitWall,
+} from './wallOps';
+import {
+  COLLECTIONS,
+  copySelection,
+  deleteSelection,
+  isPlotDimension,
+  makeRotate,
+  transformSelection,
+} from './cadCommands';
+import { selectionFromItems, selectionItems } from './selectionModel';
+import { entityArea, entityLength } from './cadGeometry';
+
+const ROOM_TYPES = ['Bedroom', 'Living', 'Kitchen', 'Dining', 'Bathroom', 'Pooja', 'Store', 'Study', 'Balcony', 'Other'];
 
 export default function EditorRightPanel({
   layout,
@@ -46,6 +66,7 @@ export default function EditorRightPanel({
   historyManager,
   onRequestPlotResize,
   onRequestSiteChange,
+  onNotice,
 }) {
   const [tab, setTab] = useState('properties'); // 'properties' | 'validation'
   // Which side stays fixed when the plot size is typed in numerically
@@ -73,133 +94,100 @@ export default function EditorRightPanel({
     onUpdateLayout(nextLayout);
   };
 
+  const notify = (text) => { if (onNotice) onNotice(text); };
+
   // ---------------------------------------------------------
-  // DUPLICATE & DELETE ACTIONS
+  // DUPLICATE, DELETE & LOCK ACTIONS (one object or a multi-selection)
   // ---------------------------------------------------------
   const handleDuplicate = () => {
-    if (!selectedElement || !layout) return;
-    const { type, data } = selectedElement;
-    const nextLayout = { ...layout };
-    const offset = 2.0;
-
-    if (type === 'room') {
-      const copy = {
-        ...data,
-        id: generateUniqueId('room'),
-        name: `${data.name} (Copy)`,
-        x: data.x + offset,
-        y: data.y + offset,
-      };
-      nextLayout.rooms = [...(layout.rooms || []), copy];
-      updateLayoutAndRecord(nextLayout);
-      onSelectElement({ type: 'room', data: copy });
-    } else if (type === 'wall') {
-      const copy = {
-        ...data,
-        id: generateUniqueId('wall'),
-        x1: data.x1 + offset,
-        y1: data.y1 + offset,
-        x2: data.x2 + offset,
-        y2: data.y2 + offset,
-      };
-      nextLayout.walls = [...(layout.walls || []), copy];
-      updateLayoutAndRecord(nextLayout);
-      onSelectElement({ type: 'wall', data: copy });
-    } else if (type === 'door') {
-      const copy = {
-        ...data,
-        id: generateUniqueId('door'),
-        x: data.x + offset,
-        y: data.y + offset,
-      };
-      nextLayout.doors = [...(layout.doors || []), copy];
-      updateLayoutAndRecord(nextLayout);
-      onSelectElement({ type: 'door', data: copy });
-    } else if (type === 'window') {
-      const copy = {
-        ...data,
-        id: generateUniqueId('win'),
-        x: data.x + offset,
-        y: data.y + offset,
-      };
-      nextLayout.windows = [...(layout.windows || []), copy];
-      updateLayoutAndRecord(nextLayout);
-      onSelectElement({ type: 'window', data: copy });
-    } else if (type === 'column') {
-      const copy = {
-        ...data,
-        id: generateUniqueId('col'),
-        x: data.x + offset,
-        y: data.y + offset,
-      };
-      nextLayout.columns = [...(layout.columns || []), copy];
-      updateLayoutAndRecord(nextLayout);
-      onSelectElement({ type: 'column', data: copy });
-    } else if (type === 'staircase') {
-      const copy = {
-        ...cloneLayout(data),
-        id: generateUniqueId('stair'),
-        x: data.x + offset,
-        y: data.y + offset,
-      };
-      nextLayout.staircases = [...(layout.staircases || []), copy];
-      updateLayoutAndRecord(nextLayout);
-      onSelectElement({ type: 'staircase', data: copy });
+    const items = selectionItems(selectedElement);
+    if (!items.length) return;
+    const res = copySelection(layout, items, 2, 2);
+    if (res.skipped.length) notify(res.skipped[0]);
+    if (res.created.length) {
+      updateLayoutAndRecord(res.layout);
+      onSelectElement(selectionFromItems(res.layout, res.created));
     }
   };
 
   const handleDelete = () => {
-    if (!selectedElement || !layout) return;
-    const { type, data } = selectedElement;
-
-    if (type === 'room' && layout.rooms?.length <= 1) {
-      alert('Cannot delete the only remaining room.');
-      return;
+    const items = selectionItems(selectedElement);
+    if (!items.length) return;
+    const res = deleteSelection(layout, items);
+    if (res.skipped.length) notify(res.skipped[0]);
+    if (res.removed) {
+      updateLayoutAndRecord(res.layout);
+      onSelectElement(null);
     }
-
-    const nextLayout = { ...layout };
-    if (type === 'room') {
-      nextLayout.rooms = (layout.rooms || []).filter(r => r.id !== data.id);
-    } else if (type === 'wall') {
-      nextLayout.walls = (layout.walls || []).filter(w => w.id !== data.id);
-    } else if (type === 'door') {
-      nextLayout.doors = (layout.doors || []).filter(d => d.id !== data.id);
-    } else if (type === 'window') {
-      nextLayout.windows = (layout.windows || []).filter(w => w.id !== data.id);
-    } else if (type === 'column') {
-      nextLayout.columns = (layout.columns || []).filter(c => c.id !== data.id);
-    } else if (type === 'staircase') {
-      nextLayout.staircases = (layout.staircases || []).filter(s => s.id !== data.id);
-    } else if (type === 'utility') {
-      nextLayout.utilities = (layout.utilities || []).filter(u => u.id !== data.id);
-    } else if (type === 'parking') {
-      nextLayout.parking = (layout.parking || []).filter(p => p.id !== data.id);
-    }
-
-    updateLayoutAndRecord(nextLayout);
-    onSelectElement(null);
   };
 
   const handleToggleLock = () => {
-    if (!selectedElement || !layout) return;
-    const { type, data } = selectedElement;
-    const nextLocked = !data.isLocked;
-
-    const nextLayout = { ...layout };
-    if (type === 'room') {
-      nextLayout.rooms = layout.rooms.map(r => r.id === data.id ? { ...r, isLocked: nextLocked } : r);
-    } else if (type === 'wall') {
-      nextLayout.walls = layout.walls.map(w => w.id === data.id ? { ...w, isLocked: nextLocked } : w);
-    } else if (type === 'door') {
-      nextLayout.doors = layout.doors.map(d => d.id === data.id ? { ...d, isLocked: nextLocked } : d);
-    } else if (type === 'window') {
-      nextLayout.windows = layout.windows.map(w => w.id === data.id ? { ...w, isLocked: nextLocked } : w);
-    } else if (type === 'staircase') {
-      nextLayout.staircases = layout.staircases.map(st => st.id === data.id ? { ...st, isLocked: nextLocked } : st);
+    const items = selectionItems(selectedElement);
+    if (!items.length) return;
+    const find = (r) => (layout[COLLECTIONS[r.type]] || []).find((e) => e.id === r.id);
+    const lock = !items.every((r) => find(r)?.isLocked);
+    const next = { ...layout };
+    for (const r of items) {
+      const key = COLLECTIONS[r.type];
+      next[key] = next[key].map((e) => (e.id === r.id ? { ...e, isLocked: lock } : e));
     }
+    updateLayoutAndRecord(next);
+    onSelectElement(selectionFromItems(next, items));
+  };
 
-    updateLayoutAndRecord(nextLayout);
-    onSelectElement({ type, data: { ...data, isLocked: nextLocked } });
+  const renderActions = (locked) => (
+    <View style={styles.actionsBar}>
+      <TouchableOpacity style={styles.actionBtn} onPress={handleDuplicate}>
+        <Ionicons name="copy-outline" size={14} color="#334155" />
+        <Text style={styles.actionBtnText}>Duplicate</Text>
+      </TouchableOpacity>
+      <TouchableOpacity style={styles.actionBtn} onPress={handleToggleLock}>
+        <Ionicons name={locked ? 'lock-closed' : 'lock-open-outline'} size={14} color="#334155" />
+        <Text style={styles.actionBtnText}>{locked ? 'Unlock' : 'Lock'}</Text>
+      </TouchableOpacity>
+      <TouchableOpacity style={[styles.actionBtn, styles.deleteBtn]} onPress={handleDelete}>
+        <Ionicons name="trash-outline" size={14} color="#DC2626" />
+        <Text style={[styles.actionBtnText, { color: '#DC2626' }]}>Delete</Text>
+      </TouchableOpacity>
+    </View>
+  );
+
+  const measureField = (label, value, onCommit, opts = {}) => (
+    <View style={[styles.inputGroup, { flex: 1 }]}>
+      <Text style={styles.inputLabel}>{label}</Text>
+      <MeasureInput style={styles.textInput} value={value} unit={unit} onCommit={onCommit} {...opts} />
+    </View>
+  );
+
+  const numberField = (label, value, onCommit, opts = {}) => (
+    <View style={[styles.inputGroup, { flex: 1 }]}>
+      <Text style={styles.inputLabel}>{label}</Text>
+      <NumberInput style={styles.textInput} value={value} onCommit={onCommit} {...opts} />
+    </View>
+  );
+
+  // Optional limit: empty clears it
+  const optionalMeasure = (label, value, placeholder, onCommit, editable = true) => {
+    const display = value !== undefined ? formatMeasurement(value, unit) : '';
+    return (
+      <View style={[styles.inputGroup, { flex: 1 }]}>
+        <Text style={styles.inputLabel}>{label}</Text>
+        <DraftInput
+          style={styles.textInput}
+          editable={editable}
+          placeholder={placeholder}
+          display={display}
+          resolve={(text) => {
+            const t = String(text).trim();
+            if (t === display) return { action: 'none' };
+            if (t === '') return { action: 'commit', value: undefined };
+            const feet = parseToFeet(t, unit);
+            return feet !== null && feet > 0 ? { action: 'commit', value: feet } : { action: 'revert', reason: 'Enter a positive size, or leave empty.' };
+          }}
+          onCommit={onCommit}
+        />
+      </View>
+    );
   };
 
   // ---------------------------------------------------------
@@ -224,12 +212,13 @@ export default function EditorRightPanel({
         if (res.room) {
           updateLayoutAndRecord(res.layout);
           onSelectElement({ type: 'room', data: res.room });
-          if (res.conflicts.length && typeof alert === 'function') alert(`Stopped at the nearest valid size: ${res.conflicts[0]}`);
+          if (res.conflicts.length) notify(`Stopped at the nearest valid size: ${res.conflicts[0]}`);
         }
         return;
       }
       if (field === 'x' || field === 'y') {
         const res = moveRoom(layout, room.id, field === 'x' ? val - room.x : 0, field === 'y' ? val - room.y : 0);
+        if (room.isLocked) { notify('This room is locked.'); return; }
         updateLayoutAndRecord(res.layout);
         onSelectElement({ type: 'room', data: res.room });
         return;
@@ -238,17 +227,13 @@ export default function EditorRightPanel({
       onSelectElement({ type: 'room', data: updatedRoom });
     };
 
-    const handleDimensionInput = (field, text) => {
-      const feet = parseToFeet(text, unit);
-      if (feet !== null && feet >= 2.5) {
-        handleRoomField(field, Number(feet.toFixed(2)));
-      }
-    };
-
-    const handlePositionInput = (field, text) => {
-      const feet = parseToFeet(text, unit);
-      if (feet !== null) {
-        handleRoomField(field, Number(feet.toFixed(2)));
+    const handleRotateRoom = () => {
+      const c = { x: room.x + room.width / 2, y: room.y + room.length / 2 };
+      const res = transformSelection(layout, [{ type: 'room', id: room.id }], makeRotate(c, 90));
+      if (res.skipped.length) notify(res.skipped[0]);
+      if (res.changed) {
+        updateLayoutAndRecord(res.layout);
+        onSelectElement({ type: 'room', data: res.layout.rooms.find((r) => r.id === room.id) });
       }
     };
 
@@ -289,34 +274,22 @@ export default function EditorRightPanel({
         {/* Room Name */}
         <View style={styles.inputGroup}>
           <Text style={styles.inputLabel}>Room Name</Text>
-          <TextInput
-            key={`room-name-${room?.id || 'room'}`}
-            style={styles.textInput}
-            value={room?.name ?? ''}
-            onChangeText={(val) => handleRoomField('name', val)}
-          />
+          <TextField style={styles.textInput} value={room?.name ?? ''} onCommit={(val) => handleRoomField('name', val)} />
         </View>
+
+        {/* Room Type (drives the default constraints and minimum size) */}
+        <Text style={styles.inputLabel}>Room Type</Text>
+        {renderChoice(
+          [{ value: 'auto', label: 'Auto (from name)' }, ...ROOM_TYPES.map((t) => ({ value: t, label: t }))],
+          room.roomType || 'auto',
+          (v) => handleRoomField('roomType', v === 'auto' ? undefined : v),
+          `rt-${room.id}`
+        )}
 
         {/* Dimensions */}
         <View style={styles.rowTwo}>
-          <View style={[styles.inputGroup, { flex: 1 }]}>
-            <Text style={styles.inputLabel}>Width ({unit})</Text>
-            <TextInput
-              key={`room-w-${room?.id}-${room?.width}-${unit}`}
-              style={styles.textInput}
-              defaultValue={formatMeasurement(room?.width ?? 10, unit)}
-              onBlur={(e) => handleDimensionInput('width', e.nativeEvent.text)}
-            />
-          </View>
-          <View style={[styles.inputGroup, { flex: 1 }]}>
-            <Text style={styles.inputLabel}>Length ({unit})</Text>
-            <TextInput
-              key={`room-l-${room?.id}-${room?.length}-${unit}`}
-              style={styles.textInput}
-              defaultValue={formatMeasurement(room?.length ?? 10, unit)}
-              onBlur={(e) => handleDimensionInput('length', e.nativeEvent.text)}
-            />
-          </View>
+          {measureField(`Width (${unit})`, room.width, (v) => handleRoomField('width', v), { min: 2.5, editable: !room.isLocked })}
+          {measureField(`Length (${unit})`, room.length, (v) => handleRoomField('length', v), { min: 2.5, editable: !room.isLocked })}
         </View>
 
         {/* Calculated Area Display */}
@@ -327,25 +300,14 @@ export default function EditorRightPanel({
 
         {/* Position X and Y */}
         <View style={styles.rowTwo}>
-          <View style={[styles.inputGroup, { flex: 1 }]}>
-            <Text style={styles.inputLabel}>Position X ({unit})</Text>
-            <TextInput
-              key={`room-x-${room?.id}-${room?.x}-${unit}`}
-              style={styles.textInput}
-              defaultValue={formatMeasurement(room?.x ?? 0, unit)}
-              onBlur={(e) => handlePositionInput('x', e.nativeEvent.text)}
-            />
-          </View>
-          <View style={[styles.inputGroup, { flex: 1 }]}>
-            <Text style={styles.inputLabel}>Position Y ({unit})</Text>
-            <TextInput
-              key={`room-y-${room?.id}-${room?.y}-${unit}`}
-              style={styles.textInput}
-              defaultValue={formatMeasurement(room?.y ?? 0, unit)}
-              onBlur={(e) => handlePositionInput('y', e.nativeEvent.text)}
-            />
-          </View>
+          {measureField(`Position X (${unit})`, room.x, (v) => handleRoomField('x', v), { editable: !room.isLocked })}
+          {measureField(`Position Y (${unit})`, room.y, (v) => handleRoomField('y', v), { editable: !room.isLocked })}
         </View>
+
+        <TouchableOpacity style={styles.secondaryBtn} onPress={handleRotateRoom}>
+          <Ionicons name="refresh-outline" size={14} color="#2563EB" />
+          <Text style={styles.secondaryBtnText}>Rotate 90° (swaps width and length)</Text>
+        </TouchableOpacity>
 
         {/* Site-resize constraints */}
         <Text style={styles.subHeading}>Resize Behaviour</Text>
@@ -365,48 +327,12 @@ export default function EditorRightPanel({
             : 'Flexible rooms grow or shrink within their limits when the plot changes; fixed rooms keep their size.'}
         </Text>
         <View style={styles.rowTwo}>
-          <View style={[styles.inputGroup, { flex: 1 }]}>
-            <Text style={styles.inputLabel}>Min W</Text>
-            <TextInput
-              key={`room-minw-${room.id}-${room.minWidth}-${unit}`}
-              style={styles.textInput}
-              placeholder={formatMeasurement(Math.min(room.width, getRoomTypeMinimum(room)), unit)}
-              defaultValue={room.minWidth !== undefined ? formatMeasurement(room.minWidth, unit) : ''}
-              onBlur={(e) => { const t = e.nativeEvent.text.trim(); const f = parseToFeet(t, unit); handleRoomField('minWidth', t === '' ? undefined : (f !== null && f > 0 ? f : room.minWidth)); }}
-            />
-          </View>
-          <View style={[styles.inputGroup, { flex: 1 }]}>
-            <Text style={styles.inputLabel}>Max W</Text>
-            <TextInput
-              key={`room-maxw-${room.id}-${room.maxWidth}-${unit}`}
-              style={styles.textInput}
-              placeholder="none"
-              defaultValue={room.maxWidth !== undefined ? formatMeasurement(room.maxWidth, unit) : ''}
-              onBlur={(e) => { const t = e.nativeEvent.text.trim(); const f = parseToFeet(t, unit); handleRoomField('maxWidth', t === '' ? undefined : (f !== null && f > 0 ? f : room.maxWidth)); }}
-            />
-          </View>
+          {optionalMeasure('Min W', room.minWidth, formatMeasurement(Math.min(room.width, getRoomTypeMinimum(room)), unit), (v) => handleRoomField('minWidth', v))}
+          {optionalMeasure('Max W', room.maxWidth, 'none', (v) => handleRoomField('maxWidth', v))}
         </View>
         <View style={styles.rowTwo}>
-          <View style={[styles.inputGroup, { flex: 1 }]}>
-            <Text style={styles.inputLabel}>Min L</Text>
-            <TextInput
-              key={`room-minl-${room.id}-${room.minLength}-${unit}`}
-              style={styles.textInput}
-              placeholder={formatMeasurement(Math.min(room.length, getRoomTypeMinimum(room)), unit)}
-              defaultValue={room.minLength !== undefined ? formatMeasurement(room.minLength, unit) : ''}
-              onBlur={(e) => { const t = e.nativeEvent.text.trim(); const f = parseToFeet(t, unit); handleRoomField('minLength', t === '' ? undefined : (f !== null && f > 0 ? f : room.minLength)); }}
-            />
-          </View>
-          <View style={[styles.inputGroup, { flex: 1 }]}>
-            <Text style={styles.inputLabel}>Max L</Text>
-            <TextInput
-              key={`room-maxl-${room.id}-${room.maxLength}-${unit}`}
-              style={styles.textInput}
-              placeholder="none"
-              defaultValue={room.maxLength !== undefined ? formatMeasurement(room.maxLength, unit) : ''}
-              onBlur={(e) => { const t = e.nativeEvent.text.trim(); const f = parseToFeet(t, unit); handleRoomField('maxLength', t === '' ? undefined : (f !== null && f > 0 ? f : room.maxLength)); }}
-            />
-          </View>
+          {optionalMeasure('Min L', room.minLength, formatMeasurement(Math.min(room.length, getRoomTypeMinimum(room)), unit), (v) => handleRoomField('minLength', v))}
+          {optionalMeasure('Max L', room.maxLength, 'none', (v) => handleRoomField('maxLength', v))}
         </View>
         <View style={styles.chipRow}>
           <TouchableOpacity style={[styles.chip, room.lockWidth && styles.chipActive]} onPress={() => handleRoomField('lockWidth', !room.lockWidth)}>
@@ -460,21 +386,7 @@ export default function EditorRightPanel({
           </View>
         </View>
 
-        {/* Action Buttons */}
-        <View style={styles.actionsBar}>
-          <TouchableOpacity style={styles.actionBtn} onPress={handleDuplicate}>
-            <Ionicons name="copy-outline" size={14} color="#334155" />
-            <Text style={styles.actionBtnText}>Duplicate</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.actionBtn} onPress={handleToggleLock}>
-            <Ionicons name={room.isLocked ? "lock-closed" : "lock-open-outline"} size={14} color="#334155" />
-            <Text style={styles.actionBtnText}>{room.isLocked ? "Unlock" : "Lock"}</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[styles.actionBtn, styles.deleteBtn]} onPress={handleDelete}>
-            <Ionicons name="trash-outline" size={14} color="#DC2626" />
-            <Text style={[styles.actionBtnText, { color: '#DC2626' }]}>Delete</Text>
-          </TouchableOpacity>
-        </View>
+        {renderActions(room.isLocked)}
       </View>
     );
   };
@@ -485,23 +397,31 @@ export default function EditorRightPanel({
   const renderWallInspector = (wall) => {
     const len = calculateWallLength(wall);
     const angle = calculateWallAngle(wall);
+    const locked = !!wall.isLocked;
 
-    const handleWallField = (field, val) => {
-      const nextWalls = layout.walls.map(w => w.id === wall.id ? { ...w, [field]: val } : w);
-      const nextLayout = { ...layout, walls: nextWalls };
-      updateLayoutAndRecord(nextLayout);
-      onSelectElement({ type: 'wall', data: { ...wall, [field]: val } });
+    const applyWall = (res) => {
+      if (res.reason) notify(res.reason);
+      if (res.layout !== layout) {
+        updateLayoutAndRecord(res.layout);
+        const fresh = res.layout.walls.find((w) => w.id === wall.id);
+        if (fresh) onSelectElement({ type: 'wall', data: fresh });
+      }
+    };
+
+    // Type and thickness change together, as one edit.
+    const setType = (type, thickness) => applyWall({ layout: setWallProps(layout, wall.id, { type, thickness }) });
+
+    // Numeric endpoint entry moves just that endpoint, and may tilt the wall.
+    const setEnd = (which, axis, value) => {
+      const point = which === 'p1' ? { x: wall.x1, y: wall.y1 } : { x: wall.x2, y: wall.y2 };
+      applyWall(moveWallEndpointTo(layout, wall.id, which, { ...point, [axis]: value }, { allowDiagonal: true }));
     };
 
     const handleSplitWall = () => {
-      const segments = splitWallAtPoint(wall, {
-        x: (wall.x1 + wall.x2) / 2,
-        y: (wall.y1 + wall.y2) / 2,
-      });
-      const nextWalls = layout.walls.filter(w => w.id !== wall.id).concat(segments);
-      const nextLayout = { ...layout, walls: nextWalls };
-      updateLayoutAndRecord(nextLayout);
-      onSelectElement({ type: 'wall', data: segments[0] });
+      const res = splitWall(layout, wall.id);
+      if (res.reason) { notify(res.reason); return; }
+      updateLayoutAndRecord(res.layout);
+      onSelectElement({ type: 'wall', data: res.segments[0] });
     };
 
     return (
@@ -515,292 +435,312 @@ export default function EditorRightPanel({
         <View style={styles.inputGroup}>
           <Text style={styles.inputLabel}>Wall Type</Text>
           <View style={styles.rowTwo}>
-            <TouchableOpacity
-              style={[styles.typeBtn, wall.type === 'exterior' && styles.typeBtnActive]}
-              onPress={() => {
-                handleWallField('type', 'exterior');
-                handleWallField('thickness', 0.75);
-              }}
-            >
-              <Text style={[styles.typeBtnText, wall.type === 'exterior' && styles.typeBtnTextActive]}>
-                Exterior (9")
-              </Text>
+            <TouchableOpacity style={[styles.typeBtn, wall.type === 'exterior' && styles.typeBtnActive]} onPress={() => setType('exterior', 0.75)}>
+              <Text style={[styles.typeBtnText, wall.type === 'exterior' && styles.typeBtnTextActive]}>Exterior (9")</Text>
             </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.typeBtn, wall.type === 'interior' && styles.typeBtnActive]}
-              onPress={() => {
-                handleWallField('type', 'interior');
-                handleWallField('thickness', 0.375);
-              }}
-            >
-              <Text style={[styles.typeBtnText, wall.type === 'interior' && styles.typeBtnTextActive]}>
-                Interior (4.5")
-              </Text>
+            <TouchableOpacity style={[styles.typeBtn, wall.type === 'interior' && styles.typeBtnActive]} onPress={() => setType('interior', 0.375)}>
+              <Text style={[styles.typeBtnText, wall.type === 'interior' && styles.typeBtnTextActive]}>Interior (4.5")</Text>
             </TouchableOpacity>
           </View>
         </View>
 
-        {/* Thickness */}
-        <View style={styles.inputGroup}>
-          <Text style={styles.inputLabel}>Wall Thickness (ft)</Text>
-          <TextInput
-            key={`wall-th-${wall?.id}-${wall?.thickness}`}
-            style={styles.textInput}
-            defaultValue={String(wall?.thickness ?? 0.375)}
-            onBlur={(e) => handleWallField('thickness', parseFloat(e.nativeEvent.text) || 0.375)}
-          />
+        <View style={styles.rowTwo}>
+          {measureField('Thickness', wall.thickness, (v) => applyWall({ layout: setWallProps(layout, wall.id, { thickness: v }) }), { min: 0.1, editable: !locked })}
+          {measureField('Length', len, (v) => applyWall(setWallLength(layout, wall.id, v)), { min: 0.25, editable: !locked })}
         </View>
+        <Text style={styles.hintText}>Changing the length keeps the start point and the wall's direction.</Text>
 
-        {/* Wall Length & Angle */}
         <View style={styles.statBox}>
           <View style={styles.rowBetween}>
-            <Text style={styles.statLabel}>Length:</Text>
-            <Text style={styles.statValue}>{formatMeasurement(len, unit)}</Text>
-          </View>
-          <View style={[styles.rowBetween, { marginTop: 4 }]}>
             <Text style={styles.statLabel}>Orientation Angle:</Text>
-            <Text style={styles.statValue}>{Math.round(angle)}°</Text>
+            <Text style={styles.statValue}>{angle.toFixed(1)}°</Text>
           </View>
         </View>
 
         {/* Start Point (X1, Y1) */}
         <Text style={styles.subHeading}>Endpoint 1 (Start)</Text>
         <View style={styles.rowTwo}>
-          <View style={[styles.inputGroup, { flex: 1 }]}>
-            <Text style={styles.inputLabel}>X1 (ft)</Text>
-            <TextInput
-              key={`wall-x1-${wall?.id}-${wall?.x1}`}
-              style={styles.textInput}
-              defaultValue={String(wall?.x1 ?? 0)}
-              onBlur={(e) => handleWallField('x1', parseFloat(e.nativeEvent.text) || 0)}
-            />
-          </View>
-          <View style={[styles.inputGroup, { flex: 1 }]}>
-            <Text style={styles.inputLabel}>Y1 (ft)</Text>
-            <TextInput
-              key={`wall-y1-${wall?.id}-${wall?.y1}`}
-              style={styles.textInput}
-              defaultValue={String(wall?.y1 ?? 0)}
-              onBlur={(e) => handleWallField('y1', parseFloat(e.nativeEvent.text) || 0)}
-            />
-          </View>
+          {measureField('X1', wall.x1, (v) => setEnd('p1', 'x', v), { editable: !locked })}
+          {measureField('Y1', wall.y1, (v) => setEnd('p1', 'y', v), { editable: !locked })}
         </View>
 
         {/* End Point (X2, Y2) */}
         <Text style={styles.subHeading}>Endpoint 2 (End)</Text>
         <View style={styles.rowTwo}>
-          <View style={[styles.inputGroup, { flex: 1 }]}>
-            <Text style={styles.inputLabel}>X2 (ft)</Text>
-            <TextInput
-              key={`wall-x2-${wall?.id}-${wall?.x2}`}
-              style={styles.textInput}
-              defaultValue={String(wall?.x2 ?? 0)}
-              onBlur={(e) => handleWallField('x2', parseFloat(e.nativeEvent.text) || 0)}
-            />
-          </View>
-          <View style={[styles.inputGroup, { flex: 1 }]}>
-            <Text style={styles.inputLabel}>Y2 (ft)</Text>
-            <TextInput
-              key={`wall-y2-${wall?.id}-${wall?.y2}`}
-              style={styles.textInput}
-              defaultValue={String(wall?.y2 ?? 0)}
-              onBlur={(e) => handleWallField('y2', parseFloat(e.nativeEvent.text) || 0)}
-            />
-          </View>
+          {measureField('X2', wall.x2, (v) => setEnd('p2', 'x', v), { editable: !locked })}
+          {measureField('Y2', wall.y2, (v) => setEnd('p2', 'y', v), { editable: !locked })}
         </View>
 
         {/* Split Wall Tool */}
         <TouchableOpacity style={styles.secondaryBtn} onPress={handleSplitWall}>
           <Ionicons name="cut-outline" size={14} color="#2563EB" />
-          <Text style={styles.secondaryBtnText}>Split Wall into Two Segments</Text>
+          <Text style={styles.secondaryBtnText}>Split Wall at Midpoint</Text>
         </TouchableOpacity>
+        <Text style={styles.hintText}>To join walls: select two collinear walls that touch, then use Join in the Modify tools.</Text>
 
-        {/* Action Buttons */}
-        <View style={styles.actionsBar}>
-          <TouchableOpacity style={styles.actionBtn} onPress={handleDuplicate}>
-            <Ionicons name="copy-outline" size={14} color="#334155" />
-            <Text style={styles.actionBtnText}>Duplicate</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[styles.actionBtn, styles.deleteBtn]} onPress={handleDelete}>
-            <Ionicons name="trash-outline" size={14} color="#DC2626" />
-            <Text style={[styles.actionBtnText, { color: '#DC2626' }]}>Delete</Text>
-          </TouchableOpacity>
-        </View>
+        {renderActions(locked)}
       </View>
     );
   };
 
   // ---------------------------------------------------------
-  // RENDER DOOR INSPECTOR
+  // RENDER DOOR / WINDOW INSPECTOR
   // ---------------------------------------------------------
-  const renderDoorInspector = (door) => {
-    const handleDoorField = (field, val) => {
-      const nextDoors = layout.doors.map(d => d.id === door.id ? { ...d, [field]: val } : d);
-      const nextLayout = { ...layout, doors: nextDoors };
-      updateLayoutAndRecord(nextLayout);
-      onSelectElement({ type: 'door', data: { ...door, [field]: val } });
+  const renderOpeningInspector = (kind, o) => {
+    const key = COLLECTIONS[kind];
+    const locked = !!o.isLocked;
+    const host = getOpeningHost(o, layout.walls);
+    const hostLength = host ? calculateWallLength(host.wall) : 0;
+
+    const applyField = (patch) => {
+      if (locked) { notify(`This ${kind} is locked.`); return; }
+      const next = { ...o, ...patch };
+      updateLayoutAndRecord({ ...layout, [key]: layout[key].map((e) => (e.id === o.id ? next : e)) });
+      onSelectElement({ type: kind, data: next });
+    };
+    const applyResult = (res) => {
+      if (res.reason) notify(res.reason);
+      if (res.layout !== layout) {
+        updateLayoutAndRecord(res.layout);
+        onSelectElement({ type: kind, data: res.layout[key].find((e) => e.id === o.id) });
+      }
     };
 
     return (
-      <View key={`inspector-door-${door?.id || 'door'}`} style={styles.inspectorContent}>
+      <View key={`inspector-${kind}-${o.id}`} style={styles.inspectorContent}>
         <View style={styles.elemHeader}>
-          <Ionicons name="enter" size={18} color="#B45309" />
-          <Text style={styles.elemTitle}>Door Properties</Text>
+          <Ionicons name={kind === 'door' ? 'enter' : 'browsers'} size={18} color={kind === 'door' ? '#B45309' : '#0284C7'} />
+          <Text style={styles.elemTitle}>{kind === 'door' ? 'Door' : 'Window'} Properties</Text>
         </View>
 
-        <View style={styles.inputGroup}>
-          <Text style={styles.inputLabel}>Door Width ({unit})</Text>
-          <TextInput
-            key={`door-w-${door?.id}-${door?.width}-${unit}`}
-            style={styles.textInput}
-            defaultValue={formatMeasurement(door?.width ?? 3, unit)}
-            onBlur={(e) => {
-              const feet = parseToFeet(e.nativeEvent.text, unit);
-              if (feet) handleDoorField('width', feet);
-            }}
-          />
-        </View>
-
-        {/* Door Type */}
-        <View style={styles.inputGroup}>
-          <Text style={styles.inputLabel}>Door Type</Text>
-          <View style={styles.rowTwo}>
-            <TouchableOpacity
-              style={[styles.typeBtn, door.type === 'single' && styles.typeBtnActive]}
-              onPress={() => handleDoorField('type', 'single')}
-            >
-              <Text style={[styles.typeBtnText, door.type === 'single' && styles.typeBtnTextActive]}>Single Leaf</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.typeBtn, door.type === 'double' && styles.typeBtnActive]}
-              onPress={() => handleDoorField('type', 'double')}
-            >
-              <Text style={[styles.typeBtnText, door.type === 'double' && styles.typeBtnTextActive]}>Double Leaf</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-
-        {/* Hinge & Swing Controls */}
         <View style={styles.rowTwo}>
-          <TouchableOpacity
-            style={styles.secondaryBtn}
-            onPress={() => handleDoorField('hinge', door.hinge === 'left' ? 'right' : 'left')}
-          >
-            <Ionicons name="swap-horizontal-outline" size={14} color="#2563EB" />
-            <Text style={styles.secondaryBtnText}>Flip Hinge ({door.hinge})</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={styles.secondaryBtn}
-            onPress={() => handleDoorField('swing', door.swing === 'inward' ? 'outward' : 'inward')}
-          >
-            <Ionicons name="swap-vertical-outline" size={14} color="#2563EB" />
-            <Text style={styles.secondaryBtnText}>Flip Swing ({door.swing})</Text>
-          </TouchableOpacity>
+          {measureField(`Width (${unit})`, o.width, (v) => applyResult(resizeOpening(layout, kind, o.id, v)), { min: 1, editable: !locked })}
+          {measureField('Along wall', getOpeningPosition(o, layout.walls), (v) => applyResult(setOpeningPosition(layout, kind, o.id, v)), { min: 0, max: hostLength || undefined, editable: !locked && !!host })}
+        </View>
+        <View style={styles.statBox}>
+          <View style={styles.rowBetween}>
+            <Text style={styles.statLabel}>Host wall length:</Text>
+            <Text style={styles.statValue}>{host ? formatMeasurement(hostLength, unit) : 'Not on a wall'}</Text>
+          </View>
         </View>
 
-        {/* Rotation */}
-        <TouchableOpacity
-          style={styles.secondaryBtn}
-          onPress={() => handleDoorField('rotation', ((door.rotation || 0) + 90) % 360)}
-        >
-          <Ionicons name="refresh-outline" size={14} color="#2563EB" />
-          <Text style={styles.secondaryBtnText}>Rotate 90° ({door.rotation || 0}°)</Text>
-        </TouchableOpacity>
+        {kind === 'door' ? (
+          <>
+            <Text style={styles.inputLabel}>Door Type</Text>
+            {renderChoice(
+              [{ value: 'single', label: 'Single' }, { value: 'double', label: 'Double' }, { value: 'sliding', label: 'Sliding' }],
+              o.type,
+              (v) => applyField({ type: v }),
+              `dt-${o.id}`
+            )}
+            <View style={styles.rowTwo}>
+              <TouchableOpacity style={[styles.secondaryBtn, { flex: 1 }]} onPress={() => applyField({ hinge: o.hinge === 'left' ? 'right' : 'left' })}>
+                <Ionicons name="swap-horizontal-outline" size={14} color="#2563EB" />
+                <Text style={styles.secondaryBtnText}>Hinge: {o.hinge}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.secondaryBtn, { flex: 1 }]} onPress={() => applyField({ swing: o.swing === 'inward' ? 'outward' : 'inward' })}>
+                <Ionicons name="swap-vertical-outline" size={14} color="#2563EB" />
+                <Text style={styles.secondaryBtnText}>Swing: {o.swing}</Text>
+              </TouchableOpacity>
+            </View>
+          </>
+        ) : (
+          <>
+            <Text style={styles.inputLabel}>Window Style</Text>
+            {renderChoice(
+              [{ value: 'standard', label: 'Standard' }, { value: 'ventilator', label: 'Ventilator' }, { value: 'bay', label: 'Bay' }],
+              o.type,
+              (v) => applyField({ type: v }),
+              `wt-${o.id}`
+            )}
+            <TouchableOpacity style={styles.secondaryBtn} onPress={() => applyField({ chajja: !o.chajja })}>
+              <Ionicons name={o.chajja ? 'checkbox' : 'square-outline'} size={16} color="#2563EB" />
+              <Text style={styles.secondaryBtnText}>Sunshade (Chajja) Projection</Text>
+            </TouchableOpacity>
+          </>
+        )}
+        <Text style={styles.hintText}>Its orientation comes from the host wall. Drag it along a wall, or onto another wall.</Text>
 
-        {/* Action Buttons */}
-        <View style={styles.actionsBar}>
-          <TouchableOpacity style={styles.actionBtn} onPress={handleDuplicate}>
-            <Ionicons name="copy-outline" size={14} color="#334155" />
-            <Text style={styles.actionBtnText}>Duplicate</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[styles.actionBtn, styles.deleteBtn]} onPress={handleDelete}>
-            <Ionicons name="trash-outline" size={14} color="#DC2626" />
-            <Text style={[styles.actionBtnText, { color: '#DC2626' }]}>Delete</Text>
-          </TouchableOpacity>
-        </View>
+        {renderActions(locked)}
       </View>
     );
   };
 
   // ---------------------------------------------------------
-  // RENDER WINDOW INSPECTOR
+  // RENDER COLUMN / PARKING / UTILITY / TEXT / DIMENSION / ENTITY INSPECTORS
   // ---------------------------------------------------------
-  const renderWindowInspector = (win) => {
-    const handleWinField = (field, val) => {
-      const nextWins = layout.windows.map(w => w.id === win.id ? { ...w, [field]: val } : w);
-      const nextLayout = { ...layout, windows: nextWins };
-      updateLayoutAndRecord(nextLayout);
-      onSelectElement({ type: 'window', data: { ...win, [field]: val } });
-    };
+  const patchElement = (type, el, patch) => {
+    const key = COLLECTIONS[type];
+    const next = { ...el, ...patch };
+    updateLayoutAndRecord({ ...layout, [key]: layout[key].map((e) => (e.id === el.id ? next : e)) });
+    onSelectElement({ type, data: next });
+  };
 
+  const renderHeader = (icon, title) => (
+    <View style={styles.elemHeader}>
+      <Ionicons name={icon} size={18} color="#2563EB" />
+      <Text style={styles.elemTitle}>{title}</Text>
+    </View>
+  );
+
+  const renderColumnInspector = (c) => {
+    const opts = { editable: !c.isLocked };
+    const set = (patch) => patchElement('column', c, patch);
     return (
-      <View key={`inspector-win-${win?.id || 'win'}`} style={styles.inspectorContent}>
-        <View style={styles.elemHeader}>
-          <Ionicons name="browsers" size={18} color="#0284C7" />
-          <Text style={styles.elemTitle}>Window Properties</Text>
+      <View key={`inspector-col-${c.id}`} style={styles.inspectorContent}>
+        {renderHeader('cube', 'Column Properties')}
+        <View style={styles.rowTwo}>
+          {measureField('Center X', c.x, (v) => set({ x: v }), opts)}
+          {measureField('Center Y', c.y, (v) => set({ y: v }), opts)}
         </View>
+        {measureField('Size', c.size, (v) => set({ size: v }), { ...opts, min: 0.25 })}
+        <Text style={styles.inputLabel}>Shape</Text>
+        {renderChoice([{ value: 'square', label: 'Square' }, { value: 'round', label: 'Round' }], c.shape, (v) => set({ shape: v }), `cs-${c.id}`)}
+        {renderActions(c.isLocked)}
+      </View>
+    );
+  };
 
+  const renderRectInspector = (type, el, title, nameField) => {
+    const opts = { editable: !el.isLocked };
+    const set = (patch) => patchElement(type, el, patch);
+    return (
+      <View key={`inspector-${type}-${el.id}`} style={styles.inspectorContent}>
+        {renderHeader(type === 'parking' ? 'car' : 'water', title)}
         <View style={styles.inputGroup}>
-          <Text style={styles.inputLabel}>Window Width ({unit})</Text>
-          <TextInput
-            key={`win-w-${win?.id}-${win?.width}-${unit}`}
-            style={styles.textInput}
-            defaultValue={formatMeasurement(win?.width ?? 4, unit)}
-            onBlur={(e) => {
-              const feet = parseToFeet(e.nativeEvent.text, unit);
-              if (feet) handleWinField('width', feet);
-            }}
-          />
+          <Text style={styles.inputLabel}>Label</Text>
+          <TextField style={styles.textInput} value={el[nameField] ?? ''} onCommit={(v) => set({ [nameField]: v })} />
         </View>
+        <View style={styles.rowTwo}>
+          {measureField('Position X', el.x, (v) => set({ x: v }), opts)}
+          {measureField('Position Y', el.y, (v) => set({ y: v }), opts)}
+        </View>
+        <View style={styles.rowTwo}>
+          {measureField('Width', el.width, (v) => set({ width: v }), { ...opts, min: 0.5 })}
+          {measureField('Length', el.length, (v) => set({ length: v }), { ...opts, min: 0.5 })}
+        </View>
+        <View style={styles.statBox}>
+          <Text style={styles.statLabel}>Area</Text>
+          <Text style={styles.statValue}>{formatArea(el.width * el.length, unit)}</Text>
+        </View>
+        {renderActions(el.isLocked)}
+      </View>
+    );
+  };
 
-        {/* Window Type */}
+  const renderAnnotationInspector = (a) => {
+    const set = (patch) => patchElement('annotation', a, patch);
+    return (
+      <View key={`inspector-anno-${a.id}`} style={styles.inspectorContent}>
+        {renderHeader('text', 'Text Properties')}
         <View style={styles.inputGroup}>
-          <Text style={styles.inputLabel}>Window Style</Text>
+          <Text style={styles.inputLabel}>Text</Text>
+          <TextField style={styles.textInput} value={a.text} onCommit={(v) => set({ text: v })} />
+        </View>
+        <View style={styles.rowTwo}>
+          {measureField('Position X', a.x, (v) => set({ x: v }), { editable: !a.isLocked })}
+          {measureField('Position Y', a.y, (v) => set({ y: v }), { editable: !a.isLocked })}
+        </View>
+        {numberField('Font size (px)', a.fontSize, (v) => set({ fontSize: v }), { min: 6, max: 72 })}
+        {renderActions(a.isLocked)}
+      </View>
+    );
+  };
+
+  const renderUserDimensionInspector = (d) => {
+    const set = (patch) => patchElement('dimension', d, patch);
+    const opts = { editable: !d.isLocked };
+    return (
+      <View key={`inspector-udim-${d.id}`} style={styles.inspectorContent}>
+        {renderHeader('resize', 'Dimension')}
+        <View style={styles.statBox}>
+          <Text style={styles.statLabel}>Measured distance</Text>
+          <Text style={styles.statValue}>{formatMeasurement(Math.hypot(d.x2 - d.x1, d.y2 - d.y1), unit)}</Text>
+        </View>
+        <View style={styles.rowTwo}>
+          {measureField('X1', d.x1, (v) => set({ x1: v }), opts)}
+          {measureField('Y1', d.y1, (v) => set({ y1: v }), opts)}
+        </View>
+        <View style={styles.rowTwo}>
+          {measureField('X2', d.x2, (v) => set({ x2: v }), opts)}
+          {measureField('Y2', d.y2, (v) => set({ y2: v }), opts)}
+        </View>
+        {measureField('Line offset', d.offset, (v) => set({ offset: v }), opts)}
+        {renderActions(d.isLocked)}
+      </View>
+    );
+  };
+
+  const renderEntityInspector = (e) => {
+    const set = (patch) => patchElement('entity', e, patch);
+    const opts = { editable: !e.isLocked };
+    const titles = { line: 'Line', polyline: 'Polyline', polygon: e.shape === 'rect' ? 'Rectangle' : 'Polygon', circle: 'Circle', arc: 'Arc' };
+    const area = entityArea(e);
+    return (
+      <View key={`inspector-ent-${e.id}`} style={styles.inspectorContent}>
+        {renderHeader('shapes', titles[e.kind])}
+        {e.kind === 'line' && (
+          <>
+            <View style={styles.rowTwo}>
+              {measureField('X1', e.x1, (v) => set({ x1: v }), opts)}
+              {measureField('Y1', e.y1, (v) => set({ y1: v }), opts)}
+            </View>
+            <View style={styles.rowTwo}>
+              {measureField('X2', e.x2, (v) => set({ x2: v }), opts)}
+              {measureField('Y2', e.y2, (v) => set({ y2: v }), opts)}
+            </View>
+          </>
+        )}
+        {(e.kind === 'circle' || e.kind === 'arc') && (
+          <>
+            <View style={styles.rowTwo}>
+              {measureField('Center X', e.cx, (v) => set({ cx: v }), opts)}
+              {measureField('Center Y', e.cy, (v) => set({ cy: v }), opts)}
+            </View>
+            {measureField('Radius', e.r, (v) => set({ r: v }), { ...opts, min: 0.05 })}
+          </>
+        )}
+        {e.kind === 'arc' && (
           <View style={styles.rowTwo}>
-            <TouchableOpacity
-              style={[styles.typeBtn, win.type === 'standard' && styles.typeBtnActive]}
-              onPress={() => handleWinField('type', 'standard')}
-            >
-              <Text style={[styles.typeBtnText, win.type === 'standard' && styles.typeBtnTextActive]}>Standard Glass</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.typeBtn, win.type === 'ventilator' && styles.typeBtnActive]}
-              onPress={() => handleWinField('type', 'ventilator')}
-            >
-              <Text style={[styles.typeBtnText, win.type === 'ventilator' && styles.typeBtnTextActive]}>Ventilator (V)</Text>
-            </TouchableOpacity>
+            {numberField('Start °', e.start, (v) => set({ start: ((v % 360) + 360) % 360 }), { editable: !e.isLocked })}
+            {numberField('End °', e.end, (v) => set({ end: ((v % 360) + 360) % 360 }), { editable: !e.isLocked })}
           </View>
+        )}
+        <View style={styles.statBox}>
+          <View style={styles.rowBetween}>
+            <Text style={styles.statLabel}>{e.kind === 'polygon' || e.kind === 'circle' ? 'Perimeter:' : 'Length:'}</Text>
+            <Text style={styles.statValue}>{formatMeasurement(entityLength(e), unit)}</Text>
+          </View>
+          {area > 0 && (
+            <View style={[styles.rowBetween, { marginTop: 4 }]}>
+              <Text style={styles.statLabel}>Area:</Text>
+              <Text style={styles.statValue}>{formatArea(area, unit)}</Text>
+            </View>
+          )}
         </View>
+        {e.points && <Text style={styles.hintText}>Drag a vertex handle to reshape it.</Text>}
+        {renderActions(e.isLocked)}
+      </View>
+    );
+  };
 
-        {/* Sunshade Chajja Toggle */}
-        <TouchableOpacity
-          style={styles.secondaryBtn}
-          onPress={() => handleWinField('chajja', !win.chajja)}
-        >
-          <Ionicons name={win.chajja ? "checkbox" : "square-outline"} size={16} color="#2563EB" />
-          <Text style={styles.secondaryBtnText}>Sunshade (Chajja) Projection</Text>
-        </TouchableOpacity>
-
-        {/* Rotation */}
-        <TouchableOpacity
-          style={styles.secondaryBtn}
-          onPress={() => handleWinField('rotation', ((win.rotation || 0) + 90) % 360)}
-        >
-          <Ionicons name="refresh-outline" size={14} color="#2563EB" />
-          <Text style={styles.secondaryBtnText}>Rotate 90° ({win.rotation || 0}°)</Text>
-        </TouchableOpacity>
-
-        {/* Action Buttons */}
-        <View style={styles.actionsBar}>
-          <TouchableOpacity style={styles.actionBtn} onPress={handleDuplicate}>
-            <Ionicons name="copy-outline" size={14} color="#334155" />
-            <Text style={styles.actionBtnText}>Duplicate</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[styles.actionBtn, styles.deleteBtn]} onPress={handleDelete}>
-            <Ionicons name="trash-outline" size={14} color="#DC2626" />
-            <Text style={[styles.actionBtnText, { color: '#DC2626' }]}>Delete</Text>
-          </TouchableOpacity>
+  const renderMultiInspector = (items) => {
+    const counts = {};
+    items.forEach((r) => { counts[r.type] = (counts[r.type] || 0) + 1; });
+    const allLocked = items.every((r) => (layout[COLLECTIONS[r.type]] || []).find((e) => e.id === r.id)?.isLocked);
+    return (
+      <View key="inspector-multi" style={styles.inspectorContent}>
+        {renderHeader('albums', `${items.length} Objects Selected`)}
+        <View style={styles.statBox}>
+          {Object.entries(counts).map(([type, n]) => (
+            <View key={type} style={styles.rowBetween}>
+              <Text style={styles.statLabel}>{type}</Text>
+              <Text style={styles.statValue}>{n}</Text>
+            </View>
+          ))}
         </View>
+        <Text style={styles.hintText}>Drag any selected object to move them together, or use the Modify tools.</Text>
+        {renderActions(allLocked)}
       </View>
     );
   };
@@ -831,18 +771,21 @@ export default function EditorRightPanel({
     const lengthInput = (field, label, minFeet = 0) => (
       <View style={[styles.inputGroup, { flex: 1 }]}>
         <Text style={styles.inputLabel}>{label}</Text>
-        <TextInput
-          key={`st-${field}-${stair.id}-${stair[field]}-${unit}`}
+        <MeasureInput
           style={styles.textInput}
           editable={!stair.isLocked}
-          defaultValue={formatMeasurement(stair[field] ?? 0, unit)}
-          onBlur={(e) => {
-            const f = parseToFeet(e.nativeEvent.text, unit);
-            if (f !== null && f >= minFeet && Math.abs(f - (stair[field] || 0)) > 1e-4) applyStair({ [field]: f }, field);
-          }}
+          value={stair[field] ?? 0}
+          unit={unit}
+          min={minFeet}
+          onCommit={(f) => applyStair({ [field]: f }, field)}
         />
       </View>
     );
+
+    const isTwoFlight = m.flights === 2;
+    const isL = stair.stairType === STAIRCASE_TYPES.L_SHAPED;
+    const isStraight = stair.stairType === STAIRCASE_TYPES.STRAIGHT;
+    const isOpenWell = isTwoFlight && !isL;
 
     return (
       <View key={`inspector-stair-${stair.id}`} style={styles.inspectorContent}>
@@ -853,12 +796,7 @@ export default function EditorRightPanel({
 
         <View style={styles.inputGroup}>
           <Text style={styles.inputLabel}>Label</Text>
-          <TextInput
-            key={`st-label-${stair.id}`}
-            style={styles.textInput}
-            defaultValue={stair.label || ''}
-            onBlur={(e) => applyStair({ label: e.nativeEvent.text })}
-          />
+          <TextField style={styles.textInput} value={stair.label || ''} onCommit={(v) => applyStair({ label: v })} />
         </View>
 
         <Text style={styles.inputLabel}>Type</Text>
@@ -870,7 +808,7 @@ export default function EditorRightPanel({
             { value: STAIRCASE_TYPES.L_SHAPED, label: 'L-shaped' },
           ],
           stair.stairType,
-          (v) => applyStair({ stairType: v, wellGap: undefined, landingDepth: undefined }, 'stairType'),
+          (v) => applyStair({ stairType: v, wellGap: undefined, landingDepth: undefined, firstFlightRisers: undefined }, 'stairType'),
           `st-type-${stair.id}`
         )}
 
@@ -886,35 +824,47 @@ export default function EditorRightPanel({
 
         <View style={styles.rowTwo}>
           {lengthInput('floorHeight', 'Floor-to-floor', 6)}
-          <View style={[styles.inputGroup, { flex: 1 }]}>
-            <Text style={styles.inputLabel}>Risers</Text>
-            <TextInput
-              key={`st-risers-${stair.id}-${stair.risers}`}
-              style={styles.textInput}
-              editable={!stair.isLocked}
-              keyboardType="numeric"
-              defaultValue={String(stair.risers)}
-              onBlur={(e) => {
-                const n = parseInt(e.nativeEvent.text, 10);
-                if (Number.isFinite(n) && n !== stair.risers) applyStair({ risers: n }, 'risers');
-              }}
-            />
-          </View>
+          {lengthInput('riserHeight', 'Riser height', 0.1)}
+        </View>
+        <Text style={styles.hintText}>Riser height = floor height ÷ risers. Entering a riser height sets the nearest whole number of risers.</Text>
+        <View style={styles.rowTwo}>
+          {numberField('Risers', stair.risers, (n) => applyStair({ risers: n }, 'risers'), { integer: true, min: 2, max: 40, editable: !stair.isLocked })}
+          {numberField('Treads', m.totalTreads, (n) => applyStair({ treads: n }, 'treads'), { integer: true, min: 1, max: 38, editable: !stair.isLocked })}
         </View>
         <View style={styles.rowTwo}>
           {lengthInput('treadDepth', 'Tread depth', 0.25)}
-          {stair.stairType === STAIRCASE_TYPES.L_SHAPED
-            ? lengthInput('flightWidth', 'Flight width', 2)
-            : stair.stairType === STAIRCASE_TYPES.STRAIGHT
-              ? <View style={{ flex: 1 }} />
-              : lengthInput('landingDepth', 'Landing depth', 2)}
+          {isOpenWell ? lengthInput('wellGap', 'Well gap', 0) : <View style={{ flex: 1 }} />}
         </View>
-        {(stair.stairType === STAIRCASE_TYPES.DOG_LEGGED || stair.stairType === STAIRCASE_TYPES.U_SHAPED) && (
+
+        <Text style={styles.inputLabel}>Number of flights</Text>
+        {renderChoice(
+          [{ value: 1, label: '1 flight' }, { value: 2, label: '2 flights' }],
+          m.flights,
+          (v) => {
+            if (v === m.flights) return;
+            applyStair({ stairType: v === 1 ? STAIRCASE_TYPES.STRAIGHT : STAIRCASE_TYPES.DOG_LEGGED, wellGap: undefined, landingDepth: undefined, firstFlightRisers: undefined }, 'stairType');
+          },
+          `st-fl-${stair.id}`
+        )}
+        {isTwoFlight && (
           <View style={styles.rowTwo}>
-            {lengthInput('wellGap', 'Well / mid-wall gap', 0)}
+            {numberField('Steps, flight 1', m.treadsPerFlight[0], (n) => applyStair({ firstFlightRisers: n + 1 }, 'firstFlightRisers'), { integer: true, min: 1, max: m.totalTreads - 1, editable: !stair.isLocked })}
+            {numberField('Steps, flight 2', m.treadsPerFlight[1], (n) => applyStair({ firstFlightRisers: stair.risers - (n + 1) }, 'firstFlightRisers'), { integer: true, min: 1, max: m.totalTreads - 1, editable: !stair.isLocked })}
+          </View>
+        )}
+        {isOpenWell && (
+          <View style={styles.rowTwo}>
+            {lengthInput('width', 'Landing width', 4)}
+            {lengthInput('landingDepth', 'Landing length', 2)}
+          </View>
+        )}
+        {isL && (
+          <View style={styles.rowTwo}>
+            {lengthInput('flightWidth', 'Landing size (= flight width)', 2)}
             <View style={{ flex: 1 }} />
           </View>
         )}
+        {isStraight && <Text style={styles.hintText}>A single straight flight has no landing.</Text>}
 
         <Text style={styles.inputLabel}>Direction</Text>
         {renderChoice(
@@ -923,6 +873,11 @@ export default function EditorRightPanel({
           (v) => applyStair({ direction: v }),
           `st-dir-${stair.id}`
         )}
+
+        <TouchableOpacity style={styles.secondaryBtn} onPress={() => applyStair({ mirrored: !stair.mirrored })}>
+          <Ionicons name="swap-horizontal-outline" size={14} color="#2563EB" />
+          <Text style={styles.secondaryBtnText}>Flip Direction of Turn ({stair.mirrored ? 'mirrored' : 'standard'})</Text>
+        </TouchableOpacity>
 
         <View style={styles.actionsBar}>
           <TouchableOpacity
@@ -998,20 +953,7 @@ export default function EditorRightPanel({
           `st-a-${stair.id}`
         )}
 
-        <View style={styles.actionsBar}>
-          <TouchableOpacity style={styles.actionBtn} onPress={handleDuplicate}>
-            <Ionicons name="copy-outline" size={14} color="#334155" />
-            <Text style={styles.actionBtnText}>Duplicate</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.actionBtn} onPress={handleToggleLock}>
-            <Ionicons name={stair.isLocked ? 'lock-closed' : 'lock-open-outline'} size={14} color="#334155" />
-            <Text style={styles.actionBtnText}>{stair.isLocked ? 'Unlock' : 'Lock'}</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[styles.actionBtn, styles.deleteBtn]} onPress={handleDelete}>
-            <Ionicons name="trash-outline" size={14} color="#DC2626" />
-            <Text style={[styles.actionBtnText, { color: '#DC2626' }]}>Delete</Text>
-          </TouchableOpacity>
-        </View>
+        {renderActions(stair.isLocked)}
       </View>
     );
   };
@@ -1029,29 +971,12 @@ export default function EditorRightPanel({
     const groundCoverage = totalPlotArea > 0 ? (totalCarpet / totalPlotArea) * 100 : 0;
     const { buildable } = getPlotAndBuildableBounds(layout);
 
-    const handleSetback = (key, text) => {
-      const feet = parseToFeet(text, unit);
-      if (feet === null || feet < 0 || !onRequestSiteChange) return;
-      if (Math.abs(feet - (Number(layout.plot?.setbacks?.[key]) || 0)) < 1e-4) return;
-      onRequestSiteChange({ setbacks: { [key]: Number(feet.toFixed(4)) } });
+    const handleSetback = (key, feet) => {
+      if (onRequestSiteChange) onRequestSiteChange({ setbacks: { [key]: Number(feet.toFixed(4)) } });
     };
 
-    const handlePlotDim = (field, text) => {
-      const feet = parseToFeet(text, unit);
-      if (feet && feet > 0) {
-        if (onRequestPlotResize) {
-          onRequestPlotResize(field, feet, { edge: field === 'width' ? resizeAnchorX : resizeAnchorY });
-        } else {
-          const nextLayout = {
-            ...layout,
-            plot: {
-              ...layout.plot,
-              [field]: feet,
-            },
-          };
-          updateLayoutAndRecord(nextLayout);
-        }
-      }
+    const handlePlotDim = (field, feet) => {
+      if (onRequestPlotResize) onRequestPlotResize(field, feet, { edge: field === 'width' ? resizeAnchorX : resizeAnchorY });
     };
 
     return (
@@ -1063,24 +988,8 @@ export default function EditorRightPanel({
 
         {/* Plot Dimensions */}
         <View style={styles.rowTwo}>
-          <View style={[styles.inputGroup, { flex: 1 }]}>
-            <Text style={styles.inputLabel}>Plot Width ({unit})</Text>
-            <TextInput
-              key={`plot-w-${plotW}-${unit}`}
-              style={styles.textInput}
-              defaultValue={formatMeasurement(plotW, unit)}
-              onBlur={(e) => handlePlotDim('width', e.nativeEvent.text)}
-            />
-          </View>
-          <View style={[styles.inputGroup, { flex: 1 }]}>
-            <Text style={styles.inputLabel}>Plot Length ({unit})</Text>
-            <TextInput
-              key={`plot-l-${plotL}-${unit}`}
-              style={styles.textInput}
-              defaultValue={formatMeasurement(plotL, unit)}
-              onBlur={(e) => handlePlotDim('length', e.nativeEvent.text)}
-            />
-          </View>
+          {measureField(`Plot Width (${unit})`, plotW, (v) => handlePlotDim('width', v), { min: 5 })}
+          {measureField(`Plot Length (${unit})`, plotL, (v) => handlePlotDim('length', v), { min: 5 })}
         </View>
 
         <Text style={styles.inputLabel}>When width changes, move</Text>
@@ -1099,28 +1008,16 @@ export default function EditorRightPanel({
         <Text style={styles.subHeading}>Setbacks</Text>
         <View style={styles.rowTwo}>
           {['north', 'south'].map((k) => (
-            <View key={`sb-${k}`} style={[styles.inputGroup, { flex: 1 }]}>
-              <Text style={styles.inputLabel}>{k === 'north' ? 'North (front/top)' : 'South (bottom)'}</Text>
-              <TextInput
-                key={`sb-${k}-${layout.plot?.setbacks?.[k]}-${unit}`}
-                style={styles.textInput}
-                defaultValue={formatMeasurement(layout.plot?.setbacks?.[k] ?? 0, unit)}
-                onBlur={(e) => handleSetback(k, e.nativeEvent.text)}
-              />
-            </View>
+            <React.Fragment key={`sb-${k}`}>
+              {measureField(k === 'north' ? 'North (front/top)' : 'South (bottom)', layout.plot?.setbacks?.[k] ?? 0, (v) => handleSetback(k, v), { min: 0 })}
+            </React.Fragment>
           ))}
         </View>
         <View style={styles.rowTwo}>
           {['west', 'east'].map((k) => (
-            <View key={`sb-${k}`} style={[styles.inputGroup, { flex: 1 }]}>
-              <Text style={styles.inputLabel}>{k === 'west' ? 'West (left)' : 'East (right)'}</Text>
-              <TextInput
-                key={`sb-${k}-${layout.plot?.setbacks?.[k]}-${unit}`}
-                style={styles.textInput}
-                defaultValue={formatMeasurement(layout.plot?.setbacks?.[k] ?? 0, unit)}
-                onBlur={(e) => handleSetback(k, e.nativeEvent.text)}
-              />
-            </View>
+            <React.Fragment key={`sb-${k}`}>
+              {measureField(k === 'west' ? 'West (left)' : 'East (right)', layout.plot?.setbacks?.[k] ?? 0, (v) => handleSetback(k, v), { min: 0 })}
+            </React.Fragment>
           ))}
         </View>
         <View style={styles.statBox}>
@@ -1147,15 +1044,10 @@ export default function EditorRightPanel({
         )}
         <View style={styles.inputGroup}>
           <Text style={styles.inputLabel}>North direction (degrees clockwise from up)</Text>
-          <TextInput
-            key={`compass-${layout.plot?.compassAngle}`}
+          <NumberInput
             style={styles.textInput}
-            defaultValue={String(layout.plot?.compassAngle ?? 0)}
-            keyboardType="numeric"
-            onBlur={(e) => {
-              const v = parseFloat(e.nativeEvent.text);
-              if (Number.isFinite(v)) updateLayoutAndRecord({ ...layout, plot: { ...layout.plot, compassAngle: ((v % 360) + 360) % 360 } });
-            }}
+            value={layout.plot?.compassAngle ?? 0}
+            onCommit={(v) => updateLayoutAndRecord({ ...layout, plot: { ...layout.plot, compassAngle: ((v % 360) + 360) % 360 } })}
           />
         </View>
 
@@ -1210,23 +1102,12 @@ export default function EditorRightPanel({
     const meta = getPlotDimensionMetaSafe(axis);
     const label = axis === 'width' ? 'Plot Width' : 'Plot Length';
 
-    const handleValue = (text) => {
-      const feet = parseToFeet(text, unit);
-      if (feet && feet > 0) {
-        if (onRequestPlotResize) onRequestPlotResize(axis, feet);
-        else {
-          const nextLayout = { ...layout, plot: { ...layout.plot, [axis]: feet } };
-          updateLayoutAndRecord(nextLayout);
-        }
-      }
+    const handleValue = (feet) => {
+      if (onRequestPlotResize) onRequestPlotResize(axis, feet);
     };
 
-    const handleOffset = (text) => {
-      const off = parseToFeet(text, unit);
-      if (off && off > 0) {
-        const nextLayout = setPlotDimensionOffset({ ...layout }, axis, off);
-        updateLayoutAndRecord(nextLayout);
-      }
+    const handleOffset = (off) => {
+      updateLayoutAndRecord(setPlotDimensionOffset(cloneLayout(layout), axis, off));
     };
 
     return (
@@ -1236,25 +1117,8 @@ export default function EditorRightPanel({
           <Text style={styles.elemTitle}>{label} Dimension</Text>
         </View>
 
-        <View style={styles.inputGroup}>
-          <Text style={styles.inputLabel}>{label} ({unit})</Text>
-          <TextInput
-            key={`dim-val-${axis}-${meta.value}-${unit}`}
-            style={styles.textInput}
-            defaultValue={formatMeasurement(meta.value, unit)}
-            onBlur={(e) => handleValue(e.nativeEvent.text)}
-          />
-        </View>
-
-        <View style={styles.inputGroup}>
-          <Text style={styles.inputLabel}>Annotation Offset ({unit})</Text>
-          <TextInput
-            key={`dim-off-${axis}-${meta.offset}-${unit}`}
-            style={styles.textInput}
-            defaultValue={formatMeasurement(meta.offset, unit)}
-            onBlur={(e) => handleOffset(e.nativeEvent.text)}
-          />
-        </View>
+        {measureField(`${label} (${unit})`, meta.value, handleValue, { min: 5 })}
+        {measureField(`Annotation Offset (${unit})`, meta.offset, handleOffset, { min: 0.5 })}
 
         <View style={[styles.statBox, { marginTop: 10 }]}>
           <Text style={styles.statLabel}>
@@ -1305,16 +1169,8 @@ export default function EditorRightPanel({
                 onPress={() => {
                   // Navigate / select the problematic element
                   if (issue.elementId) {
-                    if (issue.elementType === 'room') {
-                      const r = layout.rooms?.find(rm => rm.id === issue.elementId);
-                      if (r) onSelectElement({ type: 'room', data: r });
-                    } else if (issue.elementType === 'wall') {
-                      const w = layout.walls?.find(wl => wl.id === issue.elementId);
-                      if (w) onSelectElement({ type: 'wall', data: w });
-                    } else if (issue.elementType === 'door') {
-                      const d = layout.doors?.find(dr => dr.id === issue.elementId);
-                      if (d) onSelectElement({ type: 'door', data: d });
-                    }
+                    const found = selectionFromItems(layout, [{ type: issue.elementType, id: issue.elementId }]);
+                    if (COLLECTIONS[issue.elementType] && found) onSelectElement(found);
                   }
                 }}
               >
@@ -1365,12 +1221,22 @@ export default function EditorRightPanel({
             renderRoomInspector(selectedElement.data)
           ) : selectedElement.type === 'wall' ? (
             renderWallInspector(selectedElement.data)
-          ) : selectedElement.type === 'door' ? (
-            renderDoorInspector(selectedElement.data)
-          ) : selectedElement.type === 'window' ? (
-            renderWindowInspector(selectedElement.data)
+          ) : selectedElement.type === 'door' || selectedElement.type === 'window' ? (
+            renderOpeningInspector(selectedElement.type, selectedElement.data)
+          ) : selectedElement.type === 'multi' ? (
+            renderMultiInspector(selectedElement.data.items)
+          ) : selectedElement.type === 'column' ? (
+            renderColumnInspector(selectedElement.data)
+          ) : selectedElement.type === 'parking' ? (
+            renderRectInspector('parking', selectedElement.data, 'Parking Properties', 'label')
+          ) : selectedElement.type === 'utility' ? (
+            renderRectInspector('utility', selectedElement.data, 'Utility Properties', 'name')
+          ) : selectedElement.type === 'annotation' ? (
+            renderAnnotationInspector(selectedElement.data)
+          ) : selectedElement.type === 'entity' ? (
+            renderEntityInspector(selectedElement.data)
           ) : selectedElement.type === 'dimension' ? (
-            renderDimensionInspector(selectedElement.data)
+            isPlotDimension(selectedElement.data?.id) ? renderDimensionInspector(selectedElement.data) : renderUserDimensionInspector(selectedElement.data)
           ) : selectedElement.type === 'staircase' ? (
             renderStaircaseInspector(selectedElement.data)
           ) : (

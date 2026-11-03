@@ -172,36 +172,6 @@ export function validateLayout(layout) {
       });
     }
 
-    // Check if door is completely isolated from any wall or room
-    let nearWallOrRoom = false;
-    walls.forEach(w => {
-      const minX = Math.min(w.x1, w.x2) - 1.0;
-      const maxX = Math.max(w.x1, w.x2) + 1.0;
-      const minY = Math.min(w.y1, w.y2) - 1.0;
-      const maxY = Math.max(w.y1, w.y2) + 1.0;
-      if (door.x >= minX && door.x <= maxX && door.y >= minY && door.y <= maxY) {
-        nearWallOrRoom = true;
-      }
-    });
-    if (!nearWallOrRoom) {
-      rooms.forEach(r => {
-        if (door.x >= r.x - 1.0 && door.x <= r.x + r.width + 1.0 &&
-            door.y >= r.y - 1.0 && door.y <= r.y + r.length + 1.0) {
-          nearWallOrRoom = true;
-        }
-      });
-    }
-
-    if (!nearWallOrRoom) {
-      issues.push({
-        id: `issue-door-detached-${door.id}`,
-        elementId: door.id,
-        elementType: 'door',
-        severity: SEVERITY.WARNING,
-        title: 'Detached Door',
-        message: `Door is not positioned along any host wall or room boundary.`,
-      });
-    }
   });
 
   // 6. Validate Windows
@@ -218,6 +188,21 @@ export function validateLayout(layout) {
       });
     }
   });
+
+  // 6b. Doors and windows must sit on a wall (checked on a copy - no side effects)
+  validateOpenings(JSON.parse(JSON.stringify({ walls: layout.walls || [], doors: layout.doors || [], windows: layout.windows || [] })))
+    .filter((c) => c.code === 'opening-detached')
+    .forEach((c) => {
+      const isDoor = (layout.doors || []).some((d) => d.id === c.id);
+      issues.push({
+        id: `issue-opening-detached-${c.id}`,
+        elementId: c.id,
+        elementType: isDoor ? 'door' : 'window',
+        severity: SEVERITY.WARNING,
+        title: isDoor ? 'Detached Door' : 'Detached Window',
+        message: `This ${isDoor ? 'door' : 'window'} is not on a wall. Drag it onto a wall.`,
+      });
+    });
 
   // 7. Staircase drafting guidelines (geometric checks only)
   (layout.staircases || []).forEach((st) => {

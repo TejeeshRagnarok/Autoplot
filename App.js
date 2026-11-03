@@ -26,6 +26,7 @@ import LandingPage from './components/LandingPage';
 import LayoutEditor from './components/editor/LayoutEditor';
 import { generateStructuredLayoutFromState, syncLayoutToState } from './components/editor/layoutBridge';
 import { cloneLayout } from './components/editor/layoutModel';
+import { loadProject } from './components/editor/projectStorage';
 
 export default function App() {
   const [language, setLanguage] = useState('en'); 
@@ -173,12 +174,18 @@ export default function App() {
     setActiveTab(tabId);
   };
 
+  // A fresh layout for the current inputs. If the saved project was generated
+  // from these same inputs, its edits are restored; "Reset" still returns to
+  // the freshly generated layout.
+  const generateOrRestoreLayout = () => {
+    const generated = generateStructuredLayoutFromState(state);
+    const saved = loadProject();
+    setOriginalGeneratedLayout(cloneLayout(generated));
+    setLayoutData(saved && saved.sourceKey === generated.sourceKey ? saved : generated);
+  };
+
   const handleOpenEditor = () => {
-    if (!layoutData) {
-      const generated = generateStructuredLayoutFromState(state);
-      setLayoutData(generated);
-      setOriginalGeneratedLayout(cloneLayout(generated));
-    }
+    if (!layoutData) generateOrRestoreLayout();
     setActiveTab('editor');
   };
 
@@ -223,9 +230,7 @@ export default function App() {
                   setActiveTab={setActiveTab}
                   onCalculate={() => {
                     setHasCalculated(true);
-                    const generated = generateStructuredLayoutFromState(state);
-                    setLayoutData(generated);
-                    setOriginalGeneratedLayout(cloneLayout(generated));
+                    generateOrRestoreLayout();
                     setActiveTab('canvas');
                   }} 
                   hideFooter={true}
@@ -243,10 +248,8 @@ export default function App() {
               setActiveTab={setActiveTab}
               onCalculate={() => {
                 setHasCalculated(true);
-                const generated = generateStructuredLayoutFromState(state);
-                setLayoutData(generated);
-                setOriginalGeneratedLayout(cloneLayout(generated));
-                setActiveTab('canvas');
+                generateOrRestoreLayout();
+                    setActiveTab('canvas');
               }} 
             />
           );
@@ -303,10 +306,8 @@ export default function App() {
             setActiveTab={setActiveTab}
             onCalculate={() => {
               setHasCalculated(true);
-              const generated = generateStructuredLayoutFromState(state);
-              setLayoutData(generated);
-              setOriginalGeneratedLayout(cloneLayout(generated));
-              setActiveTab('canvas');
+              generateOrRestoreLayout();
+                    setActiveTab('canvas');
             }} 
           />
         );

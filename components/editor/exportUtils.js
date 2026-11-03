@@ -6,8 +6,14 @@
  * - Browser Print Window trigger
  */
 
-import { formatMeasurement, formatArea } from './units';
+import { formatMeasurement, formatArea } from './units.js';
 import { calculateStaircaseGeometry } from './staircaseGeometry.js';
+import { getOpeningGeometry } from './wallOps.js';
+import { arcSweep, pointAtAngle } from './cadGeometry.js';
+import { dimensionLine } from './selectionModel.js';
+import { isPlotDimension } from './cadCommands.js';
+
+const xmlText = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 /**
  * Generate full SVG string for the entire layout
@@ -69,7 +75,7 @@ export function generateLayoutSVG(layout, unit = 'ft-in') {
       <g>
         <rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" fill="${room.color || '#F8FAFC'}" stroke="#CBD5E1" stroke-width="1"/>
         <text x="${rx + rw / 2}" y="${ry + rh / 2 - 8}" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="#1E293B" text-anchor="middle">
-          ${room.name || 'Room'}
+          ${xmlText(room.name || 'Room')}
         </text>
         <text x="${rx + rw / 2}" y="${ry + rh / 2 + 8}" font-family="Arial, sans-serif" font-size="10" fill="#64748B" text-anchor="middle">
           ${formatMeasurement(room.width, unit)} × ${formatMeasurement(room.length, unit)}
@@ -89,7 +95,7 @@ export function generateLayoutSVG(layout, unit = 'ft-in') {
           fill="#F1F5F9" stroke="#94A3B8" stroke-width="1.5" stroke-dasharray="4,3"/>
         <text x="${originX + (p.x + p.width / 2) * scale}" y="${originY + (p.y + p.length / 2) * scale}" 
           font-family="Arial, sans-serif" font-size="10" font-weight="bold" fill="#64748B" text-anchor="middle">
-          ${p.label || 'PARKING'}
+          ${xmlText(p.label || 'PARKING')}
         </text>
       </g>
     `;
@@ -102,7 +108,7 @@ export function generateLayoutSVG(layout, unit = 'ft-in') {
           fill="#E0F2FE" stroke="#0284C7" stroke-width="1.5"/>
         <text x="${originX + (u.x + u.width / 2) * scale}" y="${originY + (u.y + u.length / 2) * scale + 4}" 
           font-family="Arial, sans-serif" font-size="9" font-weight="bold" fill="#0369A1" text-anchor="middle">
-          ${u.name || 'Utility'}
+          ${xmlText(u.name || 'Utility')}
         </text>
       </g>
     `;
@@ -126,7 +132,7 @@ export function generateLayoutSVG(layout, unit = 'ft-in') {
     elementsSvg += `<polyline points="${pts(geo.arrow.arrowHead)}" fill="none" stroke="#0F172A" stroke-width="1.2"/>`;
     elementsSvg += `
         <text x="${X(geo.labelPos.x)}" y="${Y(geo.labelPos.y) + 3}" font-family="Arial, sans-serif" font-size="9" font-weight="bold" fill="#0F172A" text-anchor="middle">
-          ${s.label || 'STAIRS'} ${geo.labelText} (${geo.metrics.totalRisers}R / ${geo.metrics.totalTreads}T)
+          ${xmlText(s.label || 'STAIRS')} ${geo.labelText} (${geo.metrics.totalRisers}R / ${geo.metrics.totalTreads}T)
         </text>
       </g>
     `;
@@ -144,32 +150,73 @@ export function generateLayoutSVG(layout, unit = 'ft-in') {
     `;
   });
 
-  // 6. Doors & Windows
+  // 6. Doors & Windows (same geometry as the canvas: on the host wall, with hinge and swing)
+  const SX = (x) => originX + x * scale;
+  const SY = (y) => originY + y * scale;
   (layout.doors || []).forEach(d => {
-    const dx = originX + d.x * scale;
-    const dy = originY + d.y * scale;
-    const dw = (d.width || 3.0) * scale;
+    const g = getOpeningGeometry(d, layout.walls);
+    const gap = Math.max(2, g.thickness * scale) + 1;
+    elementsSvg += `<g><line x1="${SX(g.a.x)}" y1="${SY(g.a.y)}" x2="${SX(g.b.x)}" y2="${SY(g.b.y)}" stroke="#FFFFFF" stroke-width="${gap}"/>`;
+    g.leaves.forEach((leaf) => {
+      const r = leaf.radius * scale;
+      const cross = (leaf.tip.x - leaf.hinge.x) * (leaf.free.y - leaf.hinge.y) - (leaf.tip.y - leaf.hinge.y) * (leaf.free.x - leaf.hinge.x);
+      elementsSvg += `<line x1="${SX(leaf.hinge.x)}" y1="${SY(leaf.hinge.y)}" x2="${SX(leaf.tip.x)}" y2="${SY(leaf.tip.y)}" stroke="#B45309" stroke-width="2"/>`;
+      elementsSvg += `<path d="M ${SX(leaf.tip.x)} ${SY(leaf.tip.y)} A ${r} ${r} 0 0 ${cross > 0 ? 1 : 0} ${SX(leaf.free.x)} ${SY(leaf.free.y)}" fill="none" stroke="#B45309" stroke-width="1.2" stroke-dasharray="3,3"/>`;
+    });
+    if (d.type === 'sliding') {
+      elementsSvg += `<line x1="${SX(g.a.x)}" y1="${SY(g.a.y)}" x2="${SX(g.b.x)}" y2="${SY(g.b.y)}" stroke="#B45309" stroke-width="2"/>`;
+    }
+    elementsSvg += '</g>';
+  });
+
+  (layout.windows || []).forEach(win => {
+    const g = getOpeningGeometry(win, layout.walls);
+    const h = Math.max(1.5, (g.thickness * scale) / 2);
+    const ax = SX(g.a.x); const ay = SY(g.a.y); const bx = SX(g.b.x); const by = SY(g.b.y);
+    const nx = g.nx * h; const ny = g.ny * h;
     elementsSvg += `
       <g>
-        <circle cx="${dx}" cy="${dy}" r="4" fill="#B45309"/>
-        <line x1="${dx}" y1="${dy}" x2="${dx + dw * 0.7}" y2="${dy - dw * 0.7}" stroke="#B45309" stroke-width="2"/>
-        <path d="M ${dx} ${dy - dw} A ${dw} ${dw} 0 0 1 ${dx + dw} ${dy}" fill="none" stroke="#B45309" stroke-width="1.2" stroke-dasharray="3,3"/>
+        <polygon points="${ax + nx},${ay + ny} ${bx + nx},${by + ny} ${bx - nx},${by - ny} ${ax - nx},${ay - ny}" fill="#BAE6FD" stroke="#0284C7" stroke-width="1.5"/>
+        <text x="${SX(win.x)}" y="${SY(win.y) + 3}" font-family="Arial, sans-serif" font-size="8" font-weight="bold" fill="#0369A1" text-anchor="middle">
+          ${win.isBathroom || win.type === 'ventilator' ? 'V' : 'W'}
+        </text>
       </g>
     `;
   });
 
-  (layout.windows || []).forEach(win => {
-    const wx = originX + win.x * scale;
-    const wy = originY + win.y * scale;
-    const ww = (win.width || 4.0) * scale;
-    elementsSvg += `
-      <g>
-        <rect x="${wx - ww / 2}" y="${wy - 3}" width="${ww}" height="6" fill="#0EA5E9" stroke="#0284C7" stroke-width="1.5"/>
-        <text x="${wx}" y="${wy - 6}" font-family="Arial, sans-serif" font-size="8" font-weight="bold" fill="#0284C7" text-anchor="middle">
-          ${win.isBathroom ? 'V' : 'W'}
-        </text>
-      </g>
-    `;
+  // 6b. Columns, CAD entities, user dimensions and text
+  (layout.columns || []).forEach((c) => {
+    const size = (c.size || 0.75) * scale;
+    elementsSvg += c.shape === 'round'
+      ? `<circle cx="${SX(c.x)}" cy="${SY(c.y)}" r="${size / 2}" fill="#475569"/>`
+      : `<rect x="${SX(c.x) - size / 2}" y="${SY(c.y) - size / 2}" width="${size}" height="${size}" fill="#475569"/>`;
+  });
+  (layout.cadEntities || []).forEach((ent) => {
+    const stroke = `fill="none" stroke="${ent.color || '#0F172A'}" stroke-width="1.5"`;
+    if (ent.kind === 'line') {
+      elementsSvg += `<line x1="${SX(ent.x1)}" y1="${SY(ent.y1)}" x2="${SX(ent.x2)}" y2="${SY(ent.y2)}" ${stroke}/>`;
+    } else if (ent.points) {
+      const pts = ent.points.map((p) => `${SX(p.x)},${SY(p.y)}`).join(' ');
+      elementsSvg += ent.closed ? `<polygon points="${pts}" ${stroke}/>` : `<polyline points="${pts}" ${stroke}/>`;
+    } else if (ent.kind === 'circle') {
+      elementsSvg += `<circle cx="${SX(ent.cx)}" cy="${SY(ent.cy)}" r="${ent.r * scale}" ${stroke}/>`;
+    } else {
+      const a = pointAtAngle(ent, ent.start);
+      const b = pointAtAngle(ent, ent.end);
+      const r = ent.r * scale;
+      elementsSvg += `<path d="M ${SX(a.x)} ${SY(a.y)} A ${r} ${r} 0 ${arcSweep(ent) > 180 ? 1 : 0} 1 ${SX(b.x)} ${SY(b.y)}" ${stroke}/>`;
+    }
+  });
+  (layout.dimensions || []).filter((d) => !isPlotDimension(d.id)).forEach((d) => {
+    const l = dimensionLine(d);
+    const text = formatMeasurement(Math.hypot(d.x2 - d.x1, d.y2 - d.y1), unit);
+    elementsSvg += `<line x1="${SX(d.x1)}" y1="${SY(d.y1)}" x2="${SX(l.x1)}" y2="${SY(l.y1)}" stroke="#B45309" stroke-width="0.8"/>`;
+    elementsSvg += `<line x1="${SX(d.x2)}" y1="${SY(d.y2)}" x2="${SX(l.x2)}" y2="${SY(l.y2)}" stroke="#B45309" stroke-width="0.8"/>`;
+    elementsSvg += `<line x1="${SX(l.x1)}" y1="${SY(l.y1)}" x2="${SX(l.x2)}" y2="${SY(l.y2)}" stroke="#B45309" stroke-width="1.2"/>`;
+    elementsSvg += `<text x="${(SX(l.x1) + SX(l.x2)) / 2}" y="${(SY(l.y1) + SY(l.y2)) / 2 - 5}" font-family="Arial, sans-serif" font-size="11" font-weight="bold" fill="#B45309" text-anchor="middle">${xmlText(text)}</text>`;
+  });
+  (layout.annotations || []).forEach((a) => {
+    elementsSvg += `<text x="${SX(a.x)}" y="${SY(a.y)}" font-family="Arial, sans-serif" font-size="${a.fontSize || 12}" fill="${a.color || '#334155'}">${xmlText(a.text)}</text>`;
   });
 
   // 7. Title Block & North Compass
@@ -205,8 +252,8 @@ export function generateLayoutSVG(layout, unit = 'ft-in') {
         <line x1="${plotW * scale * 0.75}" y1="0" x2="${plotW * scale * 0.75}" y2="64" stroke="#CBD5E1" stroke-width="1"/>
 
         <!-- Project & Client -->
-        <text x="16" y="24" class="txt-title">${layout.title || 'AUTOPLOT ARCHITECTURAL PLAN'}</text>
-        <text x="16" y="44" class="txt-meta">Client: <tspan class="txt-bold">${layout.ownerName || 'Client'}</tspan> | Facing: <tspan class="txt-bold">${layout.plot?.facing || 'North'}</tspan></text>
+        <text x="16" y="24" class="txt-title">${xmlText(layout.title || 'AUTOPLOT ARCHITECTURAL PLAN')}</text>
+        <text x="16" y="44" class="txt-meta">Client: <tspan class="txt-bold">${xmlText(layout.ownerName || 'Client')}</tspan> | Facing: <tspan class="txt-bold">${xmlText(layout.plot?.facing || 'North')}</tspan></text>
 
         <!-- Plot Dimensions -->
         <text x="${plotW * scale * 0.5 + 16}" y="24" class="txt-bold">Plot: ${formatMeasurement(plotW, unit)} × ${formatMeasurement(plotL, unit)}</text>

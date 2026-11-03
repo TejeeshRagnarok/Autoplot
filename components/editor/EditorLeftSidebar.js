@@ -5,6 +5,8 @@
 import React, { useState } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, ScrollView } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { MeasureInput, NumberInput, TextField } from './DraftInput';
+import { placeOpeningOnWall } from './wallOps';
 import {
   createRoom,
   createDoor,
@@ -26,7 +28,62 @@ export const TOOLS = [
   { id: 'staircase', name: 'Add Staircase', icon: 'layers', shortcut: 'S', ion: 'layers-outline' },
   { id: 'column', name: 'Add Column', icon: 'cube', shortcut: 'C', ion: 'cube-outline' },
   { id: 'measure', name: 'Measure Distance', icon: 'resize', shortcut: 'M', ion: 'resize-outline' },
+  { id: 'line', name: 'Line', shortcut: 'L', ion: 'remove-outline' },
+  { id: 'polyline', name: 'Polyline', shortcut: 'P', ion: 'git-commit-outline' },
+  { id: 'rectangle', name: 'Rectangle', ion: 'square-outline' },
+  { id: 'circle', name: 'Circle', ion: 'ellipse-outline' },
+  { id: 'arc', name: 'Arc', ion: 'radio-button-off-outline' },
+  { id: 'polygon', name: 'Polygon', ion: 'shapes-outline' },
+  { id: 'parking', name: 'Parking', ion: 'car-outline' },
+  { id: 'text', name: 'Text', shortcut: 'T', ion: 'text-outline' },
+  { id: 'dimension', name: 'Dimension', ion: 'analytics-outline' },
 ];
+
+export const MODIFY_TOOLS = [
+  { id: 'move', name: 'Move', ion: 'move-outline' },
+  { id: 'copy', name: 'Copy', ion: 'copy-outline' },
+  { id: 'rotate', name: 'Rotate', ion: 'refresh-outline' },
+  { id: 'mirror', name: 'Mirror', ion: 'swap-horizontal-outline' },
+  { id: 'scale', name: 'Scale', ion: 'expand-outline' },
+  { id: 'offset', name: 'Offset', ion: 'albums-outline' },
+  { id: 'trim', name: 'Trim', ion: 'cut-outline' },
+  { id: 'extend', name: 'Extend', ion: 'arrow-forward-outline' },
+  { id: 'fillet', name: 'Fillet', ion: 'return-down-forward-outline' },
+  { id: 'chamfer', name: 'Chamfer', ion: 'trending-down-outline' },
+  { id: 'stretch', name: 'Stretch', ion: 'resize-outline' },
+  { id: 'break', name: 'Break', ion: 'unlink-outline' },
+  { id: 'polar-array', name: 'Polar Array', ion: 'sync-outline' },
+  { id: 'delete', name: 'Delete (click object)', ion: 'trash-outline' },
+];
+
+// What the active tool expects next, shown under its parameters.
+const TOOL_PROMPTS = {
+  wall: 'Click the start, then the end. Walls stay horizontal or vertical unless Diagonal Walls is on in the toolbar.',
+  line: 'Click the start, then the end.',
+  polyline: 'Click each point. Double-click or press Enter to finish.',
+  rectangle: 'Click two opposite corners.',
+  circle: 'Click the center, then a point on the circle.',
+  arc: 'Click the start, a point on the arc, then the end.',
+  polygon: 'Click the center, then a vertex.',
+  text: 'Click where the text goes. Edit it in the Properties panel.',
+  dimension: 'Click the two points to measure.',
+  door: 'Click on a wall.',
+  window: 'Click on a wall.',
+  move: 'With objects selected: click a base point, then its destination.',
+  copy: 'With objects selected: click a base point, then where the copy goes.',
+  rotate: 'With objects selected: click the rotation center.',
+  mirror: 'With objects selected: click two points on the mirror line.',
+  scale: 'With objects selected: click the base point.',
+  offset: 'Click the object, then the side to offset to.',
+  trim: 'Click the piece to remove. Other walls and lines are the cutting edges.',
+  extend: 'Click near the end to extend to the next wall or line.',
+  fillet: 'Click two walls or lines. Radius 0 makes a sharp corner (the only option for walls).',
+  chamfer: 'Click two walls or lines.',
+  stretch: 'Drag a window around the points to move, then click a base point and destination.',
+  break: 'Click the object where it should break.',
+  'polar-array': 'With objects selected: click the center of the array.',
+  delete: 'Click the object to delete.',
+};
 
 const ROOM_TEMPLATES = [
   { name: 'Master Bedroom', width: 14, length: 12, color: '#EFF6FF' },
@@ -48,8 +105,79 @@ export default function EditorLeftSidebar({
   onUpdateLayout,
   onSelectElement,
   historyManager,
+  toolParams = {},
+  onChangeToolParams,
+  unit = 'ft-in',
+  onDuplicate,
+  onJoin,
+  onRectangularArray,
+  onDeleteSelection,
+  onNotice,
 }) {
   const [tab, setTab] = useState('tools'); // 'tools' | 'library'
+
+  const setParam = (key, value) => onChangeToolParams && onChangeToolParams({ ...toolParams, [key]: value });
+  const numParam = (key, label, opts = {}) => (
+    <View style={styles.paramRow} key={key}>
+      <Text style={styles.paramLabel}>{label}</Text>
+      <NumberInput style={styles.paramInput} value={toolParams[key]} onCommit={(v) => setParam(key, v)} {...opts} />
+    </View>
+  );
+  const lenParam = (key, label, opts = {}) => (
+    <View style={styles.paramRow} key={key}>
+      <Text style={styles.paramLabel}>{label}</Text>
+      <MeasureInput style={styles.paramInput} value={toolParams[key]} unit={unit} onCommit={(v) => setParam(key, v)} {...opts} />
+    </View>
+  );
+
+  const renderToolOptions = () => {
+    const fields = {
+      polygon: [numParam('sides', 'Sides', { integer: true, min: 3, max: 64 })],
+      text: [(
+        <View style={styles.paramRow} key="text">
+          <Text style={styles.paramLabel}>Text</Text>
+          <TextField style={styles.paramInput} value={toolParams.text} onCommit={(v) => setParam('text', v)} />
+        </View>
+      )],
+      rotate: [numParam('angle', 'Angle (°)')],
+      scale: [numParam('factor', 'Factor', { min: 0.01, max: 100 })],
+      offset: [lenParam('offset', 'Distance', { min: 0.01 })],
+      fillet: [lenParam('radius', 'Radius', { min: 0 })],
+      chamfer: [lenParam('chamferA', 'First dist.', { min: 0.01 }), lenParam('chamferB', 'Second dist.', { min: 0.01 })],
+      break: [lenParam('gap', 'Gap', { min: 0 })],
+      'polar-array': [numParam('count', 'Items', { integer: true, min: 2, max: 72 }), numParam('polarAngle', 'Total angle (°)')],
+    }[activeTool];
+    const prompt = TOOL_PROMPTS[activeTool];
+    if (!fields && !prompt) return null;
+    return (
+      <View style={styles.optionsBox}>
+        {fields}
+        {!!prompt && <Text style={styles.promptText}>{prompt}</Text>}
+      </View>
+    );
+  };
+
+  const renderToolItem = (tool) => {
+    const isActive = activeTool === tool.id;
+    return (
+      <TouchableOpacity
+        key={tool.id}
+        style={[styles.toolItem, isActive && styles.toolItemActive]}
+        onPress={() => onSelectTool(tool.id)}
+      >
+        <Ionicons name={tool.ion} size={17} color={isActive ? "#2563EB" : "#334155"} />
+        <Text style={[styles.toolItemText, isActive && styles.toolItemTextActive]}>{tool.name}</Text>
+        {!!tool.shortcut && <Text style={styles.toolShortcut}>{tool.shortcut}</Text>}
+      </TouchableOpacity>
+    );
+  };
+
+  const renderAction = (label, ion, onPress) => (
+    <TouchableOpacity key={label} style={styles.toolItem} onPress={onPress}>
+      <Ionicons name={ion} size={17} color="#334155" />
+      <Text style={styles.toolItemText}>{label}</Text>
+    </TouchableOpacity>
+  );
 
   const handleAddRoomTemplate = (tmpl) => {
     const plotW = layout.plot?.width || 30;
@@ -85,13 +213,19 @@ export default function EditorLeftSidebar({
 
     switch (type) {
       case 'door':
-        newElem = createDoor({ x: cx, y: cy, ...params });
-        nextLayout.doors = [...(layout.doors || []), newElem];
+      case 'window': {
+        // Openings only exist on walls: use the wall nearest the middle of the plot.
+        const proto = type === 'door' ? createDoor(params) : createWindow(params);
+        const place = placeOpeningOnWall(layout, proto, { x: cx, y: cy }, { maxDist: Infinity });
+        if (!place) {
+          if (onNotice) onNotice(`No wall has enough free length for this ${type}.`);
+          return;
+        }
+        newElem = { ...proto, ...place };
+        const key = type === 'door' ? 'doors' : 'windows';
+        nextLayout[key] = [...(layout[key] || []), newElem];
         break;
-      case 'window':
-        newElem = createWindow({ x: cx, y: cy, ...params });
-        nextLayout.windows = [...(layout.windows || []), newElem];
-        break;
+      }
       case 'staircase':
         newElem = createStaircase({ x: cx, y: cy, ...params });
         nextLayout.staircases = [...(layout.staircases || []), newElem];
@@ -140,26 +274,22 @@ export default function EditorLeftSidebar({
       <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
         {tab === 'tools' ? (
           <View style={styles.toolsList}>
-            {TOOLS.map((tool) => {
-              const isActive = activeTool === tool.id;
-              return (
-                <TouchableOpacity
-                  key={tool.id}
-                  style={[styles.toolItem, isActive && styles.toolItemActive]}
-                  onPress={() => onSelectTool(tool.id)}
-                >
-                  <Ionicons
-                    name={tool.ion}
-                    size={17}
-                    color={isActive ? "#2563EB" : "#334155"}
-                  />
-                  <Text style={[styles.toolItemText, isActive && styles.toolItemTextActive]}>
-                    {tool.name}
-                  </Text>
-                  <Text style={styles.toolShortcut}>{tool.shortcut}</Text>
-                </TouchableOpacity>
-              );
-            })}
+            {renderToolOptions()}
+            <Text style={styles.sectionHeading}>DRAW</Text>
+            {TOOLS.map(renderToolItem)}
+            <Text style={[styles.sectionHeading, { marginTop: 12 }]}>MODIFY</Text>
+            {MODIFY_TOOLS.map(renderToolItem)}
+            {renderAction('Duplicate (Ctrl+D)', 'duplicate-outline', onDuplicate)}
+            {renderAction('Join Selected', 'link-outline', onJoin)}
+            {renderAction('Delete Selected (Del)', 'trash-bin-outline', onDeleteSelection)}
+            <Text style={[styles.sectionHeading, { marginTop: 12 }]}>RECTANGULAR ARRAY</Text>
+            <View style={styles.optionsBox}>
+              {numParam('rows', 'Rows', { integer: true, min: 1, max: 50 })}
+              {numParam('cols', 'Columns', { integer: true, min: 1, max: 50 })}
+              {lenParam('dx', 'Col. spacing')}
+              {lenParam('dy', 'Row spacing')}
+              {renderAction('Apply to Selection', 'grid-outline', onRectangularArray)}
+            </View>
           </View>
         ) : (
           <View style={styles.libraryContainer}>
@@ -308,6 +438,43 @@ const styles = StyleSheet.create({
   },
   toolsList: {
     gap: 4,
+    paddingBottom: 20,
+  },
+  optionsBox: {
+    padding: 8,
+    marginBottom: 6,
+    gap: 6,
+    borderRadius: 6,
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+  },
+  paramRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  paramLabel: {
+    width: 68,
+    fontSize: 10,
+    fontWeight: '600',
+    color: '#64748B',
+  },
+  paramInput: {
+    width: 92,
+    height: 26,
+    paddingHorizontal: 6,
+    fontSize: 11,
+    color: '#1E293B',
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#CBD5E1',
+    borderRadius: 4,
+  },
+  promptText: {
+    fontSize: 10,
+    lineHeight: 14,
+    color: '#475569',
   },
   toolItem: {
     flexDirection: 'row',

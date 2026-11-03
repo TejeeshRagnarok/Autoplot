@@ -16,6 +16,9 @@
  *    Total treads T = R - F.
  *  - There are F - 1 landings. A landing is never counted as a tread.
  *  - Run of a flight = treads in that flight x treadDepth.
+ *  - `firstFlightRisers` (optional) overrides the even split of a two-flight
+ *    stair. The number of flights comes from the type: more than two flights
+ *    is not modelled.
  *
  * ---------------------------------------------------------------------------
  * FOOTPRINT CONVENTION
@@ -83,11 +86,15 @@ export function getFlightCount(stairType) {
 }
 
 /** Risers and treads per flight, following the counting convention above. */
-export function getFlightBreakdown(stairType, risers) {
+export function getFlightBreakdown(stairType, risers, firstFlightRisers) {
   const F = getFlightCount(stairType);
   const R = Math.max(F + 1, Math.round(risers));
   if (F === 1) return [{ risers: R, treads: R - 1 }];
-  const r1 = Math.ceil(R / 2);
+  // An explicit split wins while both flights keep at least one tread.
+  const wanted = Math.round(Number(firstFlightRisers));
+  const r1 = Number.isFinite(wanted) && wanted >= STAIR_LIMITS.minRisers && R - wanted >= STAIR_LIMITS.minRisers
+    ? wanted
+    : Math.ceil(R / 2);
   const r2 = R - r1;
   return [
     { risers: r1, treads: r1 - 1 },
@@ -113,11 +120,21 @@ export function normalizeStaircase(stair, changed = null) {
   s.floorHeight = clamp(num(s.floorHeight, def.floorHeight), STAIR_LIMITS.minFloorHeight, STAIR_LIMITS.maxFloorHeight);
   // Two-flight stairs need at least 2 risers per flight so each flight has a tread.
   const minRisers = getFlightCount(stairType) === 1 ? STAIR_LIMITS.minRisers : 2 * STAIR_LIMITS.minRisers;
+  // The derived step values are edits of the riser count: riser height = floor height / risers.
+  if (changed === 'riserHeight' && Number(s.riserHeight) > 0) {
+    s.risers = Math.round(s.floorHeight / Number(s.riserHeight));
+  } else if (changed === 'treads' && Number(s.treads) > 0) {
+    s.risers = Math.round(Number(s.treads)) + getFlightCount(stairType);
+    delete s.firstFlightRisers;
+  } else if (changed === 'risers') {
+    delete s.firstFlightRisers;
+  }
   s.risers = clamp(Math.round(num(s.risers, def.risers)), minRisers, STAIR_LIMITS.maxRisers);
   s.wellGap = Math.max(0, num(s.wellGap, def.wellGap));
   s.direction = s.direction === 'down' ? 'down' : 'up';
+  if (getFlightCount(stairType) === 1) delete s.firstFlightRisers;
 
-  const breakdown = getFlightBreakdown(stairType, s.risers);
+  const breakdown = getFlightBreakdown(stairType, s.risers, s.firstFlightRisers);
   const maxT = Math.max(1, ...breakdown.map((f) => f.treads));
   const tdLimits = [STAIR_LIMITS.minTreadDepth, STAIR_LIMITS.maxTreadDepth];
 
@@ -197,6 +214,8 @@ export function createStaircase(params = {}) {
     wellGap: params.wellGap !== undefined ? params.wellGap : def.wellGap,
     flightWidth: params.flightWidth,
     direction: params.direction || 'up',
+    mirrored: !!params.mirrored,
+    firstFlightRisers: params.firstFlightRisers,
     // Constraint configuration (see constraintEngine.js)
     anchor: params.anchor || 'none',
     constraintType: params.constraintType || 'fixed',
@@ -266,8 +285,9 @@ export function calculateStaircaseGeometry(input) {
   const bounds = getStaircaseBounds(stair);
   const { x, y } = bounds;
 
-  // local (u across, v along) -> world
-  const P = (u, v) => {
+  // local (u across, v along) -> world. A mirrored stair flips across its width.
+  const P = (uIn, v) => {
+    const u = stair.mirrored ? W - uIn : uIn;
     if (rot === 90) return { x: round4(x + (L - v)), y: round4(y + u) };
     if (rot === 180) return { x: round4(x + W - u), y: round4(y + L - v) };
     if (rot === 270) return { x: round4(x + v), y: round4(y + W - u) };
@@ -280,7 +300,7 @@ export function calculateStaircaseGeometry(input) {
     return { x1: a.x, y1: a.y, x2: b.x, y2: b.y };
   };
 
-  const breakdown = getFlightBreakdown(stairType, stair.risers);
+  const breakdown = getFlightBreakdown(stairType, stair.risers, stair.firstFlightRisers);
   const flights = [];
   const landings = [];
   const dividers = [];

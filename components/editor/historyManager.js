@@ -42,7 +42,8 @@ export class HistoryManager {
    * Called on each pointer drag move: updates current without pushing history
    */
   updateDuringDrag(newLayout) {
-    this.current = cloneLayout(newLayout);
+    // Layouts are treated as immutable, so the preview needs no deep copy per move.
+    this.current = newLayout;
   }
 
   /**
@@ -82,11 +83,11 @@ export class HistoryManager {
    * Push an explicit mutation (e.g. add/delete element, property input change)
    */
   pushState(newLayout) {
-    if (this.isDragging) {
-      this.isDragging = false;
-      this.dragSnapshot = null;
-    }
-    this.undoStack.push(cloneLayout(this.current));
+    // An edit committed mid-drag still undoes back to before the drag started.
+    const base = this.isDragging && this.dragSnapshot ? this.dragSnapshot : cloneLayout(this.current);
+    this.isDragging = false;
+    this.dragSnapshot = null;
+    this.undoStack.push(base);
     if (this.undoStack.length > this.maxHistory) {
       this.undoStack.shift();
     }
@@ -104,7 +105,8 @@ export class HistoryManager {
   }
 
   undo() {
-    if (!this.canUndo()) return this.current;
+    // A drag in progress owns the layout: it must finish or cancel first.
+    if (this.isDragging || !this.canUndo()) return cloneLayout(this.current);
     const previous = this.undoStack.pop();
     this.redoStack.push(cloneLayout(this.current));
     this.current = previous;
@@ -112,7 +114,7 @@ export class HistoryManager {
   }
 
   redo() {
-    if (!this.canRedo()) return this.current;
+    if (this.isDragging || !this.canRedo()) return cloneLayout(this.current);
     const next = this.redoStack.pop();
     this.undoStack.push(cloneLayout(this.current));
     this.current = next;

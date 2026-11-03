@@ -89,6 +89,7 @@ function buildEnvelope(layout, ignoreWallIds) {
   segs.push({ x1: 0, y1: 0, x2: W, y2: 0 }, { x1: W, y1: 0, x2: W, y2: L }, { x1: 0, y1: L, x2: W, y2: L }, { x1: 0, y1: 0, x2: 0, y2: L });
   const ext = (layout.walls || []).filter((w) => w.type === 'exterior');
   for (const w of ext) if (!ignoreWallIds.has(w.id)) segs.push(w);
+  for (const w of layout.walls || []) if (w.isLocked && w.type !== 'exterior') segs.push(w);
   if (ext.length === 0 && (layout.rooms || []).length > 0) {
     const rs = layout.rooms;
     const x0 = Math.min(...rs.map((r) => r.x));
@@ -486,12 +487,25 @@ export function resizeRoom(layout, roomId, targets = {}) {
   return { layout: cur, room: (cur.rooms || []).find((r) => r.id === roomId), conflicts, clamped };
 }
 
-/** Set a room's width or length numerically, keeping its west / north edge. */
+/**
+ * Set a room's width or length numerically. The west / north edge stays fixed
+ * while the east / south edge can move; when that edge is blocked (on an exterior
+ * wall, say), the opposite edge takes up whatever is left of the change.
+ */
 export function setRoomDimension(layout, roomId, field, value) {
   const room = (layout.rooms || []).find((r) => r.id === roomId);
   if (!room) return { layout, room: null, conflicts: ['Room not found.'], clamped: true };
-  if (field === 'width') return resizeRoom(layout, roomId, { right: room.x + Number(value) });
-  return resizeRoom(layout, roomId, { bottom: room.y + Number(value) });
+  const target = Number(value);
+  const isWidth = field === 'width';
+  const first = resizeRoom(layout, roomId, isWidth ? { right: room.x + target } : { bottom: room.y + target });
+  const got = isWidth ? first.room.width : first.room.length;
+  if (!first.clamped || Math.abs(got - target) < 1e-4) return first;
+  const second = resizeRoom(first.layout, roomId, isWidth
+    ? { left: first.room.x + first.room.width - target }
+    : { top: first.room.y + first.room.length - target });
+  const finalSize = isWidth ? second.room.width : second.room.length;
+  if (Math.abs(finalSize - target) >= Math.abs(got - target)) return first;
+  return { ...second, conflicts: Math.abs(finalSize - target) < 1e-4 ? [] : (second.conflicts.length ? second.conflicts : first.conflicts) };
 }
 
 /**
@@ -537,6 +551,16 @@ export function moveRoom(layout, roomId, dx, dy) {
   const room = next.rooms.find((r) => r.id === roomId);
   if (!room || room.isLocked) return { layout, room };
   const old = { ...room };
+  // The site boundary is a hard limit for a move (a room already outside it may come back in).
+  const W = Number(next.plot?.width) || Infinity;
+  const L = Number(next.plot?.length) || Infinity;
+  const clampMove = (pos, size, limit, d) => {
+    const lo = Math.min(0, pos);
+    const hi = Math.max(limit - size, pos);
+    return Math.max(lo, Math.min(hi, pos + d)) - pos;
+  };
+  dx = clampMove(old.x, old.width, W, dx);
+  dy = clampMove(old.y, old.length, L, dy);
   const onEdge = (r, w) => {
     const h = Math.abs(w.y1 - w.y2) < TOL;
     const v = Math.abs(w.x1 - w.x2) < TOL;
@@ -560,6 +584,15 @@ export function moveRoom(layout, roomId, dx, dy) {
     (next[key] || []).forEach((o, i) => {
       if (exclusive.has(hosts[key][i]?.wallId)) { o.x = round4(o.x + dx); o.y = round4(o.y + dy); }
     });
+  }
+  // A staircase standing inside the room travels with it.
+  for (const s of next.staircases || []) {
+    if (s.isLocked) continue;
+    const b = getStaircaseBounds(s);
+    if (b.x >= old.x - TOL && b.y >= old.y - TOL && b.x + b.width <= old.x + old.width + TOL && b.y + b.length <= old.y + old.length + TOL) {
+      s.x = round4(s.x + dx);
+      s.y = round4(s.y + dy);
+    }
   }
   fillRoomEdgeWalls(next, [roomId]);
   return { layout: next, room };

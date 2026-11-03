@@ -532,6 +532,19 @@ function applyAxis(next, axis, solved) {
     if (isX) { d.x1 = m(d.x1); d.x2 = m(d.x2); } else { d.y1 = m(d.y1); d.y2 = m(d.y2); }
   }
 
+  // CAD entities follow the same map, so they stay registered to the building.
+  for (const e of next.cadEntities || []) {
+    if (e.kind === 'line') {
+      if (isX) { e.x1 = m(e.x1); e.x2 = m(e.x2); } else { e.y1 = m(e.y1); e.y2 = m(e.y2); }
+    } else if (e.points) {
+      for (const p of e.points) p[pos] = m(p[pos]);
+    } else if (isX) {
+      e.cx = m(e.cx);
+    } else {
+      e.cy = m(e.cy);
+    }
+  }
+
   const P1 = isX ? next.plot.width : next.plot.length;
   const b = solved.building;
 

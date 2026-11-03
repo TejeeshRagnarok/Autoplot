@@ -4,7 +4,7 @@
  * with Undo/Redo, Autosave, Keyboard Shortcuts, Validation, and Exporting.
  */
 
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useDeferredValue } from 'react';
 import { View, StyleSheet, Modal, Text, TouchableOpacity, Platform } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import EditorToolbar from './EditorToolbar';
@@ -18,6 +18,8 @@ import { saveProject, exportProjectJSON, SAVE_STATUS } from './projectStorage';
 import { exportAsPNG, exportAsSVG, printLayoutPlan } from './exportUtils';
 import { cloneLayout, applySiteChange, getPlotDimensionMeta } from './layoutModel';
 import { UNIT_TYPES } from './units';
+import { COLLECTIONS, copySelection, copyToClipboard, deleteSelection, insertCopies, joinSelection, makeTranslate, rectangularArray } from './cadCommands';
+import { selectionFromItems, selectionItems } from './selectionModel';
 
 export default function LayoutEditor({
   initialLayout,
@@ -39,6 +41,20 @@ export default function LayoutEditor({
   const [allowDiagonal, setAllowDiagonal] = useState(false);
   const [snapTolerance, setSnapTolerance] = useState(0.75);
   const [pendingResize, setPendingResize] = useState(null); // { change, result } - a site change with conflicts awaiting a decision
+  const [toolParams, setToolParams] = useState({
+    angle: 90, factor: 2, offset: 1, radius: 0, chamferA: 1, chamferB: 1, sides: 6,
+    count: 4, polarAngle: 360, rows: 2, cols: 2, dx: 12, dy: 12, gap: 0, text: 'Text',
+  });
+  const [notice, setNotice] = useState(null);
+  const noticeTimer = useRef(null);
+  const clipboardRef = useRef(null);
+  const pasteCount = useRef(0);
+
+  const showNotice = (text) => {
+    setNotice(text);
+    if (noticeTimer.current) clearTimeout(noticeTimer.current);
+    noticeTimer.current = setTimeout(() => setNotice(null), 4500);
+  };
 
   // Modals state
   const [exportModalVisible, setExportModalVisible] = useState(false);
@@ -50,35 +66,26 @@ export default function LayoutEditor({
   const history = historyRef.current;
 
   // Validation issues calculated in real-time
+  const deferredLayout = useDeferredValue(layout);
   const validationIssues = useMemo(() => {
-    return validateLayout(layout);
-  }, [layout]);
+    return validateLayout(deferredLayout);
+  }, [deferredLayout]);
 
   // Keep selected element synchronized with updated layout data
   useEffect(() => {
     if (selectedElement) {
       const { type, data } = selectedElement;
+      if (type === 'multi') {
+        setSelectedElement(selectionFromItems(layout, data.items));
+        return;
+      }
       let freshData = null;
-      if (type === 'room') {
-        freshData = layout.rooms?.find(r => r.id === data.id);
-      } else if (type === 'wall') {
-        freshData = layout.walls?.find(w => w.id === data.id);
-      } else if (type === 'door') {
-        freshData = layout.doors?.find(d => d.id === data.id);
-      } else if (type === 'window') {
-        freshData = layout.windows?.find(w => w.id === data.id);
-      } else if (type === 'column') {
-        freshData = layout.columns?.find(c => c.id === data.id);
-      } else if (type === 'staircase') {
-        freshData = layout.staircases?.find(s => s.id === data.id);
-      } else if (type === 'utility') {
-        freshData = layout.utilities?.find(u => u.id === data.id);
-      } else if (type === 'parking') {
-        freshData = layout.parking?.find(p => p.id === data.id);
-      } else if (type === 'plot') {
+      if (type === 'plot') {
         freshData = layout.plot;
-      } else if (type === 'dimension') {
+      } else if (type === 'dimension' && data.axis) {
         freshData = getPlotDimensionMeta(layout, data.axis);
+      } else if (COLLECTIONS[type]) {
+        freshData = (layout[COLLECTIONS[type]] || []).find((e) => e.id === data.id);
       }
 
       if (freshData) {
@@ -132,36 +139,49 @@ export default function LayoutEditor({
       // If active in a text input, don't trigger tool or delete shortcuts
       if (isInput) return;
 
+      const noModifier = !e.ctrlKey && !e.metaKey && !e.altKey;
+
+      // Clipboard & selection commands
+      if (e.ctrlKey || e.metaKey) {
+        const key = e.key.toLowerCase();
+        const items = selectionItems(selectedElement);
+        if (key === 'c' || key === 'x') {
+          if (!items.length) return;
+          e.preventDefault();
+          clipboardRef.current = copyToClipboard(layout, items);
+          pasteCount.current = 0;
+          if (key === 'x') commitDelete(items);
+          return;
+        }
+        if (key === 'v') {
+          if (!clipboardRef.current?.length) return;
+          e.preventDefault();
+          pasteCount.current += 1;
+          const d = 2 * pasteCount.current;
+          commitCommand(insertCopies(layout, clipboardRef.current, makeTranslate(d, d)));
+          return;
+        }
+        if (key === 'd') {
+          e.preventDefault();
+          handleDuplicateSelection();
+          return;
+        }
+        if (key === 'a') {
+          e.preventDefault();
+          const all = [];
+          Object.entries(COLLECTIONS).forEach(([type, list]) => {
+            (layout[list] || []).forEach((el) => { if (!(type === 'dimension' && el.axis)) all.push({ type, id: el.id }); });
+          });
+          setSelectedElement(selectionFromItems(layout, all));
+          return;
+        }
+        return;
+      }
+
       // Delete selected element
       if (e.key === 'Delete' || e.key === 'Backspace') {
         e.preventDefault();
-        if (selectedElement) {
-          const { type, data } = selectedElement;
-          // Plot dimension annotations are linked to the plot boundary and cannot be deleted
-          if (type === 'dimension') return;
-          const nextLayout = { ...layout };
-          if (type === 'room') {
-            if (layout.rooms?.length <= 1) return;
-            nextLayout.rooms = layout.rooms.filter(r => r.id !== data.id);
-          } else if (type === 'wall') {
-            nextLayout.walls = layout.walls.filter(w => w.id !== data.id);
-          } else if (type === 'door') {
-            nextLayout.doors = layout.doors.filter(d => d.id !== data.id);
-          } else if (type === 'window') {
-            nextLayout.windows = layout.windows.filter(w => w.id !== data.id);
-          } else if (type === 'column') {
-            nextLayout.columns = layout.columns.filter(c => c.id !== data.id);
-          } else if (type === 'staircase') {
-            nextLayout.staircases = layout.staircases.filter(s => s.id !== data.id);
-          } else if (type === 'utility') {
-            nextLayout.utilities = layout.utilities.filter(u => u.id !== data.id);
-          } else if (type === 'parking') {
-            nextLayout.parking = layout.parking.filter(p => p.id !== data.id);
-          }
-          history.pushState(nextLayout);
-          setLayout(nextLayout);
-          setSelectedElement(null);
-        }
+        commitDelete(selectionItems(selectedElement));
         return;
       }
 
@@ -173,6 +193,7 @@ export default function LayoutEditor({
       }
 
       // Tool shortcuts
+      if (!noModifier) return;
       const key = e.key.toLowerCase();
       if (key === 'v') setActiveTool('select');
       else if (key === 'h') setActiveTool('pan');
@@ -183,11 +204,63 @@ export default function LayoutEditor({
       else if (key === 's') setActiveTool('staircase');
       else if (key === 'c') setActiveTool('column');
       else if (key === 'm') setActiveTool('measure');
+      else if (key === 'l') setActiveTool('line');
+      else if (key === 'p') setActiveTool('polyline');
+      else if (key === 't') setActiveTool('text');
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [layout, selectedElement, history]);
+
+  // Commit a command result as one undo step and select what it created.
+  const commitCommand = (res, { keepSelection = false } = {}) => {
+    if (res.reason) showNotice(res.reason);
+    else if (res.skipped?.length) showNotice(res.skipped[0]);
+    if (res.layout === layout) return;
+    history.pushState(res.layout);
+    setLayout(res.layout);
+    if (!keepSelection && res.created?.length) setSelectedElement(selectionFromItems(res.layout, res.created));
+  };
+
+  const commitDelete = (items) => {
+    if (!items.length) return;
+    const res = deleteSelection(layout, items);
+    if (res.skipped.length) showNotice(res.skipped[0]);
+    if (!res.removed) return;
+    history.pushState(res.layout);
+    setLayout(res.layout);
+    setSelectedElement(null);
+  };
+
+  const requireSelection = () => {
+    const items = selectionItems(selectedElement);
+    if (!items.length) showNotice('Select the objects first.');
+    return items;
+  };
+
+  const handleDuplicateSelection = () => {
+    const items = requireSelection();
+    if (items.length) commitCommand(copySelection(layout, items, 2, 2));
+  };
+
+  const handleJoinSelection = () => {
+    const items = requireSelection();
+    if (items.length < 2) {
+      if (items.length) showNotice('Select at least two objects to join.');
+      return;
+    }
+    commitCommand(joinSelection(layout, items), { keepSelection: true });
+  };
+
+  const handleRectangularArray = () => {
+    const items = requireSelection();
+    if (items.length) {
+      commitCommand(rectangularArray(layout, items, {
+        rows: toolParams.rows, cols: toolParams.cols, dx: toolParams.dx, dy: toolParams.dy,
+      }), { keepSelection: true });
+    }
+  };
 
   // Explicit Save Action
   const handleManualSave = async () => {
@@ -319,6 +392,14 @@ export default function LayoutEditor({
           onUpdateLayout={setLayout}
           onSelectElement={setSelectedElement}
           historyManager={history}
+          toolParams={toolParams}
+          onChangeToolParams={setToolParams}
+          unit={unit}
+          onDuplicate={handleDuplicateSelection}
+          onJoin={handleJoinSelection}
+          onRectangularArray={handleRectangularArray}
+          onDeleteSelection={() => commitDelete(requireSelection())}
+          onNotice={showNotice}
         />
 
         {/* Center Interactive CAD Canvas */}
@@ -340,6 +421,9 @@ export default function LayoutEditor({
           snapTolerance={snapTolerance}
           onRequestPlotResize={requestPlotResize}
           onRequestSiteChange={requestSiteChange}
+          toolParams={toolParams}
+          notice={notice}
+          onNotice={showNotice}
         />
 
         {/* Right Properties Panel (Inspector) */}
@@ -353,6 +437,7 @@ export default function LayoutEditor({
           historyManager={history}
           onRequestPlotResize={requestPlotResize}
           onRequestSiteChange={requestSiteChange}
+          onNotice={showNotice}
         />
       </View>
 
