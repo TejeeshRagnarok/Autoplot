@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createColumn, createWall, resizePlotBoundary, setPlotWallThickness } from '../components/editor/layoutModel.js';
-import { fileBaseName, generateLayoutSVG, getRasterScale, getSvgSheetSize, PLAN_VIEW } from '../components/editor/exportUtils.js';
+import { createColumn, createWall, getPlotRect, getRoadBands, resizePlotBoundary, setPlotWallThickness } from '../components/editor/layoutModel.js';
+import { EDITOR_VIEW, fileBaseName, generateLayoutSVG, getRasterScale, getSvgSheetSize, PLAN_VIEW } from '../components/editor/exportUtils.js';
+import { syncLayoutToState } from '../components/editor/layoutBridge.js';
 import { furnitureSvg } from '../components/editor/furnitureSvg.js';
 import { buildJpegPdf } from '../components/editor/pdfWriter.js';
 import { buildFixture } from './fixtures.mjs';
@@ -154,6 +155,61 @@ test('the road follows the road direction, and a south road clears the title blo
   const svg = generateLayoutSVG(layout, 'ft', PLAN_VIEW);
   const y = Number(svg.match(/translate\(100, (-?[\d.]+)\)">\s*<rect x="0" y="0"/)[1]);
   assert.ok(y >= 100 + 40 * 20 + 6 + 24, `title block at ${y} is below the road`);
+});
+
+test('the editor view draws the road and leaves out the 2D Plan extras', () => {
+  const layout = buildFixture();
+  layout.plot.roadDirection = 'North Road';
+  const svg = generateLayoutSVG(layout, 'ft', EDITOR_VIEW);
+  assert.ok(svg.includes('data-road="North"'));
+  assert.ok(!svg.includes('data-furniture'));
+  assert.ok(!svg.includes('data-layer="main-gate"'));
+  assert.ok(!generateLayoutSVG(layout, 'ft').includes('data-road'), 'no road unless asked for');
+});
+
+test('road markers sit outside the plot, beyond the dimension line, on every side', () => {
+  const layout = buildFixture();
+  const rect = getPlotRect(layout);
+  const band = (direction) => {
+    layout.plot.roadDirection = direction;
+    return getRoadBands(layout);
+  };
+  const [north] = band('North Road');
+  assert.equal(north.width, rect.width);
+  assert.ok(north.y + north.length < rect.y0 - 2);
+  const [south] = band('South Road');
+  assert.ok(south.y > rect.y1);
+  const [east] = band('East Road');
+  assert.ok(east.x > rect.x1);
+  assert.equal(east.length, rect.length);
+  const [west] = band('West Road');
+  assert.ok(west.x + west.width < rect.x0 - 2);
+  assert.deepEqual(band('Corner E+N').map((b) => b.side), ['North', 'East']);
+  assert.deepEqual(band('Corner W + S').map((b) => b.side), ['South', 'West']);
+  assert.deepEqual(band(''), []);
+});
+
+test('the road follows a resized plot and a moved dimension line', () => {
+  const layout = buildFixture();
+  layout.plot.roadDirection = 'North Road';
+  const moved = resizePlotBoundary(layout, { width: 36, length: 46, edge: 'corner-nw' }).nextLayout;
+  const [band] = getRoadBands(moved);
+  assert.equal(band.x, -6);
+  assert.equal(band.width, 36);
+  assert.ok(band.y + band.length < -6);
+
+  const before = getRoadBands(layout)[0].y;
+  layout.dimensions = layout.dimensions.map((d) => (d.id === 'dim-plot-width' ? { ...d, offset: d.offset + 3 } : d));
+  assert.equal(getRoadBands(layout)[0].y, before - 3);
+});
+
+test('a road edited in the editor reaches the inputs the report reads', () => {
+  const layout = buildFixture();
+  layout.plot.roadDirection = 'East Road';
+  layout.plot.facing = 'East';
+  const next = syncLayoutToState(layout, { roadDirection: 'North Road', siteFacing: 'North', customRooms: [] });
+  assert.equal(next.roadDirection, 'East Road');
+  assert.equal(next.siteFacing, 'East');
 });
 
 test('furniture comes from the room name, and small rooms get none', () => {

@@ -28,6 +28,7 @@ import {
   getPlotRect,
   getPlotWallData,
   getPlotWallPolygons,
+  getRoadBands,
   calculateStaircaseGeometry,
   getStaircaseBounds,
   resizeStaircaseWorld,
@@ -332,18 +333,23 @@ export default function EditorCanvas({
     if (!containerRef.current || !layout) return;
     const rect = containerRef.current.getBoundingClientRect();
     const site = getPlotRect(layout);
-    const plotW = site.width;
-    const plotL = site.length;
 
     const availableW = Math.max(200, rect.width - 160);
     const availableH = Math.max(200, rect.height - 160);
 
-    const scaleX = availableW / plotW;
-    const scaleY = availableH / plotL;
+    // Fit the road too, so it isn't left under the rulers.
+    const bands = getRoadBands(layout);
+    const fitX0 = Math.min(site.x0, ...bands.map((b) => b.x));
+    const fitY0 = Math.min(site.y0, ...bands.map((b) => b.y));
+    const fitX1 = Math.max(site.x1, ...bands.map((b) => b.x + b.width));
+    const fitY1 = Math.max(site.y1, ...bands.map((b) => b.y + b.length));
+
+    const scaleX = availableW / (fitX1 - fitX0);
+    const scaleY = availableH / (fitY1 - fitY0);
     const newScale = Math.max(8, Math.min(scaleX, scaleY, 28));
 
-    const newPanX = (rect.width - plotW * newScale) / 2 - site.x0 * newScale;
-    const newPanY = (rect.height - plotL * newScale) / 2 - site.y0 * newScale;
+    const newPanX = (rect.width - (fitX1 - fitX0) * newScale) / 2 - fitX0 * newScale;
+    const newPanY = (rect.height - (fitY1 - fitY0) * newScale) / 2 - fitY0 * newScale;
 
     setViewport({
       scale: newScale,
@@ -1811,6 +1817,32 @@ export default function EditorCanvas({
             })}
           </g>
         )}
+
+        {/* Road marker(s), from the plot's road-facing side */}
+        {getRoadBands(layout).map((band) => {
+          const q = worldToScreen(band.x, band.y);
+          const w = band.width * viewport.scale;
+          const h = band.length * viewport.scale;
+          const cx = q.x + w / 2;
+          const cy = q.y + h / 2;
+          return (
+            <g key={`road-${band.side}`} data-road={band.side}>
+              <rect x={q.x} y={q.y} width={w} height={h} fill="#E2E8F0" stroke="#94A3B8" strokeWidth="1" />
+              <text
+                x={cx}
+                y={cy + 3}
+                transform={h > w ? `rotate(90 ${cx} ${cy})` : undefined}
+                fontSize="9"
+                fontWeight="bold"
+                fill="#475569"
+                textAnchor="middle"
+                fontFamily="Arial, sans-serif"
+              >
+                {band.side.toUpperCase()} ROADWAY
+              </text>
+            </g>
+          );
+        })}
 
         {/* Plot Boundary Outline (Amber dashed) */}
         <rect

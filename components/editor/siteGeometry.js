@@ -24,6 +24,33 @@ export function getPlotRect(layout, fallback = DEFAULT_SIZE) {
   return { x0, y0, x1: x0 + width, y1: y0 + length, width, length };
 }
 
+const ROAD_DEPTH = 1.2; // ft as drawn: a marker for where the road is, not its real width
+
+/**
+ * Where the road marker(s) are drawn, in world coordinates, from the plot's
+ * road direction. Each sits outside the plot, beyond the dimension line on that
+ * side. Purely a site marker: it never affects the plot or the building.
+ * @returns {{side:string, x:number, y:number, width:number, length:number}[]}
+ */
+export function getRoadBands(layout) {
+  const road = String(layout?.plot?.roadDirection || '');
+  let sides = ['North', 'South', 'East', 'West'].filter((s) => road.includes(s));
+  if (/Corner E ?\+ ?N/.test(road)) sides = ['North', 'East'];
+  else if (/Corner W ?\+ ?S/.test(road)) sides = ['South', 'West'];
+
+  const { x0, y0, x1, y1, width, length } = getPlotRect(layout);
+  const offsetOf = (id) => Math.abs(Number((layout?.dimensions || []).find((d) => d.id === id)?.offset)) || 2.5;
+  const place = {
+    North: () => ({ x: x0, y: y0 - offsetOf('dim-plot-width') - 0.7 - ROAD_DEPTH, width, length: ROAD_DEPTH }),
+    South: () => ({ x: x0, y: y1 + 0.3, width, length: ROAD_DEPTH }),
+    // Beyond the length dimension's label, which is wider than the width label is tall.
+    West: () => ({ x: x0 - offsetOf('dim-plot-length') - 1.9 - ROAD_DEPTH, y: y0, width: ROAD_DEPTH, length }),
+    // Beyond the north arrow on drawings.
+    East: () => ({ x: x1 + 3.6, y: y0, width: ROAD_DEPTH, length }),
+  };
+  return sides.map((side) => ({ side, ...place[side]() }));
+}
+
 // ---------------------------------------------------------------------------
 // Plot boundary walls
 //

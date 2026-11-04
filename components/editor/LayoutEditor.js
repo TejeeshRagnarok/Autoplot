@@ -15,7 +15,7 @@ import EditorStatusBar from './EditorStatusBar';
 import { HistoryManager } from './historyManager';
 import { validateLayout } from './layoutValidation';
 import { saveProject, exportProjectJSON, SAVE_STATUS } from './projectStorage';
-import { exportAsPDF, exportAsPNG, exportAsSVG, printLayoutPlan } from './exportUtils';
+import { EDITOR_VIEW, exportAsPDF, exportAsPNG, exportAsSVG, printLayoutPlan } from './exportUtils';
 import { cloneLayout, applySiteChange, getPlotDimensionMeta, getPlotWallData, resizePlotBoundary, describeOutsidePlot, DEFAULT_WALL_THICKNESS_IN } from './layoutModel';
 import { UNIT_TYPES } from './units';
 import { COLLECTIONS, copySelection, copyToClipboard, deleteSelection, insertCopies, joinSelection, makeTranslate, rectangularArray } from './cadCommands';
@@ -493,7 +493,7 @@ export default function LayoutEditor({
                 style={styles.exportItem}
                 onPress={async () => {
                   setExportModalVisible(false);
-                  const ok = await exportAsPDF(layout, unit);
+                  const ok = await exportAsPDF(layout, unit, EDITOR_VIEW);
                   if (!ok) showNotice('The PDF could not be created. Please try again.');
                 }}
               >
@@ -510,7 +510,7 @@ export default function LayoutEditor({
               <TouchableOpacity
                 style={styles.exportItem}
                 onPress={() => {
-                  exportAsPNG(layout, unit);
+                  exportAsPNG(layout, unit, EDITOR_VIEW);
                   setExportModalVisible(false);
                 }}
               >
@@ -527,7 +527,7 @@ export default function LayoutEditor({
               <TouchableOpacity
                 style={styles.exportItem}
                 onPress={() => {
-                  exportAsSVG(layout, unit);
+                  exportAsSVG(layout, unit, EDITOR_VIEW);
                   setExportModalVisible(false);
                 }}
               >
@@ -544,7 +544,7 @@ export default function LayoutEditor({
               <TouchableOpacity
                 style={styles.exportItem}
                 onPress={() => {
-                  printLayoutPlan(layout, unit);
+                  printLayoutPlan(layout, unit, EDITOR_VIEW);
                   setExportModalVisible(false);
                 }}
               >

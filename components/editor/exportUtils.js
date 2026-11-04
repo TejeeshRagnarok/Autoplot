@@ -12,7 +12,7 @@ import { getOpeningGeometry, getWallShape } from './wallOps.js';
 import { arcSweep, pointAtAngle } from './cadGeometry.js';
 import { dimensionLine } from './selectionModel.js';
 import { isPlotDimension } from './cadCommands.js';
-import { getPlotRect, getPlotWallPolygons } from './siteGeometry.js';
+import { getPlotRect, getPlotWallPolygons, getRoadBands } from './siteGeometry.js';
 import { getStaircaseBounds } from './staircaseGeometry.js';
 import { entityBounds } from './cadGeometry.js';
 import { getPlotDimensionMeta } from './layoutModel.js';
@@ -20,7 +20,10 @@ import { buildJpegPdf } from './pdfWriter.js';
 import { furnitureSvg } from './furnitureSvg.js';
 
 /** Layers of the 2D Plan drawing. Pass with any grid, label, or path toggles applied. */
-export const PLAN_VIEW = { showGrid: true, showLabels: true, showFurniture: true, showCirculation: false, showSite: true };
+export const PLAN_VIEW = { showGrid: true, showLabels: true, showFurniture: true, showCirculation: false, showSite: true, showRoad: true };
+
+/** Layers of the Edit Layout drawing, so its exports match the editor. */
+export const EDITOR_VIEW = { showRoad: true };
 
 const xmlText = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
@@ -91,7 +94,7 @@ function getDrawingBounds(layout) {
  */
 export function generateLayoutSVG(layout, unit = 'ft-in', view = {}) {
   if (!layout) return '';
-  const { showGrid = true, showLabels = true, showFurniture = false, showCirculation = false, showSite = false } = view;
+  const { showGrid = true, showLabels = true, showFurniture = false, showCirculation = false, showSite = false, showRoad = false } = view;
 
   const site = getPlotRect(layout);
   const plotW = site.width;
@@ -347,24 +350,19 @@ export function generateLayoutSVG(layout, unit = 'ft-in', view = {}) {
     }
   }
 
-  const road = String(layout.plot?.roadDirection || '');
-  const isCornerEN = /Corner E ?\+ ?N/.test(road);
-  const isCornerWS = /Corner W ?\+ ?S/.test(road);
-  const roadOn = (side) => showSite && (isCornerEN ? ['North', 'East'] : isCornerWS ? ['South', 'West'] : road.includes(side) ? [side] : []).includes(side);
-  const SOUTH_ROAD_SPACE = 34;
-  if (showSite) {
-    const band = (x, y, w, h, side) => {
-      const vertical = h > w;
-      const cx = x + w / 2;
-      const cy = y + h / 2;
-      return `<g data-layer="road" data-road="${side}"><rect x="${x}" y="${y}" width="${w}" height="${h}" fill="#E2E8F0" stroke="#94A3B8" stroke-width="1"/>
-        <text x="${cx}" y="${cy + 3}" transform="${vertical ? `rotate(90 ${cx} ${cy})` : ''}" font-family="Arial, sans-serif" font-size="9" font-weight="bold" fill="#475569" text-anchor="middle">${side.toUpperCase()} ROADWAY</text></g>`;
-    };
-    if (roadOn('North')) elementsSvg += band(plotLeft, plotTop - 88, plotW * scale, 24, 'North');
-    if (roadOn('South')) elementsSvg += band(plotLeft, plotBottom + 6, plotW * scale, 24, 'South');
-    if (roadOn('West')) elementsSvg += band(plotLeft - 88, plotTop, 24, plotL * scale, 'West');
-    if (roadOn('East')) elementsSvg += band(plotRight + 72, plotTop, 24, plotL * scale, 'East');
+  const roads = showRoad ? getRoadBands(layout) : [];
+  roads.forEach((r) => {
+    const x = SX(r.x);
+    const y = SY(r.y);
+    const w = r.width * scale;
+    const h = r.length * scale;
+    const cx = x + w / 2;
+    const cy = y + h / 2;
+    elementsSvg += `<g data-layer="road" data-road="${r.side}"><rect x="${x}" y="${y}" width="${w}" height="${h}" fill="#E2E8F0" stroke="#94A3B8" stroke-width="1"/>
+        <text x="${cx}" y="${cy + 3}" transform="${h > w ? `rotate(90 ${cx} ${cy})` : ''}" font-family="Arial, sans-serif" font-size="9" font-weight="bold" fill="#475569" text-anchor="middle">${r.side.toUpperCase()} ROADWAY</text></g>`;
+  });
 
+  if (showSite) {
     if (mainDoor) {
       const g = getOpeningGeometry(mainDoor, layout.walls);
       const cx = site.x0 + plotW / 2;
@@ -395,13 +393,16 @@ export function generateLayoutSVG(layout, unit = 'ft-in', view = {}) {
   // 7. Title Block & North Compass. The sheet grows to fit anything beyond the plot.
   const bounds = getDrawingBounds(layout);
   const margin = 2 * scale;
-  const titleBlockY = originY + bounds.maxY * scale + 24 + (roadOn('South') ? SOUTH_ROAD_SPACE : 0);
+  const roadEdge = (pick, fallback, read) => (roads.length ? pick(...roads.map(read)) : fallback);
+  const roadBottom = roadEdge(Math.max, bounds.maxY, (r) => r.y + r.length);
+  const titleBlockY = originY + Math.max(bounds.maxY, roadBottom) * scale + 24;
   // Beside the plot, clear of the width dimension line above it.
   const compassX = plotRight + padding / 2;
   const compassY = plotTop + 30;
-  const viewLeft = Math.min(0, originX + bounds.minX * scale - margin);
-  const viewTop = Math.min(0, originY + bounds.minY * scale - margin);
-  const viewRight = Math.max(svgW, originX + bounds.maxX * scale + margin);
+  const roadMargin = 4;
+  const viewLeft = Math.min(0, originX + bounds.minX * scale - margin, SX(roadEdge(Math.min, bounds.minX, (r) => r.x)) - roadMargin);
+  const viewTop = Math.min(0, originY + bounds.minY * scale - margin, SY(roadEdge(Math.min, bounds.minY, (r) => r.y)) - roadMargin);
+  const viewRight = Math.max(svgW, originX + bounds.maxX * scale + margin, SX(roadEdge(Math.max, bounds.maxX, (r) => r.x + r.width)) + roadMargin);
   const viewBottom = Math.max(svgH, titleBlockY + 64 + 24);
 
   return `
@@ -450,10 +451,10 @@ export function generateLayoutSVG(layout, unit = 'ft-in', view = {}) {
 /**
  * Download SVG file
  */
-export function exportAsSVG(layout, unit = 'ft-in') {
+export function exportAsSVG(layout, unit = 'ft-in', view = {}) {
   if (typeof window === 'undefined') return;
   try {
-    const svgStr = generateLayoutSVG(layout, unit);
+    const svgStr = generateLayoutSVG(layout, unit, view);
     const blob = new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -560,10 +561,10 @@ export async function exportAsPDF(layout, unit = 'ft-in', view = {}) {
 /**
  * Export high-resolution PNG image
  */
-export async function exportAsPNG(layout, unit = 'ft-in') {
+export async function exportAsPNG(layout, unit = 'ft-in', view = {}) {
   if (typeof document === 'undefined') return;
   try {
-    const { canvas } = await rasterizeLayout(layout, unit, 2);
+    const { canvas } = await rasterizeLayout(layout, unit, 2, view);
     downloadBlob(await canvasToBlob(canvas, 'image/png'), `${fileBaseName(layout)}.png`);
   } catch (err) {
     console.error('Error exporting PNG:', err);

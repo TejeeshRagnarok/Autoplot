@@ -14,9 +14,11 @@ import {
   getPlotWallData,
   getPlotWallPolygons,
   getPlotWallThicknesses,
+  getRoadBands,
 } from './siteGeometry.js';
 
 export {
+  getRoadBands,
   DEFAULT_PLOT_WALL_THICKNESS_IN,
   PLOT_WALL_SIDES,
   findPlotWallAt,

@@ -666,6 +666,8 @@ export function syncLayoutToState(layout, currentState) {
     ...currentState,
     siteWidth: layout.plot ? String(layout.plot.width) : currentState.siteWidth,
     siteLength: layout.plot ? String(layout.plot.length) : currentState.siteLength,
+    roadDirection: layout.plot?.roadDirection || currentState.roadDirection,
+    siteFacing: layout.plot?.facing || currentState.siteFacing,
     eastOpen: open ? String(open.east) : currentState.eastOpen,
     westOpen: open ? String(open.west) : currentState.westOpen,
     northOpen: open ? String(open.north) : currentState.northOpen,
